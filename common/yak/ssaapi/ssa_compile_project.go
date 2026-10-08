@@ -86,10 +86,10 @@ func CompileDiffProgramAndSaveToDB(
 	if projectID > 0 {
 		diffOpts = append(diffOpts, ssaconfig.WithProjectID(projectID))
 	}
-	if baseProgramName != "" {
-		diffOpts = append(diffOpts, WithBaseProgramName(baseProgramName))
-		diffOpts = append(diffOpts, WithEnableIncrementalCompile(false))
-	}
+	// Diff 编译的 config 只声明"这是增量序列的一层"，不携带 BaseProgramName：
+	// parseProjectWithFS 是独立入口，不会路由回 parseProject，所以 enable=true
+	// 不会递归；base 关联与 FileHashMap 在编译完成后由下面的后置赋值写入产物。
+	diffOpts = append(diffOpts, WithEnableIncrementalCompile(true))
 	if len(fileHashMap) > 0 {
 		diffOpts = append(diffOpts, WithFileHashMap(fileHashMap))
 	}
@@ -127,7 +127,7 @@ func CompileDiffProgramAndSaveToDB(
 		}
 	}
 
-	config.SetEnableIncrementalCompile(true)
+	// config 在构造时已声明 enable=true（见上），SaveConfig 直接据此打 IsOverlay 标
 	SaveConfig(config, diffProgram)
 
 	return diffProgram, nil
@@ -142,13 +142,14 @@ func ParseProject(opts ...ssaconfig.Option) (prog Programs, err error) {
 	return config.parseProject()
 }
 
-// compileMode resolves, in one place, whether a config participates in the
-// incremental/overlay compile flow. The raw EnableIncrementalCompile /
-// BaseProgramName pair is intentionally inconsistent during an internal diff
-// compile — CompileDiffProgramAndSaveToDB turns the enable flag off to avoid
-// recursing into ParseProject while keeping BaseProgramName so the diff
-// program still persists overlay metadata — so downstream code must ask
-// compileMode() instead of re-deriving the state from the two flags.
+// compileMode 在一处判定 config 参与增量编译流程的形态。原始的
+// EnableIncrementalCompile / BaseProgramName 两个标志分工如下：enable 声明
+// "参与增量序列"（SaveConfig 打 IsOverlay 标、FS 层跳过与 overlay 语义冲突的
+// flush）；BaseProgramName 指向差量编译的基座。内部 diff 编译
+// （CompileDiffProgramAndSaveToDB）直接构造 enable=true 且不带 Base 名的
+// config——parseProjectWithFS 是独立入口不会路由回 parseProject，无递归，
+// base 关联在编译完成后后置写入产物。下游请统一读本方法，不要从两个标志
+// 自行拼装状态。
 type compileMode int
 
 const (
@@ -158,8 +159,6 @@ const (
 	// 只是产物会被标记为后续差量编译的 overlay 基座（IsOverlay + OverlayLayers）。
 	compileModeIncrementalBase
 	// compileModeIncrementalDiff：基于 base program 的差量编译，只编译变更文件。
-	// 内部 diff 编译（CompileDiffProgramAndSaveToDB）也处于此模式：它为了防递归
-	// 关闭了 EnableIncrementalCompile，但仍携带 BaseProgramName。
 	compileModeIncrementalDiff
 )
 
@@ -494,33 +493,9 @@ func buildFileSystemFromProgramName(programName string) (fi.FileSystem, error) {
 
 var buildFileSystemFromProgramNameForIncremental = buildFileSystemFromProgramName
 
-// resolveBaseOverlay 判断差量编译的 base program 自身是否是增量编译产物
-// （"对增量项目做增量编译"的情况），是则返回它的 overlay：
-//   - 优先使用从 OverlayLayers 元数据还原的 overlay（FromDatabase 加载时恢复）；
-//   - 元数据缺失/损坏且 base 是差量 program 时，回退为
-//     "base 的 base + base" 两层重建。
-// 返回 nil 表示 base 是普通全量编译 program。
-// 约定：返回非 nil 时 Base 与 Diff 必然就绪，可直接用于 extendOverlayWithNewLayer。
-func (c *Config) resolveBaseOverlay(baseProgram *Program) (*ProgramOverLay, error) {
-	if overlay := baseProgram.GetOverlay(); overlay != nil && overlay.Base != nil && len(overlay.Diff) > 0 {
-		c.Processf(0.08, "base program is an overlay with %d layers", overlay.ProgramCount())
-		return overlay, nil
-	}
-	if !baseProgram.IsIncrementalCompile() || baseProgram.IsBaseProgram() {
-		return nil, nil
-	}
-	baseBaseProgram, err := FromDatabase(baseProgram.GetBaseProgramName())
-	if err != nil {
-		return nil, utils.Wrapf(err, "failed to load base program's base program: %s", baseProgram.GetBaseProgramName())
-	}
-	overlay := NewProgramOverLay(baseBaseProgram, baseProgram)
-	if overlay == nil {
-		return nil, utils.Errorf("failed to create overlay for diff base program")
-	}
-	c.Processf(0.08, "base program is a diff program, created overlay with 2 layers")
-	return overlay, nil
-}
-
+// parseProjectWithIncrementalCompile 执行差量编译：加载 base program 及其
+// 合并视图（情况4：base 自身是增量产物，视图非 nil；情况3：base 是普通全量，
+// 视图为 nil），只编译变更文件，然后把新差量层接到视图顶端。
 func (c *Config) parseProjectWithIncrementalCompile() (*Program, error) {
 	baseProgramName := c.GetBaseProgramName()
 	c.Processf(0.03, "loading base program from database: %s", baseProgramName)
@@ -530,10 +505,15 @@ func (c *Config) parseProjectWithIncrementalCompile() (*Program, error) {
 	}
 	c.Processf(0.06, "base program loaded: %s", baseProgram.GetProgramName())
 
-	// 情况判定收敛到一个决策点：非 nil = base 自身是增量产物（情况4），nil = 普通全量（情况3）
-	baseOverlay, err := c.resolveBaseOverlay(baseProgram)
-	if err != nil {
-		return nil, err
+	// 情况判定：GetOverlay 非 nil = base 自身是增量产物（情况4），nil = 普通全量（情况3）
+	baseOverlay := baseProgram.GetOverlay()
+	if baseOverlay != nil {
+		c.Processf(0.08, "base program is an overlay with %d layers", baseOverlay.ProgramCount())
+	} else if baseProgram.IsIncrementalCompile() && !baseProgram.IsBaseProgram() {
+		// 行自称是差量层但视图没还原出来（配方损坏且加载器降级）：按情况3 继续，
+		// diff 基准会缺少更深层的历史层——告警留痕，方便事后追查"增量后结果缺层"。
+		log.Warnf("base program %s claims incremental but overlay is missing; "+
+			"diff base may lose historical layers (damaged OverlayLayers?)", baseProgramName)
 	}
 
 	// diff 的基准文件系统：情况4 直接取 base overlay 的聚合 FS；情况3 从数据库/配置重建
