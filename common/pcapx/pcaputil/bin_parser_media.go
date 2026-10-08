@@ -505,6 +505,11 @@ func (a *binParser) matchSDPMedia(domain CaptureDomain, source, destination stri
 		}
 		// These provenance collections are sets. Map traversal must not
 		// change exported evidence between identical capture replays.
+		if g.match.direction != "" {
+			directions := strings.Split(g.match.direction, ",")
+			sort.Strings(directions)
+			g.match.direction = strings.Join(directions, ",")
+		}
 		sort.Strings(g.match.endpoints)
 		sort.Slice(g.match.eventIDs, func(i, j int) bool { return g.match.eventIDs[i] < g.match.eventIDs[j] })
 		sort.Slice(g.match.packetRefs, func(i, j int) bool {

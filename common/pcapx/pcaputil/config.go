@@ -521,11 +521,8 @@ func (c *CaptureConfig) packetHandler(ctx context.Context, packet gopacket.Packe
 	if packet == nil {
 		return
 	}
-	if c.trafficPool.parallel != nil && c.trafficPool.owner == nil {
-		c.trafficPool.parallel.checkTruncation(packet.Metadata().CaptureInfo)
-	}
-
 	if c.binParser != nil {
+		packet = protocolAnalysisPacket(packet)
 		var consumed bool
 		packet, consumed = c.binParser.networkPacket(packet)
 		if consumed {

@@ -118,7 +118,7 @@ func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
 		}
 		e := captureEvidence{Ref: PacketReference{Number: r.number, Domain: CaptureDomain{Section: r.section, Interface: ci.InterfaceIndex}}}
 		d.link = link
-		pool.observeCapture(len(raw))
+		pool.observeCaptureInfo(len(raw), ci)
 		if conf.recorder != nil {
 			if err := conf.recorder.write(raw, ci, link); err != nil {
 				return err
@@ -129,12 +129,15 @@ func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
 			packet.Metadata().CaptureInfo = withEvidence(ci, e)
 			conf.packetHandler(ctx, packet)
 		} else if pool.parallel != nil && !conf.DisableAssembly {
-			pool.parallel.checkTruncation(ci)
 			if key, ok, err := rawFlowKey(raw, link); err != nil {
-				pool.malformedPacket(err.Error())
+				if conf.binParser != nil {
+					d.feedWithEvidence(ctx, raw, ci, e)
+				} else {
+					pool.malformedPacket(err.Error())
+				}
 			} else if ok {
 				key.domain = e.Ref.Domain
-				pool.parallel.submit(workerPacket{data: raw, ts: ci.Timestamp, link: link, raw: true, key: key, evidence: e})
+				pool.parallel.submit(workerPacket{data: raw, ts: ci.Timestamp, captureLength: ci.CaptureLength, originalLength: ci.Length, link: link, raw: true, key: key, evidence: e})
 			} else if conf.binParser != nil {
 				d.feedWithEvidence(ctx, raw, ci, e) // datagrams; TCP still uses the private worker path
 			}

@@ -322,3 +322,76 @@ func TestTDSFieldsMixedEndianBridgeRejectsBeforePublication(t *testing.T) {
 		}, profile)
 	})
 }
+
+func TestTDSLoginAckSealedBoundaryAndOwnership(t *testing.T) {
+	data, err := trafficfixture.ReadBatch("validation-small-corpus-df13184f", "captures/tds-login-tail.pcap")
+	require.NoError(t, err)
+	r, err := pcapgo.NewReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	var server []byte
+	for {
+		b, _, err := r.ReadPacketData()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		p := gopacket.NewPacket(b, r.LinkType(), gopacket.Default)
+		tcp, ok := p.TransportLayer().(*layers.TCP)
+		if ok && tcp.SrcPort == 1433 {
+			server = append(server, tcp.Payload...)
+		}
+	}
+	// The first server message is PRELOGIN; the second is LOGINACK + DONE.
+	require.GreaterOrEqual(t, len(server), 8)
+	first := int(binary.BigEndian.Uint16(server[2:4]))
+	require.Less(t, first, len(server))
+	wire := bytes.Clone(server[first:])
+	for _, profile := range []string{"response71", "response72"} {
+		message := wire
+		if profile == "response71" {
+			message = tdsFieldsTestPacket(4, wire[8:len(wire)-4], 0)
+		}
+		fields, info, err := decodeTDSFields(message, profile)
+		require.NoError(t, err)
+		tlsCertificateTestCoverage(t, fields, len(message))
+		tokens := info["Response Tokens"].([]map[string]any)
+		require.Len(t, tokens, 2)
+		require.Equal(t, "LOGINACK", tokens[0]["Name"])
+		require.Equal(t, "DONE", tokens[1]["Name"])
+		ack := tokens[0]["Login Acknowledgement"].(map[string]any)
+		require.Equal(t, uint64(1), ack["Interface"])
+		require.Equal(t, uint32(0x74000004), ack["TDS Version"])
+		require.Equal(t, "TEST", ack["Program Name"].(map[string]any)["Text"])
+		require.Equal(t, [2]int{0, 21}, tokens[0]["Logical Byte Range"])
+		for cut := 0; cut < len(message); cut++ {
+			f, m, err := decodeTDSFields(message[:cut], profile)
+			require.Error(t, err)
+			require.Nil(t, f)
+			require.Nil(t, m)
+		}
+	}
+	for _, n := range []uint16{0, 9, 17, 19, 65535} {
+		bad := bytes.Clone(wire)
+		binary.LittleEndian.PutUint16(bad[9:11], n)
+		fields, info, err := decodeTDSFields(bad, "response72")
+		require.Error(t, err)
+		require.Nil(t, fields)
+		require.Nil(t, info)
+	}
+	for _, at := range []int{11, 16} { // interface, B_VARCHAR character count
+		bad := bytes.Clone(wire)
+		bad[at] = 255
+		fields, info, err := decodeTDSFields(bad, "response72")
+		require.Error(t, err)
+		require.Nil(t, fields)
+		require.Nil(t, info)
+	}
+	_, info, err := decodeTDSFields(wire, "response72")
+	require.NoError(t, err)
+	name := info["Response Tokens"].([]map[string]any)[0]["Login Acknowledgement"].(map[string]any)["Program Name"].(map[string]any)
+	saved := bytes.Clone(name["Bytes"].([]byte))
+	for i := range wire {
+		wire[i] = 255
+	}
+	require.Equal(t, saved, name["Bytes"])
+}

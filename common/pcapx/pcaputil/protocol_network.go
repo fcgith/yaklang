@@ -79,7 +79,7 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 		raw := append(bytes.Clone(inner.LayerContents()), inner.LayerPayload()...)
 		ci.CaptureLength, ci.Length = len(raw), len(raw)
 		ci = withEvidence(ci, e)
-		p = gopacket.NewPacket(raw, layers.LinkTypeRaw, gopacket.Default)
+		p = gopacket.NewPacket(raw, protocolPacketDecoder{decoder: layers.LinkTypeRaw}, gopacket.Default)
 		p.Metadata().CaptureInfo = ci
 	}
 	var key fragmentKey
@@ -362,7 +362,7 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 	if err := gopacket.SerializeLayers(b, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}, ip, gopacket.Payload(raw)); err != nil {
 		return invalid("FragmentSerialization")
 	}
-	q := gopacket.NewPacket(b.Bytes(), layers.LinkTypeRaw, gopacket.Default)
+	q := gopacket.NewPacket(b.Bytes(), protocolPacketDecoder{decoder: layers.LinkTypeRaw}, gopacket.Default)
 	ci.CaptureLength, ci.Length = len(b.Bytes()), len(b.Bytes())
 	e.refs = refs
 	ci = withEvidence(ci, e)

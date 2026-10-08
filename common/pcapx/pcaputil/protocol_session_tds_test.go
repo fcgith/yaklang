@@ -152,7 +152,8 @@ func TestProtocolSessionTDSPreloginLoginBatchRPC(t *testing.T) {
 	r = s.Feed(1, ts, tdsDone72())
 	require.Nil(t, r.Err, "%v", r.Err)
 	require.Equal(t, "LOGIN7", r.Events[0].Session["Matched Request"])
-	require.Equal(t, true, r.Events[0].Session["Logged In"])
+	require.Equal(t, false, r.Events[0].Session["Logged In"])
+	require.Equal(t, "rejected", r.Events[0].Session["Login Result"])
 	require.Equal(t, []string{"DONE"}, r.Events[0].Session["Token Names"])
 
 	r = s.Feed(0, ts, tdsSQLBatch72("SELECT 1"))

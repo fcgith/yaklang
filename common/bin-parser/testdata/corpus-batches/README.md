@@ -44,7 +44,7 @@ Run from the repository root:
 ```sh
 go run ./internal/trafficfixture/cmd/corpus test
 go test -json -count=1 -timeout=5m ./internal/trafficfixture/... ./common/bin-parser/... ./common/pcapx/... ./common/yak/cmd/yakcmds/shark-cli > traffic.jsonl
-go run ./internal/trafficfixture/cmd/corpus exec -- python3 @scripts/protocol-tests/check_go_test_json.py traffic.jsonl --inventory @scripts/protocol-tests/required-tests-v2.json --tier full
+go run ./internal/trafficfixture/cmd/corpus exec -- python3 @scripts/protocol-tests/check_go_test_json.py traffic.jsonl --inventory @scripts/protocol-tests/required-tests-v3.json --tier full
 ```
 
 The single `corpus` entry point uses the same bounded Go ZIP loader as tests.
@@ -83,6 +83,15 @@ their semantic coverage. The existing synthetic session keys are test inputs;
 production credentials, user private keys and material without redistribution
 permission belong in an external fixed-source download manifest.
 
-Current test requirements are sealed at `scripts/protocol-tests/required-tests-v2.json`;
-the baseline's historical requirements remain sealed with its evidence. The new validation batch adds the DNS-before-rule budget regression (108 full requirements); prior materials and their 107-item inventory remain unchanged. `run-quality-v2.py` reuses the sealed quality runner with this inventory. Test
-logs, profiles and iteration reports belong outside the repository.
+Current test requirements are sealed at `scripts/protocol-tests/required-tests-v3.json`;
+the historical inventories and all four earlier batches remain unchanged.
+The supplemental small-corpus batch contains 26 minimal controls, their explicit
+expected facts, an offline generator and the compact pinned source manifest.
+Two Modbus cases are sanitized derivatives of a licensed upstream resegmentation;
+its attribution and changes are in `validation/sources.json`. The coalesced case
+has a recorded tshark 4.2.5 field oracle; that version does not recognize the
+seven-byte initial prefix. Full/deferred, workers 1/2/4, observer parity and split
+session feeds are asserted by `TestSmallCorpusSealedControls`; LOGINACK also has
+byte-boundary, malformed-length and ownership tests. These are scoped control
+assertions, not a semantic golden for the entire upstream collection. Process
+logs and the original large downloads remain outside the repository.

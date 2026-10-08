@@ -43,7 +43,7 @@ func readLiveWorkerPackets(conf *CaptureConfig, ctx context.Context, read func()
 			evidence.Ref.Number = number
 		}
 		ci = withEvidence(ci, evidence)
-		conf.trafficPool.observeCapture(len(raw))
+		conf.trafficPool.observeCaptureInfo(len(raw), ci)
 		if conf.recorder != nil {
 			if err := conf.recorder.write(raw, ci, link); err != nil {
 				return err
@@ -51,17 +51,16 @@ func readLiveWorkerPackets(conf *CaptureConfig, ctx context.Context, read func()
 		}
 		if private {
 			if conf.trafficPool.parallel == nil {
-				if ci.CaptureLength < ci.Length {
-					conf.trafficPool.singleDiagnostics.truncated.Add(1)
-					conf.trafficPool.reassemblyFailure("truncated live capture")
-				}
 				d.feed(ctx, raw, ci)
 				continue
 			}
-			conf.trafficPool.parallel.checkTruncation(ci)
 			if !conf.DisableAssembly {
 				if key, ok, err := rawFlowKey(raw, link); err != nil {
-					conf.trafficPool.malformedPacket(err.Error())
+					if conf.binParser != nil {
+						d.feed(ctx, raw, ci)
+					} else {
+						conf.trafficPool.malformedPacket(err.Error())
+					}
 				} else if ok {
 					key.domain = evidence.Ref.Domain
 					conf.trafficPool.parallel.submit(workerPacket{data: raw, ts: ci.Timestamp, captureLength: ci.CaptureLength, originalLength: ci.Length, link: link, raw: true, key: key, evidence: evidence})

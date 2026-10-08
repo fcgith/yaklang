@@ -110,7 +110,14 @@ func (d *offlineDecoder) feedWithEvidence(ctx context.Context, raw []byte, ci go
 	var transport layers.IPProtocol
 	switch next {
 	case layers.LayerTypeIPv4:
-		if err := d.ipv4.DecodeFromBytes(ipBytes, d); err != nil {
+		var err error
+		if d.conf.binParser != nil {
+			err = decodeProtocolIPv4(&d.ipv4, ipBytes, d)
+		} else {
+			d.ipv4 = layers.IPv4{Options: d.ipv4.Options[:0]}
+			err = d.ipv4.DecodeFromBytes(ipBytes, d)
+		}
+		if err != nil {
 			return fallback()
 		}
 		if d.ipv4.Version != 4 || d.truncated {
@@ -140,7 +147,7 @@ func (d *offlineDecoder) feedWithEvidence(ctx context.Context, raw []byte, ci go
 	}
 	if network != nil && transport == layers.IPProtocolUDP && d.conf.binParser != nil {
 		if err := d.udp.DecodeFromBytes(network.(gopacket.NetworkLayer).LayerPayload(), d); err == nil {
-			if d.udp.NextLayerType() == layers.LayerTypeVXLAN {
+			if udpEncapsulation(d.udp.NextLayerType()) {
 				return fallback()
 			}
 			feeding = true
@@ -184,18 +191,21 @@ func openOfflineFast(conf *CaptureConfig, ctx context.Context, handler *PcapHand
 		}
 		number++
 		evidence := captureEvidence{Ref: PacketReference{Number: number, Domain: CaptureDomain{Interface: ci.InterfaceIndex}}}
-		conf.trafficPool.observeCapture(len(raw))
+		conf.trafficPool.observeCaptureInfo(len(raw), ci)
 		if conf.recorder != nil {
 			if err := conf.recorder.write(raw, ci, d.link); err != nil {
 				return err
 			}
 		}
 		if conf.trafficPool.parallel != nil && conf.trafficPool.owner == nil && !conf.DisableAssembly {
-			conf.trafficPool.parallel.checkTruncation(ci)
 			if key, ok, err := rawFlowKey(raw, d.link); err != nil {
-				conf.trafficPool.malformedPacket(err.Error())
+				if conf.binParser != nil {
+					d.feedWithEvidence(ctx, raw, ci, evidence)
+				} else {
+					conf.trafficPool.malformedPacket(err.Error())
+				}
 			} else if ok {
-				conf.trafficPool.parallel.submit(workerPacket{data: raw, ts: ci.Timestamp, link: d.link, raw: true, key: key, evidence: evidence})
+				conf.trafficPool.parallel.submit(workerPacket{data: raw, ts: ci.Timestamp, captureLength: ci.CaptureLength, originalLength: ci.Length, link: d.link, raw: true, key: key, evidence: evidence})
 			} else if conf.binParser != nil {
 				d.feedWithEvidence(ctx, raw, ci, evidence)
 			}

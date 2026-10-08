@@ -282,9 +282,15 @@ func TestTDSPreloginLoginBatchAndEdges(t *testing.T) {
 	require.Equal(t, uint64(0), uintVal(t, preTokens.Children()[0].Child("Type")))
 	require.Equal(t, uint64(0xff), uintVal(t, preTokens.Children()[len(preTokens.Children())-1].Child("Type")))
 
-	login := tdsPacket(16, 1, make([]byte, 32))
+	loginPayload := make([]byte, 94) // fixed LOGIN7 header with empty variable fields
+	binary.LittleEndian.PutUint32(loginPayload, uint32(len(loginPayload)))
+	binary.LittleEndian.PutUint32(loginPayload[4:], 0x74000004)
+	binary.LittleEndian.PutUint32(loginPayload[8:], 4096)
+	binary.LittleEndian.PutUint16(loginPayload[36:], 94)
+	login := tdsPacket(16, 1, loginPayload)
 	l := parseRule(t, login, "application-layer.tds", "TDS")
 	require.Equal(t, uint64(16), uintVal(t, l.Child("Type")))
+	parseMustFail(t, tdsPacket(16, 1, make([]byte, 32)), "application-layer.tds", "TDS")
 
 	batch := tdsPacket(1, 1, []byte{0x53, 0x00, 0x45, 0x00}) // UTF-16LE "SE"
 	b := parseRule(t, batch, "application-layer.tds", "TDS")

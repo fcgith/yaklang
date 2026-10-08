@@ -4921,6 +4921,182 @@
       "password": "bin-parser",
       "sha256": "a8ef85eef1f65f31d43f43162340fef67ed3ab0bdd8a6a2cce715c7ba37b328a",
       "source_sha": "ae44a4626af9a110eccef5e1005fe6eac8998e41"
+    },
+    {
+      "id": "validation-small-corpus-df13184f",
+      "kind": "validation",
+      "source_sha": "df13184f34c425dcb975db6bd06795bca2777778",
+      "file": "validation-small-corpus-df13184f.zip",
+      "sha256": "791da912589f56829a1c510fb5b29df023601c033f5c1615af858a30cce02f4b",
+      "password": "bin-parser",
+      "members": {
+        "captures/capture-truncated.pcap": {
+          "sha256": "08744b117e6071ea25ed4a8bf4058515a916a8b062bdcaea4c002598793f9b07",
+          "bytes": 99
+        },
+        "captures/controls.json": {
+          "sha256": "d7b0418322770878750e4cadb1fa943f84bb922d06da0fb6e30869e4750bd5ed",
+          "bytes": 12476
+        },
+        "captures/dns-fragmented-tcp.pcap": {
+          "sha256": "8305df33d470c55b14b196fa1199d87831e312d18137c51645d1ebc3cc640807",
+          "bytes": 656
+        },
+        "captures/enip-empty-coap-collision.pcap": {
+          "sha256": "545757c2bb5bbb58c0c4c4d4a1b775d7c625d2ebabd42fa8613494c9d304f29c",
+          "bytes": 106
+        },
+        "captures/geneve-profile.pcap": {
+          "sha256": "8c25f7e5edcbac719abb69c1ecad477e8e115b927253b0be532c9e19a423eb04",
+          "bytes": 180
+        },
+        "captures/ipv4-bad-option-length.pcap": {
+          "sha256": "bec8c63af1fb5acd7f0f5df24c053ff6feeb53af440b37555137c638ae39d017",
+          "bytes": 240
+        },
+        "captures/ipv4-eol-stale-state.pcap": {
+          "sha256": "5c4f3d4afd150a1520dafe9f5546b41f04699525974389ff456aff2d866a5bc7",
+          "bytes": 240
+        },
+        "captures/modbus-large-mvp-coalesced.pcap": {
+          "sha256": "1481e0bb6e71ee89f49c262964d397d41a46fa864e03d7cd0f263d97d62a62e5",
+          "bytes": 615
+        },
+        "captures/modbus-large-mvp.pcap": {
+          "sha256": "87029cff7299409b4756cef926fd7acb5fbf080a69b4b4ea9443f0770b51e4db",
+          "bytes": 1525
+        },
+        "captures/modbus-short-prefix.pcap": {
+          "sha256": "accafa0fcc1ac20e04f72b9c9b4b4410cdf2596c77fcf9f4ac04b53d9a360f60",
+          "bytes": 4045
+        },
+        "captures/ntp-client-and-control.pcap": {
+          "sha256": "9432dc9ebacc071447e89dd838b6cbfcb04abf49195da8df05156cccbece6886",
+          "bytes": 200
+        },
+        "captures/radius-bad-attribute.pcap": {
+          "sha256": "9b55bc27a7e6fae9aa58470361727e152ab35a5d28f4a42dd08778e007ca1141",
+          "bytes": 105
+        },
+        "captures/rtp-negotiated-directions.pcap": {
+          "sha256": "f9d5cbf9c279d05e5a1dfa29b0b5a309775d836caed1abb4afc6aee8af9193ad",
+          "bytes": 919
+        },
+        "captures/tds-login-ack-after-done.pcap": {
+          "sha256": "36830ad1f21d217cc0aee0427a4cf513b757d3595f5065cacb9ff651685dfe03",
+          "bytes": 2756
+        },
+        "captures/tds-login-ack-pending.pcap": {
+          "sha256": "2a364a55abfdc06d1a37aee0bd8d942d7fdf9272eb2df4e781f81b4bb9faf23f",
+          "bytes": 2673
+        },
+        "captures/tds-login-ack-split.pcap": {
+          "sha256": "cbf48f66f2a88bb158131cbcf54fbe08738c5879ca51a610a8f02dd359c3b00d",
+          "bytes": 2904
+        },
+        "captures/tds-login-done-tail.pcap": {
+          "sha256": "f89a6b2d0b88fb68f74d147d3479f1740456ffdd398ac6ae4c39fc27ae1af2f2",
+          "bytes": 2831
+        },
+        "captures/tds-login-error-done.pcap": {
+          "sha256": "4cf42d2d552e021cee52f43e548809c337220e079a8d376c68c7caf82f1c19a2",
+          "bytes": 2756
+        },
+        "captures/tds-login-error-split.pcap": {
+          "sha256": "6eb94513883b5cf2b07e0f8ce39923b1741d937f1c4aebb3ef1f83c73fced9ab",
+          "bytes": 2987
+        },
+        "captures/tds-login-interleaved-error.pcap": {
+          "sha256": "d2355ee32f9cfb75f59a17ad8d22fda7af626d070a9b45a9b765dad055848f86",
+          "bytes": 4526
+        },
+        "captures/tds-login-no-ack.pcap": {
+          "sha256": "57064f4751adf9112d1dedac79157101463708b7f8dc1c253840ffee6f53f8b0",
+          "bytes": 2525
+        },
+        "captures/tds-login-procedure-error.pcap": {
+          "sha256": "a83efe03a8b7379e17e06529ba5ab4c6b3bb7cb690fda7053cc4ea7ecea7dd3f",
+          "bytes": 2909
+        },
+        "captures/tds-login-queued-no-ack.pcap": {
+          "sha256": "ec087b9aeccc37b303ce6a79f18de301caeae7de339466ade9fe37cf1746bc4f",
+          "bytes": 4295
+        },
+        "captures/tds-login-server-origin.pcap": {
+          "sha256": "75fe591fe4ec748ef37a41405a296b99f4c1cbcd4613f49acdf3913a4f6b0e2c",
+          "bytes": 2756
+        },
+        "captures/tds-login-tail.pcap": {
+          "sha256": "2fcf2f171f79845f3fd35b4b3fe79bdf747ec505936ce27633a55ccc817613f2",
+          "bytes": 2756
+        },
+        "captures/tds-login-wrong-direction.pcap": {
+          "sha256": "45bcc566062b280a7fc36c64a031b90539afe57bed21a5c6a1a9d8f4537e5007",
+          "bytes": 2756
+        },
+        "captures/vxlan-ntp-control.pcap": {
+          "sha256": "bbc859a52cabe546cc78209ee7e4ad04968f156339a723e6e5fe8af2943d1d33",
+          "bytes": 144
+        },
+        "scripts/full-small-matrix_test.go": {
+          "sha256": "18d6e3e12d5236896e3fca2ab6c5e578fbaca42541a8d8ea38a78ec0949460bf",
+          "bytes": 5776
+        },
+        "scripts/generate_controls.py": {
+          "sha256": "c34b908e2f086dced02d02794e621013885975950177cf9b7b2dd39a444414b8",
+          "bytes": 10486
+        },
+        "scripts/package_controls.py": {
+          "sha256": "094110c8ab7349357d57adf99239253b27bf77e1dc84c9cd1fed07fc73725b69",
+          "bytes": 2621
+        },
+        "scripts/required-tests-v3.json": {
+          "sha256": "433f7d3cf0012a06c4e44a1b413f75689c8d4a38770f7976b04ccd255178d823",
+          "bytes": 28316
+        },
+        "validation/expected.json": {
+          "sha256": "6b96ba1bde305276f502810db06a188d6d07d5db0fa93ff63daf60aa8d18c3b1",
+          "bytes": 16878
+        },
+        "validation/modbus-oracle.json": {
+          "sha256": "4ba9e491eda306d91bd3bc70d5d0cf0c5a52e9a5b8c39837591dadf49e080c6d",
+          "bytes": 995
+        },
+        "validation/sources.json": {
+          "sha256": "a8ff7002a5ed58689bf3b68ee3a029fc96119b32cd7ecd9848526dad44236a71",
+          "bytes": 2281
+        }
+      },
+      "aliases": {
+        "common/bin-parser/testdata/protocol-native/small-corpus/modbus-short-prefix.pcap": "captures/modbus-short-prefix.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-tail.pcap": "captures/tds-login-tail.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/enip-empty-coap-collision.pcap": "captures/enip-empty-coap-collision.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/ntp-client-and-control.pcap": "captures/ntp-client-and-control.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/radius-bad-attribute.pcap": "captures/radius-bad-attribute.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/capture-truncated.pcap": "captures/capture-truncated.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/vxlan-ntp-control.pcap": "captures/vxlan-ntp-control.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/geneve-profile.pcap": "captures/geneve-profile.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/rtp-negotiated-directions.pcap": "captures/rtp-negotiated-directions.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/modbus-large-mvp.pcap": "captures/modbus-large-mvp.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/modbus-large-mvp-coalesced.pcap": "captures/modbus-large-mvp-coalesced.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/dns-fragmented-tcp.pcap": "captures/dns-fragmented-tcp.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/ipv4-eol-stale-state.pcap": "captures/ipv4-eol-stale-state.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/ipv4-bad-option-length.pcap": "captures/ipv4-bad-option-length.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-queued-no-ack.pcap": "captures/tds-login-queued-no-ack.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-done-tail.pcap": "captures/tds-login-done-tail.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-procedure-error.pcap": "captures/tds-login-procedure-error.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-ack-after-done.pcap": "captures/tds-login-ack-after-done.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-no-ack.pcap": "captures/tds-login-no-ack.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-error-done.pcap": "captures/tds-login-error-done.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-error-split.pcap": "captures/tds-login-error-split.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-wrong-direction.pcap": "captures/tds-login-wrong-direction.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-ack-pending.pcap": "captures/tds-login-ack-pending.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-ack-split.pcap": "captures/tds-login-ack-split.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-interleaved-error.pcap": "captures/tds-login-interleaved-error.pcap",
+        "common/bin-parser/testdata/protocol-native/small-corpus/tds-login-server-origin.pcap": "captures/tds-login-server-origin.pcap",
+        "scripts/protocol-tests/required-tests-v3.json": "scripts/required-tests-v3.json",
+        "scripts/protocol-tests/generate-small-controls.py": "scripts/generate_controls.py"
+      }
     }
   ],
   "schema_version": 1,
