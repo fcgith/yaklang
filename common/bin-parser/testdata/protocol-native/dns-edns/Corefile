@@ -1,5 +1,0 @@
-native.test:19555 {
- file /fixtures/db.native.test native.test
- log
- errors
-}

@@ -1,2 +1,0 @@
-# Empty trailing TSV columns are part of the immutable TShark oracle.
-*.tsv whitespace=-blank-at-eol

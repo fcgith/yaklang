@@ -4457,6 +4457,448 @@
       },
       "password": "bin-parser",
       "sha256": "06f56d88e362998ab4d5d699872efd7d22a04a14a672737d50a13f35399eab63"
+    },
+    {
+      "id": "materials-2598e4d6",
+      "kind": "supporting-materials",
+      "source_sha": "2598e4d6aafbd369a46be8c71aff3cbc799cebdb",
+      "file": "materials-2598e4d6.zip",
+      "password": "bin-parser",
+      "members": {
+        "common/bin-parser/testdata/protocol-corpus/README.md": {
+          "sha256": "331b55047f96ed5e2743fd89ada5a063c8da84a326b58006d4556aee4e9ac6b1",
+          "bytes": 2627
+        },
+        "common/bin-parser/testdata/protocol-corpus/derived/README.md": {
+          "sha256": "d3b95a02cf22d22cb71d7aadf5da859fc200200214fe875506d6d7350002810c",
+          "bytes": 2324
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/audit-pr5023-reproduction.mjs": {
+          "sha256": "f68e67176189aefa92313705d1084405997112950484eac3a5bb2c0bd1cde680",
+          "bytes": 7840
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/audit-pr5023-reproduction.test.mjs": {
+          "sha256": "b2475b11519c8e1c9885a782e65b762687a85e0a02a01793ae06b593ef1df8b2",
+          "bytes": 2145
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/extract-quic-streams.mjs": {
+          "sha256": "ebf25368f2e8c158d6607b9c9509bd5ff96265a882ec1e5b4b33a57b6835f633",
+          "bytes": 6706
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/.gitignore": {
+          "sha256": "97b89659edd3005ae1e514ac0ccb2b3a1e905d5bb1b4a4d8d810b3903a106250",
+          "bytes": 31
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/README.md": {
+          "sha256": "52b758b6a3386a5921ab97e04cd20c474226f4184e1271b497944df31ebb7517",
+          "bytes": 1533
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/corrections.py": {
+          "sha256": "30f1fbfc15a4db71ac2b81a1267654a57bffc3253daae9e611b3654c44003100",
+          "bytes": 59832
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/generate.py": {
+          "sha256": "3036bf26fea1db10261188787dc0c28244fd275948a9c2635e3a9123a5ecb856",
+          "bytes": 32331
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/.gitignore": {
+          "sha256": "97b89659edd3005ae1e514ac0ccb2b3a1e905d5bb1b4a4d8d810b3903a106250",
+          "bytes": 31
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/README.md": {
+          "sha256": "daaf6b319c89afab8a1217c590049fa6455d24348e54164c27369a531f264da0",
+          "bytes": 949
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/generate.py": {
+          "sha256": "7a62e7e59fb6600c188e85e954912e43eb6d6f3fd9152d582e9866538012f610",
+          "bytes": 76212
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate/main.go": {
+          "sha256": "8b5fe0deed5a64c92308b2e27ede9e24b7a99b8ef3c3027f7bbde9ec0abf418d",
+          "bytes": 22551
+        },
+        "common/bin-parser/testdata/protocol-corpus/tools/generate/main_test.go": {
+          "sha256": "1fa1d05f337ed7a207640391db18211c0308e6561b4225d50c7ebca255c5ee2e",
+          "bytes": 10936
+        },
+        "common/bin-parser/testdata/protocol-native/dns-doh/Corefile": {
+          "sha256": "f888b8a5032fd7be076ae99fa7d57c74881c56c92b07201943163580d720044f",
+          "bytes": 236
+        },
+        "common/bin-parser/testdata/protocol-native/dns-doh/h1.keys": {
+          "sha256": "66ab5ae69f8986cc24c0a2981b49fd8aba73cf72bc71e9c974924912a0498afa",
+          "bytes": 230
+        },
+        "common/bin-parser/testdata/protocol-native/dns-doh/h2.keys": {
+          "sha256": "b41b473e20dcafbbaaa2323e0cbe046259b5ff27ad7a01ce2b15396e015f5e8c",
+          "bytes": 230
+        },
+        "common/bin-parser/testdata/protocol-native/dns-doh/server.pem": {
+          "sha256": "e9efd33797927105832522be82aa10459d7d6c06783213e7b5602ae5ef9206d2",
+          "bytes": 1216
+        },
+        "common/bin-parser/testdata/protocol-native/dns-edns/Corefile": {
+          "sha256": "2ac9d08044673284f2f1d73ecff442e23333a01bbac0178abf6ab01985453b07",
+          "bytes": 78
+        },
+        "common/bin-parser/testdata/protocol-native/dtls/server.pem": {
+          "sha256": "6a84ea59382284c85c468095c4f3fe2c602782c0b4d9c4fe217562d761950caf",
+          "bytes": 1172
+        },
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/ecc-client.der": {
+          "sha256": "165cacdd3f1707720196ebfc6600de24bfaa2c832809ebb52608266faa8d0fa6",
+          "bytes": 527
+        },
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/ecc-server.der": {
+          "sha256": "fe6701bb55dcdf4da34d1c9fa5d7e94ad56179604a576646b9d41a1abc6e2ff6",
+          "bytes": 528
+        },
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/rsa-client.der": {
+          "sha256": "40c716a32bc3ef207ee6ea42fbffb7f77e94551d14fac34fddee4b3f86d47fd9",
+          "bytes": 923
+        },
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/rsa-server.der": {
+          "sha256": "657e096a7cf6e0f1016094efafb5e365c60d36ce5926adf8a1637d6fac4f5c4e",
+          "bytes": 923
+        },
+        "common/bin-parser/testdata/protocol-recognition-regressions/doh-clickhouse/README.md": {
+          "sha256": "fd796ee2ce0b6bc6950f39091dad143867ae572de48364858b5b8a5f9513e6b5",
+          "bytes": 1139
+        },
+        "common/bin-parser/testdata/winlab5013/README.md": {
+          "sha256": "a515c9393e00e431ac648c9b057c5227674c7363a6541b288ccccba0fb6c9227",
+          "bytes": 1976
+        },
+        "common/bin-parser/testdata/winlab5013/corrected/README.md": {
+          "sha256": "71b357693463837e1a3506fd6b012888be25dfeb2600ebffedecdb1fa514ee86",
+          "bytes": 1797
+        },
+        "common/pcapx/pcaputil/testdata/fuzz/FuzzFirstBatchM0/8abe1862026f5684": {
+          "sha256": "8abe1862026f5684de669e43d29ba3fabfa43fc4b2b4104a2b3a80cfda1ce15f",
+          "bytes": 81
+        },
+        "common/pcapx/pcaputil/testdata/protocol-sessions/README.md": {
+          "sha256": "10cc778fd6830a34a13ce5b69cff767675c15b45c6a988ae3e25c2c8e96d7cdc",
+          "bytes": 7395
+        },
+        "common/pcapx/pcaputil/testdata/protocol-sessions/first-batch-m1/.gitattributes": {
+          "sha256": "55cee11e32cab821c8b9ddbb1b9a31ec0b5a82691cdd5fcb02cdcfc436e25822",
+          "bytes": 101
+        },
+        "common/pcapx/pcaputil/testdata/protocol-sessions/first-batch-m1/tls-h2-bidi.keys": {
+          "sha256": "36e9091beac1b8fe5e2e53d897e7ae6e72452295272facad476bd9874b5fd3e3",
+          "bytes": 1616
+        },
+        "common/pcapx/pcaputil/testdata/protocol-sessions/m2b-quic.keys": {
+          "sha256": "dc83b0416e75df64784a8c68dea946a16061aa6ec0c2b1f59a46fe01dcd0296a",
+          "bytes": 1264
+        },
+        "common/pcapx/pcaputil/testdata/protocol-sessions/reliability/tls-hrr.keys": {
+          "sha256": "76285ca2b8c673ed269cefacd5c0c13760ab4d26ed5ebee465bd90c473a451ed",
+          "bytes": 632
+        },
+        "scripts/protocol-tests/check_go_test_json.py": {
+          "sha256": "26fccc4bdbdc4b15678600cf0e539c87c9573a0184a51f553ee52542d4eee56d",
+          "bytes": 4641
+        },
+        "scripts/protocol-tests/compare-quality-bench.py": {
+          "sha256": "331f1477a06ad6b15453a28c8d93ab324bf0dc100f9780f4d5649e400a4bdfba",
+          "bytes": 11175
+        },
+        "scripts/protocol-tests/generate-dcerpc-session/README.md": {
+          "sha256": "d4db02116b3d82f15f235f4c5afb5564e3630d63dcdf407372065e1012799ce0",
+          "bytes": 2590
+        },
+        "scripts/protocol-tests/generate-dcerpc-session/generate.py": {
+          "sha256": "69188c58977cb9b14c9748fca8454c5ca371694b8ea2ee2f69d883ea517818d1",
+          "bytes": 4860
+        },
+        "scripts/protocol-tests/generate-dcerpc-session/tshark-4.4.8.tsv": {
+          "sha256": "a31660fd2616db4a57b031ba1958c5d1281b816b1db93dd17b75c5f3be5f967c",
+          "bytes": 275
+        },
+        "scripts/protocol-tests/generate-dns-doh-native/Corefile": {
+          "sha256": "f888b8a5032fd7be076ae99fa7d57c74881c56c92b07201943163580d720044f",
+          "bytes": 236
+        },
+        "scripts/protocol-tests/generate-dns-doh-native/client.py": {
+          "sha256": "a01d7976548f5648de4eb1291d74417c29b095e4df6acfd467d4c29104962dd1",
+          "bytes": 5688
+        },
+        "scripts/protocol-tests/generate-dns-doh-native/db.native.test": {
+          "sha256": "23c99b28f3fe783d0fd1b56724cea7d778e012c9770b7a90793da250453902cf",
+          "bytes": 284
+        },
+        "scripts/protocol-tests/generate-dns-doh-native/generate.py": {
+          "sha256": "3d32028cff8c23bf12f1e422cff147278c594ff10b6b845acd522bc313c7f6da",
+          "bytes": 5593
+        },
+        "scripts/protocol-tests/generate-dns-doh-native/requirements.txt": {
+          "sha256": "1fd07aa6e7b47ca249fe04f34bd56c8abae7b730911e1af84f3379572603f421",
+          "bytes": 43
+        },
+        "scripts/protocol-tests/generate-dns-edns-native/generate.py": {
+          "sha256": "b48ea4ca2b10f33bbb0e84df15944df33d6d4f1e29d360172aae48f1c13fa2ca",
+          "bytes": 3989
+        },
+        "scripts/protocol-tests/generate-dtls-native/generate.py": {
+          "sha256": "4d8f2ba201689bafa346479298ea81254ff8bef32e7a1fa4e3802f1de2efaa77",
+          "bytes": 5711
+        },
+        "scripts/protocol-tests/generate-industrial-native/Dockerfile": {
+          "sha256": "b3d98e4a3a521d74d38ff1bc235d8f3ee4428faf96fc341d841f0a6f35feda2f",
+          "bytes": 999
+        },
+        "scripts/protocol-tests/generate-industrial-native/archive.py": {
+          "sha256": "a62fe30c4fffd7f0980963b2100224b7781a7e52b9749b543c8ac742ac980d56",
+          "bytes": 5744
+        },
+        "scripts/protocol-tests/generate-industrial-native/capture-goose.sh": {
+          "sha256": "39df4a8b20c7ac18f939e7c90d19815ff6a56fbb75f803d780a766d73a2e38d0",
+          "bytes": 747
+        },
+        "scripts/protocol-tests/generate-industrial-native/capture-opcua.py": {
+          "sha256": "af1e65c260c98deef9674c80bf18e7a7ecff1cb0a459d30307527d23f9771828",
+          "bytes": 3116
+        },
+        "scripts/protocol-tests/generate-industrial-native/generate.sh": {
+          "sha256": "ecb7e28b3dd90d46e8dc54221944b82d43c60b5382c09700ff95d5134f5e8ccb",
+          "bytes": 1755
+        },
+        "scripts/protocol-tests/generate-industrial-native/goose.c": {
+          "sha256": "98a5747cb581a78d360b3ceede89d8c599c8ea5b5934bb73a9470e92802b25da",
+          "bytes": 2563
+        },
+        "scripts/protocol-tests/generate-industrial-native/opcua.c": {
+          "sha256": "caff13d4540cdc49350010adfdece7fe2cdfa977184319bee1fa74cc1c7635bd",
+          "bytes": 7054
+        },
+        "scripts/protocol-tests/generate-kafka-flex/KafkaFlex.java": {
+          "sha256": "81a666fb41ba2a477e2a27cd80a1b67a2771704d52745e18ba4d6c7664b6dcc4",
+          "bytes": 5958
+        },
+        "scripts/protocol-tests/generate-kafka-flex/KafkaFlexTags.java": {
+          "sha256": "ed19709947e6858b1842f9b2e435c6c75078f0387c4d60ef76ab861a9ca1749c",
+          "bytes": 3398
+        },
+        "scripts/protocol-tests/generate-kafka-flex/README.md": {
+          "sha256": "f909413fa529b2a04efd8a380470079c2e51a605580d0b3e9958e7517b95e03c",
+          "bytes": 2642
+        },
+        "scripts/protocol-tests/generate-m1/README.md": {
+          "sha256": "d8cf59afbdf02a00287af66ae0efabb9860f61ca9f41cc42f413ff00f13be73b",
+          "bytes": 2240
+        },
+        "scripts/protocol-tests/generate-m1/main.go": {
+          "sha256": "77f32723e11f8278e95c41cc20854e2c4eceb16d8094a5788f7c90228970334c",
+          "bytes": 3085
+        },
+        "scripts/protocol-tests/generate-m1/web.go": {
+          "sha256": "910b9a0db581d563046fdee93ded0da2dee27c9b1538a5ccf5eaa662d3a041f7",
+          "bytes": 1809
+        },
+        "scripts/protocol-tests/generate-m2a/README.md": {
+          "sha256": "04da8a513d581b3db99ce63c2335ccc06e0be26d075a092392a2099586f7878b",
+          "bytes": 2466
+        },
+        "scripts/protocol-tests/generate-m2a/client.py": {
+          "sha256": "ee916b820ba4006b7b74b6acc55416a31104885b3d41e5fa691461d24edf8943",
+          "bytes": 4534
+        },
+        "scripts/protocol-tests/generate-m2b/databases.py": {
+          "sha256": "6967db9237dae713b9884218f30158ce10c2c5d050bb72c859c7dab481b24c39",
+          "bytes": 2316
+        },
+        "scripts/protocol-tests/generate-m2b/mysql_client.go": {
+          "sha256": "ec9fd936b7c8739198b9dc5a2802a650ff857d902dfdd2441c0f18a9153f0341",
+          "bytes": 696
+        },
+        "scripts/protocol-tests/generate-m2b/quic.py": {
+          "sha256": "e3cc6a39f8bd783543bdeb68a961cec4330f7a2a216170b81ce3b5b2a7df6754",
+          "bytes": 5068
+        },
+        "scripts/protocol-tests/generate-nats-native/client.go.txt": {
+          "sha256": "c216d8de9ae0ab5d2fce27cb7c4c2dc6b780f9988bab888e6533db591fe080ec",
+          "bytes": 5435
+        },
+        "scripts/protocol-tests/generate-nats-native/client.mod": {
+          "sha256": "eccf0fbea7e04a837f1ccecdb1803348d7e4dba10c2c0da2d4f85c217a2d63ce",
+          "bytes": 337
+        },
+        "scripts/protocol-tests/generate-nats-native/client.sum": {
+          "sha256": "ec5f884c848a19c7eaf45cf4484f6115dea613c6b1c0461d3115232bd97f8bf6",
+          "bytes": 996
+        },
+        "scripts/protocol-tests/generate-nats-native/generate.py": {
+          "sha256": "56249c391a2e32604c2a86a220f3a43474a308d2351ecfd167ea618fe5217dac",
+          "bytes": 9406
+        },
+        "scripts/protocol-tests/generate-nats-native/server-SHA256SUMS": {
+          "sha256": "c8e2e3968f029e4f42312afbf341da97905a7cf8e03f0fcc10f5b57c6dadc26a",
+          "bytes": 4920
+        },
+        "scripts/protocol-tests/generate-opcua-lifecycle-native/endpoint.c": {
+          "sha256": "95579e55049a4118571bfbdc4bb76d0737067f0071f9d273a086f1903b64f063",
+          "bytes": 2579
+        },
+        "scripts/protocol-tests/generate-opcua-lifecycle-native/generate.py": {
+          "sha256": "576f051d70a4e71ecaf0f85e11392ad45d419378c2fe016643989021ad49e291",
+          "bytes": 3728
+        },
+        "scripts/protocol-tests/generate-reliability/dns.py": {
+          "sha256": "434bb6051ba98b281472ad1f8d2496fa300c0fe102be0f1ff7a788b619389cd1",
+          "bytes": 1804
+        },
+        "scripts/protocol-tests/generate-reliability/redis.py": {
+          "sha256": "334e2778dde6efa4c371fbe8f3e556d3fe7ac2f93f686e86e9a60c13f4899f15",
+          "bytes": 1617
+        },
+        "scripts/protocol-tests/generate-reliability/tls.go": {
+          "sha256": "30aa4bee0bcc910f4f56088cf1e4658e4026a76d2be7ade88286b0d9e5172c0c",
+          "bytes": 1502
+        },
+        "scripts/protocol-tests/generate-sip-rtp-duplex/capture.sh": {
+          "sha256": "bacd5c10f0221e625852a90155c6de47579f96687dd6b1751f17c5c80b5a5f71",
+          "bytes": 4424
+        },
+        "scripts/protocol-tests/generate-sip-rtp-duplex/rtp_endpoint.py": {
+          "sha256": "97ef93b8c096a1c0dbfbaa21dd86b8ff1b5e2e1074c5eece867303867ac7b2a4",
+          "bytes": 3066
+        },
+        "scripts/protocol-tests/generate-stomp-native/README.md": {
+          "sha256": "999276a434a229b73a517df6137698a685a0ff2f98816ab4398f3575062176c8",
+          "bytes": 3428
+        },
+        "scripts/protocol-tests/generate-stomp-native/client.py": {
+          "sha256": "a68a911bf3e5bbdf282cfa175ffdef041023830c5544d4d8d14e0ff22343799c",
+          "bytes": 3993
+        },
+        "scripts/protocol-tests/generate-stomp-native/generate.py": {
+          "sha256": "e1def55d758890fe1138ca94129939a2501a1793f9469946378d70ccf6d0edcd",
+          "bytes": 5085
+        },
+        "scripts/protocol-tests/generate-stomp-native/requirements.txt": {
+          "sha256": "46d489b739a8e531c24a6ba48fa23ade7330418727677a945a82ee0f83b9ad38",
+          "bytes": 54
+        },
+        "scripts/protocol-tests/pr5013-corpus/capture_inventory.py": {
+          "sha256": "f7325fef8756ffc52bb444b055fdf43eeffbf4e655c448f46412a37f9e818da9",
+          "bytes": 8903
+        },
+        "scripts/protocol-tests/pr5013-corpus/fetch_manifest.py": {
+          "sha256": "cbd187ee29dbbd624a3f9c00c0d539fbfe576cdc0edd5daadd646042845b59e1",
+          "bytes": 2693
+        },
+        "scripts/protocol-tests/pr5013-corpus/generate_legal_zookeeper.py": {
+          "sha256": "1c3db34cc554a5a02c7cbef2329944ccf72fc97f30cb8416d7b4ce9a66bede39",
+          "bytes": 3341
+        },
+        "scripts/protocol-tests/required-tests.json": {
+          "sha256": "428aace88ad0f01c1b3a218765ec68293beeae65648fba82043627bd66a3c756",
+          "bytes": 27485
+        },
+        "scripts/protocol-tests/run-quality.py": {
+          "sha256": "b0d73aeba531e746c39877010b7714b43455a616c0c91bd15fe2107586f80810",
+          "bytes": 4626
+        },
+        "scripts/protocol-tests/test_check_go_test_json.py": {
+          "sha256": "8699bdbba3c9a877cbb101d73249018dea3fc87d00a4a8b5b1d5973af8b658c9",
+          "bytes": 3069
+        },
+        "scripts/protocol-tests/test_compare_quality_bench.py": {
+          "sha256": "cd1a40a9f04ac768188ba14daf7a4f8677c0005993fc82ded9f321e7b113fba3",
+          "bytes": 6986
+        }
+      },
+      "aliases": {
+        "common/bin-parser/testdata/protocol-corpus/README.md": "common/bin-parser/testdata/protocol-corpus/README.md",
+        "common/bin-parser/testdata/protocol-corpus/derived/README.md": "common/bin-parser/testdata/protocol-corpus/derived/README.md",
+        "common/bin-parser/testdata/protocol-corpus/tools/audit-pr5023-reproduction.mjs": "common/bin-parser/testdata/protocol-corpus/tools/audit-pr5023-reproduction.mjs",
+        "common/bin-parser/testdata/protocol-corpus/tools/audit-pr5023-reproduction.test.mjs": "common/bin-parser/testdata/protocol-corpus/tools/audit-pr5023-reproduction.test.mjs",
+        "common/bin-parser/testdata/protocol-corpus/tools/extract-quic-streams.mjs": "common/bin-parser/testdata/protocol-corpus/tools/extract-quic-streams.mjs",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/.gitignore": "common/bin-parser/testdata/protocol-corpus/tools/generate-local/.gitignore",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/README.md": "common/bin-parser/testdata/protocol-corpus/tools/generate-local/README.md",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/corrections.py": "common/bin-parser/testdata/protocol-corpus/tools/generate-local/corrections.py",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-local/generate.py": "common/bin-parser/testdata/protocol-corpus/tools/generate-local/generate.py",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/.gitignore": "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/.gitignore",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/README.md": "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/README.md",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/generate.py": "common/bin-parser/testdata/protocol-corpus/tools/generate-pr5023/generate.py",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate/main.go": "common/bin-parser/testdata/protocol-corpus/tools/generate/main.go",
+        "common/bin-parser/testdata/protocol-corpus/tools/generate/main_test.go": "common/bin-parser/testdata/protocol-corpus/tools/generate/main_test.go",
+        "common/bin-parser/testdata/protocol-native/dns-doh/Corefile": "common/bin-parser/testdata/protocol-native/dns-doh/Corefile",
+        "common/bin-parser/testdata/protocol-native/dns-doh/h1.keys": "common/bin-parser/testdata/protocol-native/dns-doh/h1.keys",
+        "common/bin-parser/testdata/protocol-native/dns-doh/h2.keys": "common/bin-parser/testdata/protocol-native/dns-doh/h2.keys",
+        "common/bin-parser/testdata/protocol-native/dns-doh/server.pem": "common/bin-parser/testdata/protocol-native/dns-doh/server.pem",
+        "common/bin-parser/testdata/protocol-native/dns-edns/Corefile": "common/bin-parser/testdata/protocol-native/dns-edns/Corefile",
+        "common/bin-parser/testdata/protocol-native/dtls/server.pem": "common/bin-parser/testdata/protocol-native/dtls/server.pem",
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/ecc-client.der": "common/bin-parser/testdata/protocol-native/industrial/certificates/ecc-client.der",
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/ecc-server.der": "common/bin-parser/testdata/protocol-native/industrial/certificates/ecc-server.der",
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/rsa-client.der": "common/bin-parser/testdata/protocol-native/industrial/certificates/rsa-client.der",
+        "common/bin-parser/testdata/protocol-native/industrial/certificates/rsa-server.der": "common/bin-parser/testdata/protocol-native/industrial/certificates/rsa-server.der",
+        "common/bin-parser/testdata/protocol-recognition-regressions/doh-clickhouse/README.md": "common/bin-parser/testdata/protocol-recognition-regressions/doh-clickhouse/README.md",
+        "common/bin-parser/testdata/winlab5013/README.md": "common/bin-parser/testdata/winlab5013/README.md",
+        "common/bin-parser/testdata/winlab5013/corrected/README.md": "common/bin-parser/testdata/winlab5013/corrected/README.md",
+        "common/pcapx/pcaputil/testdata/fuzz/FuzzFirstBatchM0/8abe1862026f5684": "common/pcapx/pcaputil/testdata/fuzz/FuzzFirstBatchM0/8abe1862026f5684",
+        "common/pcapx/pcaputil/testdata/protocol-sessions/README.md": "common/pcapx/pcaputil/testdata/protocol-sessions/README.md",
+        "common/pcapx/pcaputil/testdata/protocol-sessions/first-batch-m1/.gitattributes": "common/pcapx/pcaputil/testdata/protocol-sessions/first-batch-m1/.gitattributes",
+        "common/pcapx/pcaputil/testdata/protocol-sessions/first-batch-m1/tls-h2-bidi.keys": "common/pcapx/pcaputil/testdata/protocol-sessions/first-batch-m1/tls-h2-bidi.keys",
+        "common/pcapx/pcaputil/testdata/protocol-sessions/m2b-quic.keys": "common/pcapx/pcaputil/testdata/protocol-sessions/m2b-quic.keys",
+        "common/pcapx/pcaputil/testdata/protocol-sessions/reliability/tls-hrr.keys": "common/pcapx/pcaputil/testdata/protocol-sessions/reliability/tls-hrr.keys",
+        "scripts/protocol-tests/check_go_test_json.py": "scripts/protocol-tests/check_go_test_json.py",
+        "scripts/protocol-tests/compare-quality-bench.py": "scripts/protocol-tests/compare-quality-bench.py",
+        "scripts/protocol-tests/generate-dcerpc-session/README.md": "scripts/protocol-tests/generate-dcerpc-session/README.md",
+        "scripts/protocol-tests/generate-dcerpc-session/generate.py": "scripts/protocol-tests/generate-dcerpc-session/generate.py",
+        "scripts/protocol-tests/generate-dcerpc-session/tshark-4.4.8.tsv": "scripts/protocol-tests/generate-dcerpc-session/tshark-4.4.8.tsv",
+        "scripts/protocol-tests/generate-dns-doh-native/Corefile": "scripts/protocol-tests/generate-dns-doh-native/Corefile",
+        "scripts/protocol-tests/generate-dns-doh-native/client.py": "scripts/protocol-tests/generate-dns-doh-native/client.py",
+        "scripts/protocol-tests/generate-dns-doh-native/db.native.test": "scripts/protocol-tests/generate-dns-doh-native/db.native.test",
+        "scripts/protocol-tests/generate-dns-doh-native/generate.py": "scripts/protocol-tests/generate-dns-doh-native/generate.py",
+        "scripts/protocol-tests/generate-dns-doh-native/requirements.txt": "scripts/protocol-tests/generate-dns-doh-native/requirements.txt",
+        "scripts/protocol-tests/generate-dns-edns-native/generate.py": "scripts/protocol-tests/generate-dns-edns-native/generate.py",
+        "scripts/protocol-tests/generate-dtls-native/generate.py": "scripts/protocol-tests/generate-dtls-native/generate.py",
+        "scripts/protocol-tests/generate-industrial-native/Dockerfile": "scripts/protocol-tests/generate-industrial-native/Dockerfile",
+        "scripts/protocol-tests/generate-industrial-native/archive.py": "scripts/protocol-tests/generate-industrial-native/archive.py",
+        "scripts/protocol-tests/generate-industrial-native/capture-goose.sh": "scripts/protocol-tests/generate-industrial-native/capture-goose.sh",
+        "scripts/protocol-tests/generate-industrial-native/capture-opcua.py": "scripts/protocol-tests/generate-industrial-native/capture-opcua.py",
+        "scripts/protocol-tests/generate-industrial-native/generate.sh": "scripts/protocol-tests/generate-industrial-native/generate.sh",
+        "scripts/protocol-tests/generate-industrial-native/goose.c": "scripts/protocol-tests/generate-industrial-native/goose.c",
+        "scripts/protocol-tests/generate-industrial-native/opcua.c": "scripts/protocol-tests/generate-industrial-native/opcua.c",
+        "scripts/protocol-tests/generate-kafka-flex/KafkaFlex.java": "scripts/protocol-tests/generate-kafka-flex/KafkaFlex.java",
+        "scripts/protocol-tests/generate-kafka-flex/KafkaFlexTags.java": "scripts/protocol-tests/generate-kafka-flex/KafkaFlexTags.java",
+        "scripts/protocol-tests/generate-kafka-flex/README.md": "scripts/protocol-tests/generate-kafka-flex/README.md",
+        "scripts/protocol-tests/generate-m1/README.md": "scripts/protocol-tests/generate-m1/README.md",
+        "scripts/protocol-tests/generate-m1/main.go": "scripts/protocol-tests/generate-m1/main.go",
+        "scripts/protocol-tests/generate-m1/web.go": "scripts/protocol-tests/generate-m1/web.go",
+        "scripts/protocol-tests/generate-m2a/README.md": "scripts/protocol-tests/generate-m2a/README.md",
+        "scripts/protocol-tests/generate-m2a/client.py": "scripts/protocol-tests/generate-m2a/client.py",
+        "scripts/protocol-tests/generate-m2b/databases.py": "scripts/protocol-tests/generate-m2b/databases.py",
+        "scripts/protocol-tests/generate-m2b/mysql_client.go": "scripts/protocol-tests/generate-m2b/mysql_client.go",
+        "scripts/protocol-tests/generate-m2b/quic.py": "scripts/protocol-tests/generate-m2b/quic.py",
+        "scripts/protocol-tests/generate-nats-native/client.go.txt": "scripts/protocol-tests/generate-nats-native/client.go.txt",
+        "scripts/protocol-tests/generate-nats-native/client.mod": "scripts/protocol-tests/generate-nats-native/client.mod",
+        "scripts/protocol-tests/generate-nats-native/client.sum": "scripts/protocol-tests/generate-nats-native/client.sum",
+        "scripts/protocol-tests/generate-nats-native/generate.py": "scripts/protocol-tests/generate-nats-native/generate.py",
+        "scripts/protocol-tests/generate-nats-native/server-SHA256SUMS": "scripts/protocol-tests/generate-nats-native/server-SHA256SUMS",
+        "scripts/protocol-tests/generate-opcua-lifecycle-native/endpoint.c": "scripts/protocol-tests/generate-opcua-lifecycle-native/endpoint.c",
+        "scripts/protocol-tests/generate-opcua-lifecycle-native/generate.py": "scripts/protocol-tests/generate-opcua-lifecycle-native/generate.py",
+        "scripts/protocol-tests/generate-reliability/dns.py": "scripts/protocol-tests/generate-reliability/dns.py",
+        "scripts/protocol-tests/generate-reliability/redis.py": "scripts/protocol-tests/generate-reliability/redis.py",
+        "scripts/protocol-tests/generate-reliability/tls.go": "scripts/protocol-tests/generate-reliability/tls.go",
+        "scripts/protocol-tests/generate-sip-rtp-duplex/capture.sh": "scripts/protocol-tests/generate-sip-rtp-duplex/capture.sh",
+        "scripts/protocol-tests/generate-sip-rtp-duplex/rtp_endpoint.py": "scripts/protocol-tests/generate-sip-rtp-duplex/rtp_endpoint.py",
+        "scripts/protocol-tests/generate-stomp-native/README.md": "scripts/protocol-tests/generate-stomp-native/README.md",
+        "scripts/protocol-tests/generate-stomp-native/client.py": "scripts/protocol-tests/generate-stomp-native/client.py",
+        "scripts/protocol-tests/generate-stomp-native/generate.py": "scripts/protocol-tests/generate-stomp-native/generate.py",
+        "scripts/protocol-tests/generate-stomp-native/requirements.txt": "scripts/protocol-tests/generate-stomp-native/requirements.txt",
+        "scripts/protocol-tests/pr5013-corpus/capture_inventory.py": "scripts/protocol-tests/pr5013-corpus/capture_inventory.py",
+        "scripts/protocol-tests/pr5013-corpus/fetch_manifest.py": "scripts/protocol-tests/pr5013-corpus/fetch_manifest.py",
+        "scripts/protocol-tests/pr5013-corpus/generate_legal_zookeeper.py": "scripts/protocol-tests/pr5013-corpus/generate_legal_zookeeper.py",
+        "scripts/protocol-tests/required-tests.json": "scripts/protocol-tests/required-tests.json",
+        "scripts/protocol-tests/run-quality.py": "scripts/protocol-tests/run-quality.py",
+        "scripts/protocol-tests/test_check_go_test_json.py": "scripts/protocol-tests/test_check_go_test_json.py",
+        "scripts/protocol-tests/test_compare_quality_bench.py": "scripts/protocol-tests/test_compare_quality_bench.py"
+      },
+      "sha256": "8266960ccb868ad485e8cc64bb1acfd27e18bdbe21e0759394b95729c941300d"
     }
   ],
   "schema_version": 1,

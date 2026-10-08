@@ -144,6 +144,8 @@ func TestFirstBatchT05Inspect(t *testing.T) {
 	base := "../../pcaputil/testdata/protocol-sessions/first-batch-m1/"
 	key, err := trafficfixture.ReadFile(base + "tls-h2-bidi.keys")
 	require.NoError(t, err)
+	keyPath, err := trafficfixture.Materialize(base+"tls-h2-bidi.keys", t.TempDir())
+	require.NoError(t, err)
 	keys, err := pcaputil.ParseTLSKeyLog(string(key))
 	require.NoError(t, err)
 	for _, name := range []string{"tls-h2-bidi.pcap", "http-ws-native.pcap", "dhcpv6-native.pcap"} {
@@ -152,7 +154,7 @@ func TestFirstBatchT05Inspect(t *testing.T) {
 			var expected pcaputil.ProtocolStats
 			require.NoError(t, pcaputil.ReplayPcapFile(path, pcaputil.WithTLSSecrets(keys), pcaputil.WithOnProtocolMessage(func(*pcaputil.ProtocolEvent) {}), pcaputil.WithOnProtocolStats(func(s pcaputil.ProtocolStats) { expected = s })))
 			file := filepath.Join(t.TempDir(), "report.json")
-			require.NoError(t, run(context.Background(), []string{"-read", path, "-tls-keylog", base + "tls-h2-bidi.keys", "-report", file, "-quiet"}, io.Discard, io.Discard))
+			require.NoError(t, run(context.Background(), []string{"-read", path, "-tls-keylog", keyPath, "-report", file, "-quiet"}, io.Discard, io.Discard))
 			raw, err := trafficfixture.ReadFile(file)
 			require.NoError(t, err)
 			var got report

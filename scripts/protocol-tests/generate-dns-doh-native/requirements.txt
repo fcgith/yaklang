@@ -1,2 +1,0 @@
-dnspython[doh]==2.7.0
-httpx[http2]==0.28.1

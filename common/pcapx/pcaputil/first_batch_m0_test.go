@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -316,6 +317,17 @@ func TestFirstBatchT03(t *testing.T) {
 	}
 }
 func FuzzFirstBatchM0(f *testing.F) {
+	// Preserve the minimized regression seed while keeping its original Go
+	// fuzz encoding and bytes in the immutable supporting-materials batch.
+	seed, err := trafficfixture.ReadFile("testdata/fuzz/FuzzFirstBatchM0/8abe1862026f5684")
+	require.NoError(f, err)
+	lines := strings.Split(strings.TrimSpace(string(seed)), "\n")
+	require.Len(f, lines, 2)
+	require.Equal(f, "go test fuzz v1", lines[0])
+	require.True(f, strings.HasPrefix(lines[1], "[]byte(") && strings.HasSuffix(lines[1], ")"))
+	value, err := strconv.Unquote(strings.TrimSuffix(strings.TrimPrefix(lines[1], "[]byte("), ")"))
+	require.NoError(f, err)
+	f.Add([]byte(value))
 	for _, w := range [][]byte{[]byte(":+1\r\n"), {1, 'a', 0}, {0xc0, 0}, rfc9001ClientInitial()} {
 		f.Add(w)
 	}

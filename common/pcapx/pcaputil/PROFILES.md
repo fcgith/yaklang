@@ -75,7 +75,10 @@ This is a documented subset, not full Wireshark filter compatibility.
 
 Use `pcap-inspect -read capture.pcap -tls-keylog authorized.keys`, or
 `yak shark --pcap-file capture.pcap --tls-keylog authorized.keys`. Keys are never
-auto-discovered or exported. The existing `.keys` fixtures contain generated loopback session secrets and remain separate from the corpus ZIP. Record authentication does not prove certificate trust
+auto-discovered or exported by production readers. The existing `.keys` fixtures
+contain generated loopback session secrets, sealed with the reproduction tools
+in the supporting-materials ZIP. Tests materialize explicit private copies for
+filename APIs. Record authentication does not prove certificate trust
 or business authentication. Certificate metadata always says `not-evaluated`.
 
 ## Recognition and additional transport profiles
@@ -102,7 +105,12 @@ are not added here. Redis streamed strings/aggregates remain unsupported.
 loopback PCAP (tcpdump reported zero kernel drops), actual socket reply oracles,
 and a 63-message Kafka TShark 4.4.8 field export. Redis 7.2.5 and Kafka 3.9.1
 ran on isolated ports. Reproduction instructions and an independent Python
-client are in `scripts/protocol-tests/generate-m2a/`.
+client are sealed at `scripts/protocol-tests/generate-m2a/`.
+
+Reproduction paths in this document are virtual ZIP aliases. Use
+`go run ./internal/trafficfixture/cmd/corpus export /tmp/new-traffic-workspace`
+to obtain configs, certificates, synthetic keylogs and the original build/capture
+recipes, or `corpus exec -- ... @path` for temporary verified tool inputs.
 
 Capture-backed tests run full/deferred with workers 1/2/4 and check all 31 Kafka
 response associations, actual record values/offsets/CRC, Redis pushes, and

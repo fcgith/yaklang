@@ -82,10 +82,13 @@ func TestTrafficWorkflowIsolation(t *testing.T) {
 	for _, step := range job.Steps {
 		run += step.Run + "\n"
 	}
-	if !strings.Contains(run, "go test -json -count=1 -timeout=5m ./internal/trafficfixture ./common/bin-parser/... ./common/pcapx/... ./common/yak/cmd/yakcmds/shark-cli") {
+	if !strings.Contains(run, "go test -json -count=1 -timeout=5m ./internal/trafficfixture/... ./common/bin-parser/... ./common/pcapx/... ./common/yak/cmd/yakcmds/shark-cli") {
 		t.Fatal("isolated traffic job must run complete parser and pcapx packages, including capture CLI")
 	}
-	if !strings.Contains(run, "check_go_test_json.py") || !strings.Contains(run, "--inventory scripts/protocol-tests/required-tests.json --tier full") {
+	if !strings.Contains(run, "go run ./internal/trafficfixture/cmd/corpus test") {
+		t.Fatal("traffic CI must execute the archived tooling and validator regressions")
+	}
+	if !strings.Contains(run, "corpus exec -- python3 @scripts/protocol-tests/check_go_test_json.py") || !strings.Contains(run, "--inventory @scripts/protocol-tests/required-tests.json --tier full") {
 		t.Fatal("traffic test success requires the actual package-qualified test inventory")
 	}
 }

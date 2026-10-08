@@ -31,13 +31,15 @@ type Member struct {
 	Bytes  int64  `json:"bytes"`
 }
 type Batch struct {
-	ID       string            `json:"id"`
-	File     string            `json:"file"`
-	SHA256   string            `json:"sha256"`
-	Password string            `json:"password"`
-	Members  map[string]Member `json:"members"`
-	Aliases  map[string]string `json:"aliases"`
-	files    map[string]*zip.File
+	ID        string            `json:"id"`
+	Kind      string            `json:"kind,omitempty"`
+	SourceSHA string            `json:"source_sha,omitempty"`
+	File      string            `json:"file"`
+	SHA256    string            `json:"sha256"`
+	Password  string            `json:"password"`
+	Members   map[string]Member `json:"members"`
+	Aliases   map[string]string `json:"aliases"`
+	files     map[string]*zip.File
 }
 type Index struct {
 	SchemaVersion       int      `json:"schema_version"`
@@ -50,9 +52,10 @@ type location struct {
 	member string
 }
 type corpus struct {
-	root    string
-	index   Index
-	aliases map[string]location
+	root     string
+	index    Index
+	indexRaw []byte
+	aliases  map[string]location
 }
 
 var loaded struct {
@@ -187,6 +190,7 @@ func load() (*corpus, error) {
 		c := &corpus{root: root, aliases: map[string]location{}}
 		data, err := readBoundedFile(filepath.Join(root, batchDir, "index.json"), maxMember)
 		if err == nil {
+			c.indexRaw = data
 			err = json.Unmarshal(data, &c.index)
 		}
 		if err != nil {
@@ -278,6 +282,13 @@ func ReadFile(name string) ([]byte, error) {
 	ext := strings.ToLower(path.Ext(rel))
 	if validName(rel) && (ext == ".pcap" || ext == ".pcapng" || ext == ".cap") {
 		return nil, fmt.Errorf("trafficfixture: unindexed repository capture %s", rel)
+	}
+	if validName(rel) && ext != ".go" && !strings.HasPrefix(rel, batchDir+"/") {
+		for _, prefix := range []string{"common/bin-parser/testdata/", "common/pcapx/pcaputil/testdata/", "scripts/protocol-tests/"} {
+			if strings.HasPrefix(rel, prefix) {
+				return nil, fmt.Errorf("trafficfixture: unindexed repository material %s", rel)
+			}
+		}
 	}
 	return os.ReadFile(name)
 }
