@@ -1,6 +1,7 @@
 package pcaputil
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"testing"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/yaklang/yaklang/common/bin-parser/parser/base"
+	"github.com/yaklang/yaklang/common/bin-parser/parser/stream_parser"
 	"github.com/yaklang/yaklang/internal/trafficfixture"
 )
 
@@ -103,5 +106,72 @@ func TestDNSTCPOutcomeCaptureReplay(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// Reject before entering the rule VM: a native collection limit must not spend
+// its CPU budget replaying the same rejected message through another parser.
+type dnsBudgetRuleProbe struct {
+	stream_parser.DefParser
+	calls  int
+	reject bool
+}
+
+func (p *dnsBudgetRuleProbe) OnRoot(node *base.Node) error {
+	p.calls++
+	if p.reject {
+		return fmt.Errorf("unexpected DNS rule parse")
+	}
+	return p.DefParser.OnRoot(node)
+}
+
+func TestDNSTCPBudgetRejectsBeforeRuleDecode(t *testing.T) {
+	original := base.ParserRegistration("default")
+	defer base.RegisterParser("default", original)
+	probe := &dnsBudgetRuleProbe{}
+	base.RegisterParser("default", probe)
+	txt := caaDNSControl(make([]byte, 4097))
+	binary.BigEndian.PutUint16(txt[13:], 16)
+	binary.BigEndian.PutUint16(txt[19:], 16)
+	txt = append(binary.BigEndian.AppendUint16(nil, uint16(len(txt))), txt...)
+	records, err := trafficfixture.ReadFile("../../bin-parser/testdata/protocol-recognition-regressions/dns/two-questions.tcp.bin")
+	require.NoError(t, err)
+	feed := func(t *testing.T, wire []byte, limit int) (*ProtocolEvent, ProtocolStats) {
+		t.Helper()
+		s, err := NewProtocolSession(ParserBudget{MaxCollectionElements: limit})
+		require.NoError(t, err)
+		s.(*captureSession).f.ports = [2]uint16{40000, 53}
+		r := s.Feed(1, time.Unix(1, 0), wire)
+		require.Len(t, r.Events, 1)
+		s.Close("EOF")
+		require.Zero(t, s.Stats().BufferedBytes)
+		return r.Events[0], s.Stats()
+	}
+	for _, tc := range []struct {
+		name  string
+		wire  []byte
+		limit int
+	}{
+		{"txt-count", txt, 4096}, {"record-count", records, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe.calls, probe.reject = 0, true
+			e, stats := feed(t, tc.wire, tc.limit)
+			require.Equal(t, "limited", e.Status)
+			require.Equal(t, string(ErrResourceExceeded), e.ExpertCode)
+			require.Zero(t, probe.calls, "resource rejection invoked rule parser")
+			require.Nil(t, e.Fields)
+			require.Nil(t, e.Structured)
+			require.Zero(t, stats.Decoded+stats.Deferred+stats.Malformed)
+			require.EqualValues(t, len(tc.wire), stats.LimitedBytes)
+			require.Equal(t, tc.wire, e.Raw)
+			probe.calls, probe.reject = 0, false
+			normal, stats := feed(t, records, 4096)
+			require.Equal(t, "decoded", normal.Status, "%s", normal.Error)
+			require.Positive(t, probe.calls, "valid message bypassed custom parser")
+			require.NotEmpty(t, normal.Fields)
+			require.EqualValues(t, 1, stats.Decoded)
+			require.Zero(t, stats.LimitedBytes+stats.Malformed)
+		})
 	}
 }

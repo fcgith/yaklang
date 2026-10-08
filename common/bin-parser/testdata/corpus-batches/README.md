@@ -20,8 +20,8 @@ remain inside these archives. Artificial and upstream fixtures do not become
 claims of real capture merely because they are archived.
 
 The supporting-materials batch seals 86 further files from `2598e4d6aafbd369a46be8c71aff3cbc799cebdb`:
-generators and their tests, capture/build recipes, validator scripts, the current
-required-test inventory, endpoint configs, six public test certificates, five
+generators and their tests, capture/build recipes, validator scripts, its original
+107-test inventory, endpoint configs, six public test certificates, five
 generated loopback session keylogs and the minimized Go fuzz regression seed.
 The quality runner resolves the tested checkout through `YAK_TRAFFIC_REPO_ROOT`;
 its companion validator and inventory still come from the verified workspace.
@@ -44,7 +44,7 @@ Run from the repository root:
 ```sh
 go run ./internal/trafficfixture/cmd/corpus test
 go test -json -count=1 -timeout=5m ./internal/trafficfixture/... ./common/bin-parser/... ./common/pcapx/... ./common/yak/cmd/yakcmds/shark-cli > traffic.jsonl
-go run ./internal/trafficfixture/cmd/corpus exec -- python3 @scripts/protocol-tests/check_go_test_json.py traffic.jsonl --inventory @scripts/protocol-tests/required-tests.json --tier full
+go run ./internal/trafficfixture/cmd/corpus exec -- python3 @scripts/protocol-tests/check_go_test_json.py traffic.jsonl --inventory @scripts/protocol-tests/required-tests-v2.json --tier full
 ```
 
 The single `corpus` entry point uses the same bounded Go ZIP loader as tests.
@@ -66,7 +66,7 @@ path aliases, module files, the small current Go source dependencies and an
 ```sh
 go run ./internal/trafficfixture/cmd/corpus verify
 go run ./internal/trafficfixture/cmd/corpus export /tmp/new-traffic-workspace
-go run ./internal/trafficfixture/cmd/corpus exec -- python3 @scripts/protocol-tests/run-quality.py quick --output /tmp/new-quality-result
+go run ./internal/trafficfixture/cmd/corpus exec -- python3 @scripts/protocol-tests/run-quality-v2.py quick --output /tmp/new-quality-result
 ```
 
 Add future captures and answers as a **new** batch. Do not rewrite old ZIPs,
@@ -83,6 +83,6 @@ their semantic coverage. The existing synthetic session keys are test inputs;
 production credentials, user private keys and material without redistribution
 permission belong in an external fixed-source download manifest.
 
-Current test requirements are sealed at `scripts/protocol-tests/required-tests.json`;
-the baseline's historical requirements remain sealed with its evidence. Test
+Current test requirements are sealed at `scripts/protocol-tests/required-tests-v2.json`;
+the baseline's historical requirements remain sealed with its evidence. The new validation batch adds the DNS-before-rule budget regression (108 full requirements); prior materials and their 107-item inventory remain unchanged. `run-quality-v2.py` reuses the sealed quality runner with this inventory. Test
 logs, profiles and iteration reports belong outside the repository.

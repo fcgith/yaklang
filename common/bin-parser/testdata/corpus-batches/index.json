@@ -4899,6 +4899,28 @@
         "scripts/protocol-tests/test_compare_quality_bench.py": "scripts/protocol-tests/test_compare_quality_bench.py"
       },
       "sha256": "8266960ccb868ad485e8cc64bb1acfd27e18bdbe21e0759394b95729c941300d"
+    },
+    {
+      "aliases": {
+        "scripts/protocol-tests/required-tests-v2.json": "scripts/protocol-tests/required-tests-v2.json",
+        "scripts/protocol-tests/run-quality-v2.py": "scripts/protocol-tests/run-quality-v2.py"
+      },
+      "file": "validation-dns-budget-ae44a462.zip",
+      "id": "validation-dns-budget-ae44a462",
+      "kind": "supporting-materials",
+      "members": {
+        "scripts/protocol-tests/required-tests-v2.json": {
+          "bytes": 27766,
+          "sha256": "f8118f7db3809621485ee445fe18a2f8fa4209a2f68a918fa64902226a7ce0da"
+        },
+        "scripts/protocol-tests/run-quality-v2.py": {
+          "bytes": 478,
+          "sha256": "d7440a9c73dee8d43388bd6dac45adee30935b2cec17f151974706462346602c"
+        }
+      },
+      "password": "bin-parser",
+      "sha256": "a8ef85eef1f65f31d43f43162340fef67ed3ab0bdd8a6a2cce715c7ba37b328a",
+      "source_sha": "ae44a4626af9a110eccef5e1005fe6eac8998e41"
     }
   ],
   "schema_version": 1,

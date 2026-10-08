@@ -651,6 +651,13 @@ func (f *binFlow) feed(dir int, data []byte, ts time.Time) {
 		if f.protocol == "dns" || f.protocol == "dot" {
 			e.decodeSkip = 2
 		}
+		var dnsFields map[string]any
+		var dnsErr error
+		if f.protocol == "dns" || f.protocol == "dot" {
+			// Enforce native collection budgets before the rule VM can retry a
+			// rejected message. Reuse accepted fields for DNS association below.
+			dnsFields, dnsErr = DecodeDNSMessage(e.Raw[e.decodeSkip:], a.budget.MaxCollectionElements)
+		}
 		if f.protocol == "smb2" {
 			e.decodeSkip = 4
 		}
@@ -690,12 +697,14 @@ func (f *binFlow) feed(dir int, data []byte, ts time.Time) {
 			} else if e.Protocol == "websocket" && e.Entry == "WebSocket" && f.ws != nil && f.ws.deflate {
 				result = map[string]any{"fields": map[string]any{}}
 			} else {
-				result, err = e.Decode()
-				// A rule diagnostic must not hide the shared DNS codec's typed
-				// resource failure. Keep successful structured output unchanged.
-				if err != nil && (f.protocol == "dns" || f.protocol == "dot") {
-					if _, semanticErr := DecodeDNSMessage(e.Raw[e.decodeSkip:], a.budget.MaxCollectionElements); semanticErr != nil {
-						err = semanticErr
+				var budgetErr *ProtocolError
+				if errors.As(dnsErr, &budgetErr) && budgetErr.Kind == ErrResourceExceeded {
+					err = dnsErr
+				} else {
+					result, err = e.Decode()
+					// Preserve the shared codec's established error classification.
+					if err != nil && dnsErr != nil {
+						err = dnsErr
 					}
 				}
 			}
@@ -808,6 +817,10 @@ func (f *binFlow) feed(dir int, data []byte, ts time.Time) {
 				var err error
 				if dns, ok := e.Session["DNS"].(map[string]any); ok {
 					err = a.dnsEventDecoded(e, dns)
+				} else if dnsErr != nil {
+					err = dnsErr
+				} else if dnsFields != nil {
+					err = a.dnsEventDecoded(e, dnsFields)
 				} else {
 					err = a.dnsEvent(e, e.Raw[2:])
 				}
