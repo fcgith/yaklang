@@ -1,0 +1,134 @@
+# yaklite
+
+A small LAN inventory and change-monitoring tool built from the parts of
+yaklang that held up in testing: the port scanner (connect and SYN) and the
+service fingerprinter (nmap-derived probes plus ~11.8k web/CPE rules).
+
+It answers two questions for a network you own:
+
+- **What is on my network right now?** `yaklite scan`
+- **What changed since last time?** `yaklite watch` / `yaklite diff`
+
+Only scan networks you own or are authorised to test.
+
+## What it leaves out, on purpose
+
+The full `yak` binary is 310 MB and ships an AI agent, gRPC engine, MITM CA,
+plugin store and self-updater. Testing found unsafe defaults in several of
+these. yaklite links none of them:
+
+| Full yak | yaklite |
+| --- | --- |
+| Resets umask to 0, so files and the CA key end up world-readable or world-writable | Leaves your umask alone. State dir is `0700`, files are `0600` |
+| Creates `~/yakit-projects` | Keeps yaklang's working files in `~/.local/state/yaklite/engine` (`0700`) |
+| gRPC, MCP, AI gateway and reverse listeners, some on `0.0.0.0` | Opens no listening sockets |
+| Self-update and plugin downloads with TLS verification off | No update or download code. The webhook uses Go's default client with certificate checks, and plain `http://` is refused except to localhost |
+| AI provider calls to the vendor cloud by default | No AI code |
+
+Binary size: about 58 MB (stripped) against 310 MB.
+
+## Usage
+
+```sh
+go build -ldflags "-s -w" -o yaklite ./cmd/yaklite
+
+# one-off inventory of your LAN, common ports, with fingerprints
+./yaklite scan -t 192.168.1.0/24
+
+# all ports on a single host, saved as JSON
+./yaklite scan -t 192.168.1.10 -p all -o nas.json
+
+# faster subnet discovery with raw SYN packets (root or CAP_NET_RAW)
+sudo ./yaklite scan -t 192.168.1.0/24 -p top --syn
+
+# compare two saved scans (exit code 3 when anything changed)
+./yaklite diff monday.json friday.json
+```
+
+`-p` accepts `top` (default, ~80 ports common on home and office networks:
+SSH, web, SMB, RDP, VNC, printers, NAS, MQTT, Home Assistant, Plex, Jellyfin,
+Docker, Kubernetes, databases, WireGuard), `all`, or a list such as
+`22,80,8000-8100`.
+
+Fingerprints that come only from the port number are shown as
+`(unconfirmed)` and are never reported as a service change, so a flaky probe
+does not raise an alert.
+
+## Monitoring with watch
+
+`yaklite watch` scans on a schedule, keeps the last snapshot, and reports:
+
+- `host_new`, `host_gone` (only after `--gone-after` scans in a row, default 2, so a sleeping laptop does not alert every hour)
+- `port_open`, `port_closed`
+- `service_changed` (for example `OpenSSH 8.9p1 -> Dropbear sshd 2022.83`)
+
+The first run records a baseline and does not alert. Every change is
+appended to `<state>/<name>.changes.jsonl` and can be posted to a webhook as
+`{"text": "...", "changes": [...]}`. Slack and Mattermost incoming webhooks,
+and ntfy topics, accept that body as is.
+
+```sh
+# long-running
+./yaklite watch -t 192.168.1.0/24 --every 1h --webhook https://ntfy.sh/your-topic
+
+# one cycle, for cron or a systemd timer (exit 3 = changes found)
+./yaklite watch -t 192.168.1.0/24 --once
+```
+
+### systemd timer (Linux LAN box)
+
+`/etc/systemd/system/yaklite-lan.service`
+
+```ini
+[Unit]
+Description=yaklite LAN change check
+
+[Service]
+Type=oneshot
+User=yaklite
+ExecStart=/usr/local/bin/yaklite watch -t 192.168.1.0/24 --once --syn -q --webhook https://ntfy.sh/your-topic
+SuccessExitStatus=3
+AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+StateDirectory=yaklite
+Environment=XDG_STATE_HOME=/var/lib
+```
+
+`/etc/systemd/system/yaklite-lan.timer`
+
+```ini
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it with `systemctl enable --now yaklite-lan.timer`. Drop `--syn` and
+`AmbientCapabilities` to run without raw sockets.
+
+## What was not extracted, and what to pair it with
+
+These parts of yaklang were tested and were too weak to carry over:
+
+- **Traffic analysis (pcap + Suricata rules).** `yak pcap --suricata` is a
+  no-op, only HTTP flows reach the matcher, and core keywords such as
+  `dsize`, `flags`, `flow`, `threshold`, `flowbits` and `byte_test` are parsed
+  but never enforced, so rules over-fire. The statically linked libpcap 1.8.1
+  could not open the repo's own test capture. Use **Suricata** (signatures)
+  or **Zeek** (connection logs, protocol metadata) on a mirror/SPAN port
+  instead. yaklite's inventory complements them by telling you which hosts
+  and services should exist.
+- **Host monitoring (HIDS).** Well-tested code, but it only reports to the
+  closed-source Legion platform, is excluded from normal builds, and its eBPF
+  exec events carry no arguments. Use **Wazuh**, **osquery** or **Falco**.
+- **Metrics and dashboards.** yaklang has none. Use Prometheus with
+  node_exporter, or Uptime Kuma for simple availability checks.
+
+## Licence
+
+yaklite is part of this AGPL-3.0 repository and stays AGPL-3.0. Running it on
+your own machines and LAN needs nothing extra. If you give others access to a
+modified version over a network, you must offer them its source.
