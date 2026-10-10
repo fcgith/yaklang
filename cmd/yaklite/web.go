@@ -93,11 +93,9 @@ func (r *stateReader) changes(path string) ([]Change, error) {
 	return list, nil
 }
 
-func (r *stateReader) hostName(host string) string {
-	if r.inv != nil {
-		if e := r.inv.Hosts[host]; e != nil {
-			return e.Name
-		}
+func (r *stateReader) hostName(host string, snap *Snapshot) string {
+	if e := r.inv.entry(host, snap.mac(host)); e != nil {
+		return e.Name
 	}
 	return ""
 }
@@ -165,20 +163,32 @@ func (r *stateReader) metrics(states []*watchState) string {
 	p.metric("yaklite_host_open_ports", "gauge", "Open ports per host.")
 	for _, w := range states {
 		for _, h := range sortedHosts(w.Snap) {
-			p.sample("yaklite_host_open_ports", float64(len(w.Snap.Hosts[h])), "watch", w.Name, "host", h, "name", r.hostName(h))
+			p.sample("yaklite_host_open_ports", float64(len(w.Snap.Hosts[h])), "watch", w.Name, "host", h, "name", r.hostName(h, w.Snap))
 		}
 	}
 	p.metric("yaklite_host_missed_scans", "gauge", "Consecutive scans a known host did not answer (0 when it answered).")
 	for _, w := range states {
 		for _, h := range sortedHosts(w.Snap) {
-			p.sample("yaklite_host_missed_scans", float64(w.Snap.Misses[h]), "watch", w.Name, "host", h, "name", r.hostName(h))
+			p.sample("yaklite_host_missed_scans", float64(w.Snap.Misses[h]), "watch", w.Name, "host", h, "name", r.hostName(h, w.Snap))
+		}
+	}
+	p.metric("yaklite_device_info", "gauge", "One series per device found by MAC address.")
+	for _, w := range states {
+		for _, h := range sortedHosts(w.Snap) {
+			d := w.Snap.Devices[h]
+			if d == nil {
+				continue
+			}
+			p.sample("yaklite_device_info", 1, "watch", w.Name, "host", h, "name", r.hostName(h, w.Snap), "mac", d.MAC,
+				"vendor", d.Vendor, "hostname", d.Hostname, "randomized_mac", strconv.FormatBool(d.Randomized),
+				"gateway", strconv.FormatBool(h == w.Snap.Gateway))
 		}
 	}
 	p.metric("yaklite_service_info", "gauge", "One series per open port, labelled with what the fingerprinter found.")
 	for _, w := range states {
 		for _, h := range sortedHosts(w.Snap) {
 			for _, s := range w.Snap.Hosts[h] {
-				p.sample("yaklite_service_info", 1, "watch", w.Name, "host", h, "name", r.hostName(h),
+				p.sample("yaklite_service_info", 1, "watch", w.Name, "host", h, "name", r.hostName(h, w.Snap),
 					"port", strconv.Itoa(s.Port), "proto", s.Proto, "service", s.Service, "product", s.Product,
 					"version", s.Version, "verified", strconv.FormatBool(s.Verified))
 			}
@@ -192,7 +202,7 @@ func (r *stateReader) metrics(states []*watchState) string {
 					continue
 				}
 				p.sample("yaklite_tls_cert_expiry_timestamp_seconds", float64(s.TLS.NotAfter.Unix()),
-					"watch", w.Name, "host", h, "name", r.hostName(h), "port", strconv.Itoa(s.Port),
+					"watch", w.Name, "host", h, "name", r.hostName(h, w.Snap), "port", strconv.Itoa(s.Port),
 					"subject", s.TLS.Subject, "self_signed", strconv.FormatBool(s.TLS.SelfSigned))
 			}
 		}
@@ -227,7 +237,8 @@ func sortedHosts(s *Snapshot) []string {
 // ---- HTML ----
 
 type pageHost struct {
-	Host, Name string
+	Host, Name, Device string
+	Gateway    bool
 	Missed     int
 	Services   []pageService
 }
@@ -258,7 +269,10 @@ func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 			Hosts:    len(w.Snap.Hosts), Ports: w.Snap.OpenPortCount(),
 		}
 		for _, h := range sortedHosts(w.Snap) {
-			row := pageHost{Host: h, Name: r.hostName(h), Missed: w.Snap.Misses[h]}
+			row := pageHost{Host: h, Name: r.hostName(h, w.Snap), Missed: w.Snap.Misses[h], Gateway: h == w.Snap.Gateway}
+			if d := w.Snap.Devices[h]; d != nil {
+				row.Device = strings.TrimSpace(d.MAC + "  " + d.describe())
+			}
 			for _, s := range w.Snap.Hosts[h] {
 				ps := pageService{Key: s.Key(), Label: s.Label(), Unconfirmed: !s.Verified}
 				if s.TLS != nil {
@@ -280,7 +294,7 @@ func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 		for i := len(w.Changes) - 1; i >= 0 && len(pw.Changes) < 200; i-- {
 			c := w.Changes[i]
 			if c.Name == "" {
-				c.Name = r.hostName(c.Host)
+				c.Name = r.hostName(c.Host, w.Snap)
 			}
 			if (c.Severity == sevHigh || c.Severity == sevMedium) && now.Sub(c.Time) < 24*time.Hour {
 				pw.Alerts24h++
@@ -328,8 +342,8 @@ code{font:12px ui-monospace,Menlo,monospace}
 </div>
 <h2>Devices</h2>
 <div class="wrap"><table><tr><th>Host</th><th>Open ports and services</th></tr>
-{{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}</td>
-<td>{{range .Services}}<div class="svc"><code>{{.Key}}</code> {{.Label}}{{if .Unconfirmed}} <span class="muted">(unconfirmed)</span>{{end}}{{if .Cert}} <span class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">cert: {{.Cert}}</span>{{end}}</div>{{end}}</td></tr>
+{{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Gateway}} <span class="muted">(gateway)</span>{{end}}{{if .Device}}<br><span class="muted">{{.Device}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}</td>
+<td>{{if not .Services}}<span class="muted">no open ports</span>{{end}}{{range .Services}}<div class="svc"><code>{{.Key}}</code> {{.Label}}{{if .Unconfirmed}} <span class="muted">(unconfirmed)</span>{{end}}{{if .Cert}} <span class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">cert: {{.Cert}}</span>{{end}}</div>{{end}}</td></tr>
 {{end}}</table></div>
 <h2>Recent changes</h2>
 {{if .Changes}}<div class="wrap"><table><tr><th>When</th><th>Severity</th><th>Change</th></tr>

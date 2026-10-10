@@ -30,7 +30,13 @@ type ScanOptions struct {
 	ProbeTimeout  time.Duration
 	NoFingerprint bool
 	NoTLS         bool
-	Progress      func(format string, args ...any)
+	// NoARP turns off finding devices on directly attached networks by their
+	// MAC address (which also finds devices with no open ports).
+	NoARP    bool
+	UDP      bool   // also probe common UDP services on live hosts
+	UDPPorts string // default DefaultUDPPorts
+	NoNames  bool   // skip reverse DNS lookups for device names
+	Progress func(format string, args ...any)
 }
 
 func resolvePorts(spec string) string {
@@ -226,6 +232,41 @@ func Scan(ctx context.Context, opt ScanOptions) (*Snapshot, error) {
 		}
 		swg.Wait()
 	}
+
+	if !opt.NoARP {
+		if devices := discoverNeighbours(ctx, hosts, !opt.NoNames); len(devices) > 0 {
+			snap.Devices = devices
+			snap.Gateway = defaultGateway()
+			for h := range devices {
+				if _, ok := snap.Hosts[h]; !ok {
+					snap.Hosts[h] = []*Service{}
+				}
+			}
+			opt.Progress("%d devices found on the local network", len(devices))
+		}
+	}
+
+	if opt.UDP && len(snap.Hosts) > 0 {
+		udpPorts := utils.ParseStringToPorts(opt.UDPPorts)
+		if opt.UDPPorts == "" {
+			udpPorts = utils.ParseStringToPorts(DefaultUDPPorts)
+		}
+		alive := make([]string, 0, len(snap.Hosts))
+		for h := range snap.Hosts {
+			alive = append(alive, h)
+		}
+		opt.Progress("probing %d UDP ports on %d live hosts", len(udpPorts), len(alive))
+		var mu sync.Mutex
+		err := probeUDP(ctx, opt, alive, udpPorts, func(h string, svc *Service) {
+			mu.Lock()
+			snap.Add(h, svc)
+			mu.Unlock()
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	snap.Finished = time.Now().UTC()
 	snap.Sort()
 	return snap, ctx.Err()
@@ -233,13 +274,29 @@ func Scan(ctx context.Context, opt ScanOptions) (*Snapshot, error) {
 
 func printSnapshot(s *Snapshot) {
 	fmt.Fprintf(os.Stdout, "%d hosts, %d open ports (%s scan, %s)\n", len(s.Hosts), s.OpenPortCount(), s.Method, s.Finished.Sub(s.Started).Round(time.Millisecond))
+	if len(s.Devices) > 0 {
+		fmt.Fprintf(os.Stdout, "%d devices found by MAC address on the local network\n", len(s.Devices))
+	}
 	hosts := make([]string, 0, len(s.Hosts))
 	for h := range s.Hosts {
 		hosts = append(hosts, h)
 	}
 	sortHosts(hosts)
 	for _, h := range hosts {
-		fmt.Fprintf(os.Stdout, "\n%s\n", h)
+		line := h
+		if d := s.Devices[h]; d != nil {
+			line += "  " + d.MAC
+			if desc := d.describe(); desc != "" {
+				line += "  " + desc
+			}
+		}
+		if h == s.Gateway {
+			line += "  [gateway]"
+		}
+		fmt.Fprintf(os.Stdout, "\n%s\n", line)
+		if len(s.Hosts[h]) == 0 {
+			fmt.Fprintln(os.Stdout, "  (no open ports)")
+		}
 		for _, svc := range s.Hosts[h] {
 			mark := ""
 			if !svc.Verified {

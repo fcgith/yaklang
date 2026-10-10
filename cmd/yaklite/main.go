@@ -82,6 +82,10 @@ func scanFlags(fs *flag.FlagSet, opt *ScanOptions) *bool {
 	fs.DurationVar(&opt.ProbeTimeout, "probe-timeout", 5*time.Second, "timeout per fingerprint probe")
 	fs.BoolVar(&opt.NoFingerprint, "no-fp", false, "only report open ports, skip service fingerprinting")
 	fs.BoolVar(&opt.NoTLS, "no-tls", false, "skip reading TLS certificates on HTTPS and other TLS ports")
+	fs.BoolVar(&opt.NoARP, "no-arp", false, "skip finding devices by MAC address on directly attached networks")
+	fs.BoolVar(&opt.UDP, "udp", false, "also probe common UDP services (DNS, NTP, SNMP, SSDP/UPnP, mDNS, TFTP, IPMI, ...) on live hosts")
+	fs.StringVar(&opt.UDPPorts, "udp-ports", DefaultUDPPorts, "UDP ports for --udp")
+	fs.BoolVar(&opt.NoNames, "no-names", false, "skip reverse DNS lookups for device names")
 	return fs.Bool("q", false, "quiet: no progress output on stderr")
 }
 

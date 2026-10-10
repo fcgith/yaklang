@@ -53,13 +53,19 @@ type Snapshot struct {
 	Ports    string                `json:"ports"`
 	Method   string                `json:"method"`
 	Hosts    map[string][]*Service `json:"hosts"`
+	// Devices holds MAC address, vendor and name for hosts found on a
+	// directly attached network. Hosts with no open ports appear in Hosts
+	// with an empty list.
+	Devices map[string]*Device `json:"devices,omitempty"`
+	// Gateway is the default gateway's IP when it was on a scanned network.
+	Gateway string `json:"gateway,omitempty"`
 	// Misses counts consecutive scans in which a previously seen host did not
 	// answer. It lets watch mode wait before reporting a host as gone.
 	Misses map[string]int `json:"misses,omitempty"`
 }
 
 func NewSnapshot(targets, ports, method string) *Snapshot {
-	return &Snapshot{Version: 1, Targets: targets, Ports: ports, Method: method, Hosts: map[string][]*Service{}, Misses: map[string]int{}}
+	return &Snapshot{Version: 1, Targets: targets, Ports: ports, Method: method, Hosts: map[string][]*Service{}, Devices: map[string]*Device{}, Misses: map[string]int{}}
 }
 
 func (s *Snapshot) Add(host string, svc *Service) {
@@ -89,9 +95,10 @@ func (s *Snapshot) OpenPortCount() int {
 // Change is one difference between two snapshots.
 type Change struct {
 	Time     time.Time `json:"time"`
-	Kind     string    `json:"kind"` // host_new, host_gone, port_open, port_closed, service_changed, tls_expiring, tls_expired, tls_cert_changed
+	Kind     string    `json:"kind"` // host_new, host_gone, port_open, port_closed, service_changed, tls_expiring, tls_expired, tls_cert_changed, mac_changed, gateway_impersonated
 	Severity string    `json:"severity,omitempty"`
 	Host     string    `json:"host"`
+	MAC      string    `json:"mac,omitempty"`
 	Name     string    `json:"name,omitempty"` // friendly name from the inventory file
 	Port     int       `json:"port,omitempty"`
 	Proto    string    `json:"proto,omitempty"`
@@ -126,6 +133,10 @@ func (c Change) String() string {
 		msg = fmt.Sprintf("CERT EXPIRED  %s %s/%d %s", c.who(), c.Proto, c.Port, c.After)
 	case "tls_cert_changed":
 		msg = fmt.Sprintf("CERT CHANGED  %s %s/%d %s -> %s", c.who(), c.Proto, c.Port, c.Before, c.After)
+	case "mac_changed":
+		msg = fmt.Sprintf("MAC CHANGED   %s %s -> %s", c.who(), c.Before, c.After)
+	case "gateway_impersonated":
+		msg = fmt.Sprintf("GATEWAY MAC CLAIMED %s also answers with the router's MAC %s", c.who(), c.After)
 	default:
 		msg = c.Kind + " " + c.who()
 	}
@@ -162,6 +173,46 @@ func portList(svcs []*Service) string {
 	return out
 }
 
+func macLabel(d *Device) string {
+	if d == nil || d.MAC == "" {
+		return ""
+	}
+	if desc := d.describe(); desc != "" {
+		return d.MAC + " (" + desc + ")"
+	}
+	return d.MAC
+}
+
+func hostSummary(d *Device, svcs []*Service) string {
+	if desc := d.describe(); desc != "" {
+		return desc + "; " + portList(svcs)
+	}
+	return portList(svcs)
+}
+
+func (s *Snapshot) mac(h string) string {
+	if s == nil || s.Devices[h] == nil {
+		return ""
+	}
+	return s.Devices[h].MAC
+}
+
+// gatewayImpersonators lists other hosts answering with the gateway's MAC,
+// the usual sign of ARP spoofing.
+func gatewayImpersonators(s *Snapshot) map[string]bool {
+	out := map[string]bool{}
+	gwMAC := s.mac(s.Gateway)
+	if gwMAC == "" {
+		return out
+	}
+	for h, d := range s.Devices {
+		if h != s.Gateway && d != nil && d.MAC == gwMAC && !d.Self {
+			out[h] = true
+		}
+	}
+	return out
+}
+
 // Diff compares prev with cur. Hosts missing from cur are only reported as gone
 // once they have been missing for goneAfter consecutive scans; until then they
 // are carried forward into cur so the next comparison still knows them.
@@ -174,6 +225,9 @@ func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
 	var changes []Change
 	if cur.Misses == nil {
 		cur.Misses = map[string]int{}
+	}
+	if cur.Devices == nil {
+		cur.Devices = map[string]*Device{}
 	}
 
 	hosts := map[string]bool{}
@@ -201,7 +255,7 @@ func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
 
 		switch {
 		case inCur && !inPrev:
-			changes = append(changes, Change{Time: now, Kind: "host_new", Host: h, After: portList(curSvcs)})
+			changes = append(changes, Change{Time: now, Kind: "host_new", Host: h, MAC: cur.mac(h), After: hostSummary(cur.Devices[h], curSvcs)})
 			for _, s := range curSvcs {
 				changes = append(changes, Change{Time: now, Kind: "port_open", Host: h, Port: s.Port, Proto: s.Proto, After: s.Label()})
 				changes = append(changes, tlsChanges(h, nil, s, opt.TLSWarn, now)...)
@@ -209,13 +263,23 @@ func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
 		case !inCur && inPrev:
 			misses := prev.Misses[h] + 1
 			if misses >= goneAfter {
-				changes = append(changes, Change{Time: now, Kind: "host_gone", Host: h, Before: portList(prevSvcs)})
+				changes = append(changes, Change{Time: now, Kind: "host_gone", Host: h, MAC: prev.mac(h), Before: hostSummary(prev.Devices[h], prevSvcs)})
 				continue
 			}
 			// not gone yet: remember it
 			cur.Hosts[h] = prevSvcs
 			cur.Misses[h] = misses
+			if d := prev.Devices[h]; d != nil {
+				cur.Devices[h] = d
+			}
 		default:
+			if pm, cm := prev.mac(h), cur.mac(h); pm != "" && cm != "" && pm != cm {
+				c := Change{Time: now, Kind: "mac_changed", Host: h, MAC: cm, Before: macLabel(prev.Devices[h]), After: macLabel(cur.Devices[h])}
+				if h == cur.Gateway {
+					c.Detail = "gateway"
+				}
+				changes = append(changes, c)
+			}
 			prevBy := map[string]*Service{}
 			for _, s := range prevSvcs {
 				prevBy[s.Key()] = s
@@ -243,6 +307,16 @@ func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
 					changes = append(changes, Change{Time: now, Kind: "port_closed", Host: h, Port: p.Port, Proto: p.Proto, Before: p.Label()})
 				}
 			}
+		}
+	}
+	var before map[string]bool
+	if prev != nil {
+		before = gatewayImpersonators(prev)
+	}
+	for h := range gatewayImpersonators(cur) {
+		if !before[h] {
+			changes = append(changes, Change{Time: now, Kind: "gateway_impersonated", Host: h, MAC: cur.mac(h), After: cur.mac(h),
+				Detail: "possible ARP spoofing of the router " + cur.Gateway})
 		}
 	}
 	return changes
@@ -296,6 +370,9 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	}
 	if s.Misses == nil {
 		s.Misses = map[string]int{}
+	}
+	if s.Devices == nil {
+		s.Devices = map[string]*Device{}
 	}
 	return &s, nil
 }

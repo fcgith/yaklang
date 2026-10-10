@@ -17,6 +17,8 @@ import (
 //	    expect: [22, 443, 5000]   # tcp ports this device is allowed to expose
 //	  192.168.1.20:
 //	    name: Living room TV
+//	  "aa:bb:cc:dd:ee:ff":        # devices can also be keyed by MAC address,
+//	    name: Laptop              # which survives the router handing out a new IP
 //	  192.168.1.99:
 //	    name: Guest laptop
 //	    ignore: true              # never alert about this host
@@ -50,14 +52,21 @@ func LoadInventory(path string) (*Inventory, error) {
 	if err := yaml.Unmarshal(data, &inv); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	for k := range inv.Hosts {
-		if net.ParseIP(k) == nil {
-			return nil, fmt.Errorf("%s: host key %q is not an IP address", path, k)
+	hosts := map[string]*HostEntry{}
+	for k, e := range inv.Hosts {
+		if e == nil {
+			e = &HostEntry{}
 		}
-		if inv.Hosts[k] == nil {
-			inv.Hosts[k] = &HostEntry{}
+		switch {
+		case net.ParseIP(k) != nil:
+			hosts[k] = e
+		case normalizeMAC(k) != "":
+			hosts[normalizeMAC(k)] = e
+		default:
+			return nil, fmt.Errorf("%s: host key %q is not an IP or MAC address", path, k)
 		}
 	}
+	inv.Hosts = hosts
 	return &inv, nil
 }
 
@@ -69,7 +78,8 @@ var riskyPorts = map[int]string{
 	445: "SMB file sharing", 1433: "SQL Server", 1883: "MQTT (often no auth)", 2375: "Docker API without TLS (full host control)",
 	3306: "MySQL", 3389: "Remote Desktop", 5432: "PostgreSQL", 5900: "VNC remote desktop",
 	5985: "WinRM", 6379: "Redis (often no auth)", 9200: "Elasticsearch (often no auth)", 11211: "Memcached",
-	27017: "MongoDB (often no auth)",
+	27017: "MongoDB (often no auth)", 69: "TFTP (no authentication)", 161: "SNMP (often default community strings)",
+	623: "IPMI server management (remote power and console)",
 }
 
 var riskyServiceWords = []string{"telnet", "vnc", "rdp", "ms-wbt-server", "redis", "mongodb", "memcache", "docker"}
@@ -112,15 +122,26 @@ func (inv *Inventory) risky(port int, label string) (string, bool) {
 	return "", false
 }
 
+// entry finds the inventory entry for a host by IP, then by MAC.
+func (inv *Inventory) entry(host, mac string) *HostEntry {
+	if inv == nil {
+		return nil
+	}
+	if e := inv.Hosts[host]; e != nil {
+		return e
+	}
+	if mac != "" {
+		return inv.Hosts[mac]
+	}
+	return nil
+}
+
 // Annotate fills in friendly names and severities and drops changes for
 // ignored hosts. It works without an inventory, using only the risky-port list.
 func Annotate(changes []Change, inv *Inventory) []Change {
 	out := changes[:0]
 	for _, c := range changes {
-		var entry *HostEntry
-		if inv != nil {
-			entry = inv.Hosts[c.Host]
-		}
+		entry := inv.entry(c.Host, c.MAC)
 		if entry != nil {
 			if entry.Ignore {
 				continue
@@ -135,6 +156,8 @@ func Annotate(changes []Change, inv *Inventory) []Change {
 			c.Severity = sevMedium
 			if known {
 				c.Severity, c.Detail = sevInfo, "known device"
+			} else if inv != nil && c.MAC != "" && inv.Hosts[c.Host] == nil {
+				c.Detail = "unknown device joined the network"
 			} else if inv != nil {
 				c.Detail = "not in inventory"
 			} else {
@@ -176,6 +199,17 @@ func Annotate(changes []Change, inv *Inventory) []Change {
 			if strings.HasPrefix(c.Detail, "issuer changed") {
 				c.Severity = sevMedium
 			}
+		case "mac_changed":
+			switch {
+			case c.Detail == "gateway":
+				c.Severity, c.Detail = sevHigh, "the router's MAC changed: a new router, or someone impersonating it (ARP spoofing)"
+			case known:
+				c.Severity = sevMedium
+			default:
+				c.Severity = sevLow // DHCP often hands an address to a different device
+			}
+		case "gateway_impersonated":
+			c.Severity = sevHigh
 		default:
 			c.Severity = sevLow
 		}

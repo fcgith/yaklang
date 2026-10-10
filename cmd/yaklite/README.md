@@ -54,6 +54,53 @@ Fingerprints that come only from the port number are shown as
 `(unconfirmed)` and are never reported as a service change, so a flaky probe
 does not raise an alert.
 
+## Finding every device, not just ones with open ports
+
+On networks the machine is directly attached to, yaklite also finds devices
+by their MAC address, so phones, TVs and IoT gadgets with no open ports show
+up too. It sends one tiny UDP packet to each address, which makes the OS look
+up its MAC, then reads the OS neighbour table (`/proc/net/arp` on Linux,
+`arp -an` on macOS). No root is needed. For each device it records:
+
+- the MAC address and the maker, from the IEEE vendor registry built into
+  the binary (`data/oui.txt.gz`; rebuild with `contrib/update-oui.py`)
+- whether the MAC is a private, randomized one, as phones use
+- its name from reverse DNS, which most home routers answer with the name
+  the device gave over DHCP (`--no-names` skips this)
+- which device is the default gateway
+
+`--no-arp` turns this off.
+
+This adds three alerts aimed at someone tampering with the network:
+
+| Change | Severity |
+| --- | --- |
+| The router's MAC address changed (a new router, or someone impersonating it) | high |
+| Another device answers with the router's MAC (the usual sign of ARP spoofing) | high |
+| An IP now belongs to a different MAC | medium for devices in your inventory, otherwise low |
+
+The inventory file can name devices by MAC address as well as by IP, which
+keeps working when the router hands out a new IP:
+
+```yaml
+hosts:
+  "b8:27:eb:12:34:56":
+    name: Pi-hole
+    expect: [22, 53, 80]
+```
+
+With an inventory, any device that is not in it raises a medium "unknown
+device joined the network" alert.
+
+### UDP services
+
+`--udp` also asks every live device about common UDP services, using the
+fingerprinter's UDP probes: DNS, TFTP, NTP, NetBIOS, SNMP, IPsec, IPMI,
+SSDP/UPnP, STUN, SIP, mDNS, CoAP, Ubiquiti discovery and memcached
+(`--udp-ports` to change). A UDP port is only reported when the service
+answers, since silence proves nothing. TFTP, SNMP and IPMI count as risky.
+It adds roughly 5 to 10 seconds per device, run in parallel.
+
 ## Monitoring with watch
 
 `yaklite watch` scans on a schedule, keeps the last snapshot, and reports:
