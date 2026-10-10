@@ -1,6 +1,6 @@
 # yaklite
 
-A small LAN inventory and change-monitoring tool built from the parts of
+A small network inventory and change-monitoring tool built from the parts of
 yaklang that held up in testing: the port scanner (connect and SYN) and the
 service fingerprinter (nmap-derived probes plus ~11.8k web/CPE rules).
 
@@ -10,6 +10,68 @@ It answers two questions for a network you own:
 - **What changed since last time?** `yaklite watch` / `yaklite diff`
 
 Only scan networks you own or are authorised to test.
+
+## Set and forget on a Mac (or Linux laptop)
+
+```sh
+curl -fsSLo yaklite https://github.com/fcgith/yaklang/releases/download/yaklite-latest/yaklite-macos
+chmod +x yaklite
+./yaklite install
+```
+
+That is all. `install` copies itself to `~/Library/Application Support/yaklite/`,
+asks whether the network you are on is yours, and sets up two background jobs
+for your user (no admin password):
+
+- a check that runs at login, every hour, and **whenever you join a network**
+  (launchd watches the network configuration), and
+- the dashboard on <http://127.0.0.1:9842/>.
+
+Problems show up as normal macOS notifications. Add
+`--webhook https://ntfy.sh/your-topic` to also get them on your phone.
+
+What a check does depends on the network:
+
+| Network | What yaklite does |
+| --- | --- |
+| **Trusted** (you said it is yours) | Watches every device on it, as `watch` does: new and unknown devices, risky open ports, certificates, UDP services, the router's MAC changing and ARP spoofing |
+| **Untrusted** (café, hotel, someone else's office) | Does not scan other people's devices. Checks what **this computer** exposes there (file sharing, remote login, databases, dev servers) and reads the neighbour table the OS already has to spot another device answering as the router |
+
+Networks are told apart by the router's MAC address, so home, office and the
+café down the road each keep their own baseline. A network you have not seen
+before is untrusted, and you get a notification saying so. Commands:
+
+```sh
+yaklite status                                  # current network, trusted or not, last check
+yaklite trust --name Office                     # monitor every device here (only on networks you may scan)
+yaklite untrust
+yaklite name 192.168.1.10 "NAS" --expect 22,443  # name a device (IP or MAC) and the ports it may expose
+yaklite name aa:bb:cc:dd:ee:ff "Kid's tablet"
+yaklite uninstall [--purge]
+```
+
+Settings live in `~/.config/yaklite/` (`networks.yaml`, `inventory.yaml`),
+state and logs in `~/.local/state/yaklite/`. Alerts default to `medium` and
+above.
+
+Good to know:
+
+- **No admin rights are needed.** Everything uses normal connections and the
+  OS neighbour table. Only the optional `--syn` scan needs root.
+- **Unsigned binary.** Downloading with `curl` as above avoids the Gatekeeper
+  prompt. If you download it in a browser, macOS will block the first run.
+  Allow it under System Settings > Privacy & Security, or run
+  `xattr -d com.apple.quarantine yaklite`. Signing and notarizing needs an
+  Apple Developer ID, which this build does not have.
+- **Local Network permission (macOS 15 and later).** macOS may ask whether
+  yaklite can find devices on your local network. Say yes; without it,
+  trusted-network scans see nothing beyond the router.
+- On Linux, `install` creates systemd user units (`yaklite-auto.timer`,
+  `yaklite-web.service`) that check every hour; notifications use
+  `notify-send`.
+- yaklite detects and warns. It cannot block anything, because that needs
+  control of the router or firewall. Each alert says what changed, so you know
+  what to fix.
 
 ## What it leaves out, on purpose
 
@@ -25,7 +87,7 @@ these. yaklite links none of them:
 | Self-update and plugin downloads with TLS verification off | No update or download code. The webhook uses Go's default client with certificate checks, and plain `http://` is refused except to localhost |
 | AI provider calls to the vendor cloud by default | No AI code |
 
-Binary size: about 58 MB (stripped) against 310 MB.
+Binary size: about 57 MB (stripped) against 310 MB.
 
 ## Usage
 

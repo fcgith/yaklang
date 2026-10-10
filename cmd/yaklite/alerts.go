@@ -25,13 +25,13 @@ import (
 //	risky_ports: [23, 445]        # optional, replaces the built-in list
 type Inventory struct {
 	Hosts      map[string]*HostEntry `yaml:"hosts"`
-	RiskyPorts []int                 `yaml:"risky_ports"`
+	RiskyPorts []int                 `yaml:"risky_ports,omitempty"`
 }
 
 type HostEntry struct {
 	Name   string `yaml:"name"`
-	Expect []int  `yaml:"expect"`
-	Ignore bool   `yaml:"ignore"`
+	Expect []int  `yaml:"expect,omitempty"`
+	Ignore bool   `yaml:"ignore,omitempty"`
 }
 
 func (h *HostEntry) expects(port int) bool {
@@ -102,7 +102,7 @@ func parseSeverity(s string) (string, error) {
 }
 
 func (inv *Inventory) risky(port int, label string) (string, bool) {
-	if inv != nil && inv.RiskyPorts != nil {
+	if inv != nil && len(inv.RiskyPorts) > 0 {
 		for _, p := range inv.RiskyPorts {
 			if p == port {
 				return "listed in risky_ports", true

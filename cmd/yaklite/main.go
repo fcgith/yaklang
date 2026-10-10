@@ -26,14 +26,23 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 )
 
-const usage = `yaklite: LAN inventory and change monitoring (built from yaklang)
+const usage = `yaklite: network inventory and change monitoring (built from yaklang)
 
-Usage:
-  yaklite scan  -t TARGETS [-p PORTS] [-o snapshot.json] [--syn]
-  yaklite watch -t TARGETS [-p PORTS] [--every 1h] [--state DIR] [--webhook URL] [--once]
+Set and forget (laptops and desktops):
+  yaklite install                 check in the background, notify on problems
+  yaklite status                  current network, trust, last check
+  yaklite trust [--name Home]     monitor every device on the current network
+  yaklite untrust                 only check this computer on the current network
+  yaklite name IP|MAC "Name" [--expect 22,443]   name a device
+  yaklite uninstall [--purge]
+
+By hand:
+  yaklite scan  -t TARGETS [-p PORTS] [--udp] [-o snapshot.json]
+  yaklite watch -t TARGETS [--every 1h] [--inventory FILE] [--webhook URL] [--once]
   yaklite diff  OLD.json NEW.json
-  yaklite serve [--state DIR] [--listen 127.0.0.1:9842]   dashboard + Prometheus metrics
   yaklite outside -d example.com [--ip 203.0.113.7] [--once]   what the internet sees of you
+  yaklite serve [--listen 127.0.0.1:9842]                      dashboard + Prometheus metrics
+  yaklite auto                    one check of the current network (what install schedules)
 
 TARGETS  IPs, CIDRs, ranges or hostnames, comma separated (192.168.1.0/24,10.0.0.5)
 PORTS    "top" (default, ~80 common LAN ports), "all", or a list like 22,80,8000-8100
@@ -62,6 +71,20 @@ func main() {
 		err = cmdServe(ctx, os.Args[2:])
 	case "outside":
 		err = cmdOutside(ctx, os.Args[2:])
+	case "auto":
+		err = cmdAuto(ctx, os.Args[2:])
+	case "install":
+		err = cmdInstall(ctx, os.Args[2:])
+	case "uninstall":
+		err = cmdUninstall(os.Args[2:])
+	case "trust":
+		err = cmdTrust(ctx, os.Args[2:], true)
+	case "untrust":
+		err = cmdTrust(ctx, os.Args[2:], false)
+	case "name":
+		err = cmdName(os.Args[2:])
+	case "status":
+		err = cmdStatus(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -402,6 +425,9 @@ func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any)
 		fmt.Fprintln(os.Stdout, "\nFindings in the baseline:")
 	}
 	emit(os.Stdout, changes, asJSON)
+	if ac.desktop != "" {
+		notifyChanges(ac.desktop, changes)
+	}
 	if ac.webhook != "" {
 		if err := postWebhook(ctx, ac.webhook, ac.webhookFormat, changes); err != nil {
 			fmt.Fprintln(os.Stderr, "[yaklite] webhook failed:", err)
@@ -455,6 +481,7 @@ type alertConfig struct {
 	goneAfter     int
 	webhook       string
 	webhookFormat string
+	desktop       string // network name for desktop notifications (auto mode)
 }
 
 func alertFlags(fs *flag.FlagSet) *alertFlagValues {
