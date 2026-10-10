@@ -64,6 +64,11 @@ type Snapshot struct {
 	Names        map[string]*NameInfo `json:"names,omitempty"`
 	ZoneTransfer map[string][]string  `json:"zone_transfer,omitempty"` // domain -> name servers that allowed AXFR
 	SourceErrors []string             `json:"source_errors,omitempty"`
+	// PublicIP is this network's address on the internet, when a check found it.
+	PublicIP string `json:"public_ip,omitempty"`
+	// Findings are standing problems found by checks other than the port
+	// scan (see checks.go), keyed by Finding.ID.
+	Findings map[string]*Finding `json:"findings,omitempty"`
 	// Misses counts consecutive scans in which a previously seen host did not
 	// answer. It lets watch mode wait before reporting a host as gone.
 	Misses map[string]int `json:"misses,omitempty"`
@@ -111,6 +116,8 @@ type Change struct {
 	After    string    `json:"after,omitempty"`
 	Detail   string    `json:"detail,omitempty"`
 	Outside  bool      `json:"outside,omitempty"` // seen from the internet (yaklite outside)
+	ID       string    `json:"id,omitempty"`      // finding ID, for finding and finding_resolved
+	Fix      string    `json:"fix,omitempty"`     // what to do about a finding
 }
 
 func (c Change) who() string {
@@ -153,6 +160,10 @@ func (c Change) String() string {
 		msg = fmt.Sprintf("SITE CHANGED  %s %s -> %s", c.who(), c.Before, c.After)
 	case "cert_mismatch":
 		msg = fmt.Sprintf("CERT WRONG NAME %s certificate on 443 does not cover this name: %s", c.who(), c.After)
+	case "finding":
+		msg = c.After
+	case "finding_resolved":
+		msg = "RESOLVED      " + c.Before
 	case "zone_transfer_open":
 		msg = fmt.Sprintf("ZONE TRANSFER OPEN %s: name servers %s hand out the whole zone", c.who(), c.After)
 	default:
@@ -333,6 +344,7 @@ func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
 		}
 		changes = append(changes, diffNames(prev, cur, opt, now)...)
 	}
+	changes = append(changes, diffFindings(prev, cur, now)...)
 	var before map[string]bool
 	if prev != nil {
 		before = gatewayImpersonators(prev)

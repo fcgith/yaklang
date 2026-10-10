@@ -30,10 +30,22 @@ func TestLaunchdPlistIsWellFormed(t *testing.T) {
 	if strings.Contains(launchdPlist(webLabel, []string{"/bin/yaklite", "serve"}, 0, true, "/tmp/l"), "StartInterval") {
 		t.Error("keep-alive job should not have StartInterval")
 	}
+	weekly := launchdPlistAt(summaryLabel, []string{"/bin/yaklite", "summary"}, 0, false, 1, "/tmp/l")
+	if !strings.Contains(weekly, "<key>Weekday</key><integer>1</integer>") || strings.Contains(weekly, "RunAtLoad") || strings.Contains(weekly, "WatchPaths") {
+		t.Errorf("weekly job:\n%s", weekly)
+	}
 }
 
 func TestSystemdUnits(t *testing.T) {
-	u := systemdUnits("/home/a b/.local/bin/yaklite", []string{"auto", "-q", "--webhook", "https://ntfy.sh/100%"}, 30*time.Minute)
+	u := systemdUnits("/home/a b/.local/bin/yaklite", []string{"auto", "-q", "--webhook", "https://ntfy.sh/100%"}, []string{"connwatch"}, []string{"summary", "--send"}, 30*time.Minute)
+	for _, n := range systemdUnitNames {
+		if u[n] == "" {
+			t.Errorf("unit %s missing", n)
+		}
+	}
+	if !strings.Contains(u["yaklite-summary.timer"], "OnCalendar=Mon") || !strings.Contains(u["yaklite-conn.service"], "Restart=always") {
+		t.Error("summary timer or connection watch unit")
+	}
 	if !strings.Contains(u["yaklite-auto.service"], `ExecStart="/home/a b/.local/bin/yaklite" "auto" "-q" "--webhook" "https://ntfy.sh/100%%"`) {
 		t.Errorf("ExecStart quoting:\n%s", u["yaklite-auto.service"])
 	}

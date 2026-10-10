@@ -210,6 +210,12 @@ func Annotate(changes []Change, inv *Inventory) []Change {
 			default:
 				c.Severity = sevLow // DHCP often hands an address to a different device
 			}
+		case "finding":
+			if c.Severity == "" {
+				c.Severity = sevMedium
+			}
+		case "finding_resolved":
+			c.Severity = sevInfo
 		case "gateway_impersonated", "zone_transfer_open":
 			c.Severity = sevHigh
 		case "name_new":

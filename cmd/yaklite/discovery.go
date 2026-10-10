@@ -308,6 +308,7 @@ func discoverNeighbours(ctx context.Context, hosts []string, lookupNames bool) m
 	}
 	if lookupNames {
 		reverseNames(ctx, out)
+		announcedNames(ctx, out)
 	}
 	return out
 }

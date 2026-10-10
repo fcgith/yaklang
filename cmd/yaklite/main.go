@@ -85,6 +85,18 @@ func main() {
 		err = cmdName(os.Args[2:])
 	case "status":
 		err = cmdStatus(ctx, os.Args[2:])
+	case "conns":
+		err = cmdConns(ctx, os.Args[2:])
+	case "connwatch":
+		err = cmdConnWatch(ctx, os.Args[2:])
+	case "summary":
+		err = cmdSummary(ctx, os.Args[2:])
+	case "check":
+		err = cmdCheck(ctx, os.Args[2:])
+	case "ack":
+		err = cmdAck(os.Args[2:])
+	case "alerts":
+		err = cmdAlerts(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -231,7 +243,7 @@ func addWatchFlags(fs *flag.FlagSet, every time.Duration) *watchFlags {
 		every:     fs.Duration("every", every, "time between scans"),
 		stateDir:  fs.String("state", defaultStateDir(), "where the last snapshot and the change log are kept (created 0700)"),
 		name:      fs.String("name", "", "name for this watch, so several can share one state dir (default: derived from the targets)"),
-		webhook:   fs.String("webhook", "", "POST changes to this URL (Slack, Mattermost, Discord, Telegram, Gotify, ntfy or plain JSON)"),
+		webhook:   fs.String("webhook", "", "send changes here: ntfy, Slack, Discord, Telegram, Gotify, Pushover, Home Assistant or any JSON webhook, or smtps://user@host/you@example.com for email; comma separated for several"),
 		format:    fs.String("webhook-format", "auto", "webhook body: "+strings.Join(webhookFormats, ", ")+" (auto picks from the URL)"),
 		af:        alertFlags(fs),
 		goneAfter: fs.Int("gone-after", 2, "report a host or name as gone only after this many scans in a row without it"),
@@ -250,8 +262,8 @@ func (wf *watchFlags) build(scan scanFunc, progress func(string, ...any), defaul
 	if !contains(webhookFormats, *wf.format) {
 		return watchRun{}, fmt.Errorf("unknown --webhook-format %q", *wf.format)
 	}
-	if *wf.webhook != "" && !strings.HasPrefix(*wf.webhook, "https://") && !strings.HasPrefix(*wf.webhook, "http://127.0.0.1") && !strings.HasPrefix(*wf.webhook, "http://localhost") {
-		return watchRun{}, errors.New("--webhook must use https:// (plain http is only allowed to localhost)")
+	if err := validateWebhooks(*wf.webhook); err != nil {
+		return watchRun{}, err
 	}
 	name := *wf.name
 	if name == "" {
@@ -272,6 +284,9 @@ func cmdOutside(ctx context.Context, args []string) error {
 	noCT := fs.Bool("no-ct", false, "skip certificate transparency lookups (crt.sh and certspotter receive the domain name)")
 	dns := fs.String("dns", "1.1.1.1,8.8.8.8", "DNS resolvers to use, comma separated")
 	maxNames := fs.Int("max-names", 300, "most names to check per run")
+	noDomainChecks := fs.Bool("no-domain-checks", false, "skip the email spoofing, expiry, hijackable subdomain, new certificate and look-alike checks")
+	lookalikes := fs.Bool("lookalikes", true, "look for typo and look-alike versions of your domains (a few hundred DNS lookups)")
+	noRDAP := fs.Bool("no-rdap", false, "skip the registration expiry lookup (rdap.org receives the domain name)")
 	var opt ScanOptions
 	fs.StringVar(&opt.Ports, "p", "top", `ports to scan on public IPs: "top", "all" or a list`)
 	fs.IntVar(&opt.Concurrency, "c", 100, "concurrent connection attempts")
@@ -300,6 +315,7 @@ func cmdOutside(ctx context.Context, args []string) error {
 	oo := OutsideOptions{
 		Domains: ds, IPs: *ips, ScanNames: *scanNames, Brute: *brute, NoCT: *noCT,
 		DNSServers: servers, Scan: opt, MaxNames: *maxNames, ProgressFor: progress(*quiet),
+		NoDomainChecks: *noDomainChecks, Lookalikes: *lookalikes, NoRDAP: *noRDAP,
 	}
 	scan := func(ctx context.Context) (*Snapshot, error) { return ScanOutside(ctx, oo) }
 	if *scanOnly {
@@ -323,16 +339,17 @@ func cmdOutside(ctx context.Context, args []string) error {
 }
 
 type watchRun struct {
-	scan      scanFunc
-	progress  func(string, ...any)
-	ac        *alertConfig
-	stateDir  string
-	name      string
-	every     time.Duration
-	once      bool
-	asJSON    bool
-	listen    string
-	goneAfter int
+	scan        scanFunc
+	progress    func(string, ...any)
+	ac          *alertConfig
+	stateDir    string
+	name        string
+	every       time.Duration
+	once        bool
+	asJSON      bool
+	listen      string
+	goneAfter   int
+	quietErrors bool // only report a failing scan once until it recovers
 }
 
 func runWatch(ctx context.Context, w watchRun) error {
@@ -348,16 +365,27 @@ func runWatch(ctx context.Context, w watchRun) error {
 		}
 		defer srv.Close()
 	}
+	failing := false
 	for {
+		for _, u := range splitWebhooks(w.ac.webhook) {
+			if pollPhoneActions(ctx, u, w.stateDir) && w.name == "connections" {
+				kickAuto() // "Check again" pressed on the phone
+			}
+		}
 		w.ac.goneAfter = w.goneAfter
 		if err := watchOnce(ctx, w.scan, w.progress, w.ac, snapPath, logPath, w.asJSON); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			fmt.Fprintln(os.Stderr, "[yaklite] scan failed:", err)
+			if !w.quietErrors || !failing {
+				fmt.Fprintln(os.Stderr, "[yaklite] scan failed:", err)
+			}
+			failing = true
 			if w.once {
 				return err
 			}
+		} else {
+			failing = false
 		}
 		if w.once {
 			if lastChangeCount > 0 {
@@ -413,7 +441,19 @@ func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any)
 			fmt.Fprintln(os.Stderr, "[yaklite] could not write change log:", err)
 		}
 	}
-	changes := filterSeverity(all, min)
+	// findings are not "everything is new" noise, so the baseline exception
+	// above does not apply to them
+	var changes []Change
+	for _, c := range all {
+		m := min
+		if c.Kind == "finding" {
+			m = ac.minSev
+		}
+		if sevRank[c.Severity] >= sevRank[m] {
+			changes = append(changes, c)
+		}
+	}
+	changes = dropAcked(changes, cur.Finished)
 	if len(changes) == 0 {
 		if progress != nil {
 			progress("no changes at or above %s (%d hosts, %d open ports)", min, len(cur.Hosts), cur.OpenPortCount())
@@ -428,10 +468,8 @@ func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any)
 	if ac.desktop != "" {
 		notifyChanges(ac.desktop, changes)
 	}
-	if ac.webhook != "" {
-		if err := postWebhook(ctx, ac.webhook, ac.webhookFormat, changes); err != nil {
-			fmt.Fprintln(os.Stderr, "[yaklite] webhook failed:", err)
-		}
+	for _, err := range sendAlerts(ctx, ac.webhook, ac.webhookFormat, changes) {
+		fmt.Fprintln(os.Stderr, "[yaklite] alert delivery failed:", err)
 	}
 	return nil
 }

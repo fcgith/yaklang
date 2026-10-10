@@ -169,6 +169,8 @@ type autoOptions struct {
 	stateDir    string
 	quiet       bool
 	asJSON      bool
+	noChecks    bool
+	checks      *checkOptions
 }
 
 func autoFlags(fs *flag.FlagSet) *autoOptions {
@@ -181,6 +183,10 @@ func autoFlags(fs *flag.FlagSet) *autoOptions {
 	fs.StringVar(&o.stateDir, "state", defaultStateDir(), "state directory")
 	fs.BoolVar(&o.quiet, "q", false, "quiet")
 	fs.BoolVar(&o.asJSON, "json", false, "print changes as JSON lines")
+	fs.BoolVar(&o.noChecks, "no-checks", false, "only scan ports; skip the other checks (yaklite check --list)")
+	o.checks = defaultCheckOptions()
+	fs.BoolFunc("no-threat-lists", "do not download public lists of known bad addresses", func(string) error { o.checks.threatLists = false; return nil })
+	fs.BoolFunc("no-public-lookup", "do not ask public services for this network's public IP", func(string) error { o.checks.publicLookup = false; return nil })
 	return o
 }
 
@@ -195,8 +201,8 @@ func cmdAuto(ctx context.Context, args []string) error {
 	if !contains(webhookFormats, o.format) {
 		return fmt.Errorf("unknown --webhook-format %q", o.format)
 	}
-	if o.webhook != "" && !strings.HasPrefix(o.webhook, "https://") {
-		return errors.New("--webhook must use https://")
+	if err := validateWebhooks(o.webhook); err != nil {
+		return err
 	}
 
 	release, ok := lockState(o.stateDir)
@@ -250,6 +256,18 @@ func cmdAuto(ctx context.Context, args []string) error {
 	} else {
 		name = n.ID() + "-self"
 		scan = func(ctx context.Context) (*Snapshot, error) { return guardScan(ctx, n, prog) }
+	}
+	if !o.noChecks {
+		portScan := scan
+		scan = func(ctx context.Context) (*Snapshot, error) {
+			snap, err := portScan(ctx)
+			if err != nil {
+				return nil, err
+			}
+			prog("running checks")
+			runChecks(ctx, &checkEnv{net: n, trusted: known.Trusted, snap: snap, stateDir: o.stateDir, prog: prog, opts: o.checks, inAuto: true, inv: ac.inv}, nil)
+			return snap, nil
+		}
 	}
 
 	if o.minInterval > 0 {

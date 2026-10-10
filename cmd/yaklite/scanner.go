@@ -274,6 +274,10 @@ func Scan(ctx context.Context, opt ScanOptions) (*Snapshot, error) {
 }
 
 func printSnapshot(s *Snapshot) {
+	if s.Method == "connections" {
+		printFindings(s)
+		return
+	}
 	fmt.Fprintf(os.Stdout, "%d hosts, %d open ports (%s scan, %s)\n", len(s.Hosts), s.OpenPortCount(), s.Method, s.Finished.Sub(s.Started).Round(time.Millisecond))
 	if len(s.Devices) > 0 {
 		fmt.Fprintf(os.Stdout, "%d devices found by MAC address on the local network\n", len(s.Devices))
@@ -314,6 +318,10 @@ func printSnapshot(s *Snapshot) {
 		}
 	}
 	printNames(s)
+	if len(s.Findings) > 0 {
+		fmt.Fprintln(os.Stdout, "\nOther checks:")
+		printFindings(s)
+	}
 }
 
 func printNames(s *Snapshot) {

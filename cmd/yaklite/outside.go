@@ -37,6 +37,10 @@ type OutsideOptions struct {
 	MaxNames    int
 	MaxScanIPs  int
 	ProgressFor func(format string, args ...any)
+	// domain checks (domaincheck.go)
+	NoDomainChecks bool
+	Lookalikes     bool
+	NoRDAP         bool
 }
 
 // NameInfo is one DNS name under a watched domain.
@@ -78,7 +82,7 @@ var ctClient = &http.Client{Timeout: 60 * time.Second}
 
 // ctNames asks two certificate transparency search services for names
 // under domain. Only the domain name is sent to them.
-func ctNames(ctx context.Context, domain string) ([]string, []string) {
+func ctNames(ctx context.Context, domain string) ([]string, []ctCert, []string) {
 	var names, errs []string
 	get := func(u string, v any) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -97,14 +101,12 @@ func ctNames(ctx context.Context, domain string) ([]string, []string) {
 		return json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(v)
 	}
 
-	var crt []struct {
-		NameValue string `json:"name_value"`
-	}
+	var crt []ctCert
 	if err := get("https://crt.sh/?output=json&q="+url.QueryEscape("%."+domain), &crt); err != nil {
 		errs = append(errs, "crt.sh: "+err.Error())
 	}
 	for _, e := range crt {
-		names = append(names, strings.Split(e.NameValue, "\n")...)
+		names = append(names, strings.Split(e.Names, "\n")...)
 	}
 
 	var cs []struct {
@@ -116,7 +118,7 @@ func ctNames(ctx context.Context, domain string) ([]string, []string) {
 	for _, e := range cs {
 		names = append(names, e.DNSNames...)
 	}
-	return names, errs
+	return names, crt, errs
 }
 
 func cleanName(n, domain string) string {
@@ -305,11 +307,13 @@ func ScanOutside(ctx context.Context, opt OutsideOptions) (*Snapshot, error) {
 		}
 		sources[n][src] = true
 	}
+	var certs []ctCert
 	for _, d := range opt.Domains {
 		addName(d, d, "given")
 		addName("www."+d, d, "given")
 		if !opt.NoCT {
-			names, errs := ctNames(ctx, d)
+			names, cs, errs := ctNames(ctx, d)
+			certs = append(certs, cs...)
 			snap.SourceErrors = append(snap.SourceErrors, errs...)
 			for _, n := range names {
 				addName(n, d, "ct")
@@ -368,6 +372,9 @@ func ScanOutside(ctx context.Context, opt OutsideOptions) (*Snapshot, error) {
 	}
 	wg.Wait()
 	progress("%d names resolve", len(snap.Names))
+	if !opt.NoDomainChecks && len(opt.Domains) > 0 {
+		domainChecks(ctx, snap, opt.Domains, all, certs, domainCheckOptions{resolver: resolver, lookalikes: opt.Lookalikes, noRDAP: opt.NoRDAP}, progress)
+	}
 
 	// Port scan: IPs the user listed, plus resolved IPs when asked. Resolved
 	// IPs often belong to a CDN or hosting provider rather than to you, so

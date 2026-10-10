@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-var webhookFormats = []string{"auto", "json", "slack", "discord", "telegram", "gotify", "ntfy"}
+var webhookFormats = []string{"auto", "json", "slack", "discord", "telegram", "gotify", "ntfy", "pushover"}
 
 // detectFormat picks a webhook body format from the URL when the user did not
 // choose one.
@@ -30,6 +30,8 @@ func detectFormat(raw string) string {
 		return "slack"
 	case host == "ntfy.sh" || strings.HasPrefix(host, "ntfy."):
 		return "ntfy"
+	case host == "api.pushover.net":
+		return "pushover"
 	case strings.HasSuffix(u.Path, "/message") && u.Query().Get("token") != "":
 		return "gotify"
 	}
@@ -64,6 +66,17 @@ func worstSeverity(changes []Change) string {
 // buildWebhook returns the request body and content type for a format.
 func buildWebhook(format string, changes []Change) ([]byte, string, map[string]string) {
 	title, text := summaryText(changes)
+	return buildWebhookText(format, changes, title, text)
+}
+
+func truncText(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "\n…"
+	}
+	return s
+}
+
+func buildWebhookText(format string, changes []Change, title, text string) ([]byte, string, map[string]string) {
 	worst := worstSeverity(changes)
 	switch format {
 	case "slack":
@@ -100,7 +113,34 @@ func postWebhook(ctx context.Context, rawURL, format string, changes []Change) e
 	if format == "" || format == "auto" {
 		format = detectFormat(rawURL)
 	}
-	body, ctype, headers := buildWebhook(format, changes)
+	title, text := summaryText(changes)
+	return postBody(ctx, rawURL, format, changes, title, text)
+}
+
+// postText sends a plain message, such as the weekly summary.
+func postText(ctx context.Context, rawURL, title, text string) error {
+	format := detectFormat(rawURL)
+	return postBody(ctx, rawURL, format, []Change{{Severity: sevInfo, Kind: "summary", After: title}}, title, text)
+}
+
+func postBody(ctx context.Context, rawURL, format string, changes []Change, title, text string) error {
+	if format == "" || format == "auto" {
+		format = detectFormat(rawURL)
+	}
+	body, ctype, headers := buildWebhookText(format, changes, title, text)
+	if format == "pushover" {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return err
+		}
+		q := u.Query()
+		q.Set("title", title)
+		q.Set("message", truncText(text, 1000))
+		q.Set("priority", map[string]string{sevInfo: "-1", sevLow: "0", sevMedium: "0", sevHigh: "1"}[worstSeverity(changes)])
+		u.RawQuery = ""
+		rawURL = u.String()
+		body, ctype, headers = []byte(q.Encode()), "application/x-www-form-urlencoded", nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
@@ -110,6 +150,11 @@ func postWebhook(ctx context.Context, rawURL, format string, changes []Change) e
 	req.Header.Set("Content-Type", ctype)
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	if format == "ntfy" && changes[0].Kind != "summary" {
+		if a := ntfyActions(rawURL, changes); a != "" {
+			req.Header.Set("Actions", a)
+		}
 	}
 	// default client: system CA store, certificate verification on
 	resp, err := http.DefaultClient.Do(req)
