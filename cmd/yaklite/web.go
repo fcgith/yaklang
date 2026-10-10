@@ -206,6 +206,35 @@ func (r *stateReader) metrics(states []*watchState) string {
 					"subject", s.TLS.Subject, "self_signed", strconv.FormatBool(s.TLS.SelfSigned))
 			}
 		}
+		for _, n := range sortedNames(w.Snap) {
+			if hs := w.Snap.Names[n].HTTPS; hs != nil && hs.TLS != nil {
+				p.sample("yaklite_tls_cert_expiry_timestamp_seconds", float64(hs.TLS.NotAfter.Unix()),
+					"watch", w.Name, "host", n, "name", n, "port", "443",
+					"subject", hs.TLS.Subject, "self_signed", strconv.FormatBool(hs.TLS.SelfSigned))
+			}
+		}
+	}
+	p.metric("yaklite_name_info", "gauge", "One series per DNS name in the outside view.")
+	for _, w := range states {
+		for _, n := range sortedNames(w.Snap) {
+			ni := w.Snap.Names[n]
+			status := 0
+			if ni.Web != nil {
+				status = ni.Web.Status
+			}
+			p.sample("yaklite_name_info", 1, "watch", w.Name, "name", n, "ips", strings.Join(ni.IPs, ","),
+				"http_status", strconv.Itoa(status), "cert_mismatch", strconv.FormatBool(ni.CertMismatch))
+		}
+	}
+	p.metric("yaklite_zone_transfer_open", "gauge", "1 when a domain's name servers allow zone transfers.")
+	for _, w := range states {
+		for _, d := range w.Snap.Domains {
+			v := 0.0
+			if len(w.Snap.ZoneTransfer[d]) > 0 {
+				v = 1
+			}
+			p.sample("yaklite_zone_transfer_open", v, "watch", w.Name, "domain", d)
+		}
 	}
 	p.metric("yaklite_changes_total", "counter", "Changes recorded in the change log, by kind and severity.")
 	for _, w := range states {
@@ -223,6 +252,15 @@ func (r *stateReader) metrics(states []*watchState) string {
 		}
 	}
 	return p.b.String()
+}
+
+func sortedNames(s *Snapshot) []string {
+	names := make([]string, 0, len(s.Names))
+	for n := range s.Names {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func sortedHosts(s *Snapshot) []string {
@@ -252,10 +290,16 @@ type pageChange struct {
 	When, Severity, Text string
 }
 
+type pageName struct {
+	Name, IPs, Web, Cert, CertClass string
+}
+
 type pageWatch struct {
 	Name, Targets, Method, LastScan, Took string
 	Hosts, Ports, Alerts24h               int
 	HostRows                              []pageHost
+	Names                                 []pageName
+	ZoneTransfer                          []string
 	Changes                               []pageChange
 }
 
@@ -290,6 +334,27 @@ func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 				row.Services = append(row.Services, ps)
 			}
 			pw.HostRows = append(pw.HostRows, row)
+		}
+		for _, n := range sortedNames(w.Snap) {
+			ni := w.Snap.Names[n]
+			pn := pageName{Name: n, IPs: strings.Join(ni.IPs, ", "), Web: ni.Web.Short()}
+			if ni.HTTPS != nil && ni.HTTPS.TLS != nil {
+				pn.Cert = daysLeft(ni.HTTPS.TLS, now) + ", " + ni.HTTPS.TLS.Issuer
+				switch expiryState(ni.HTTPS.TLS, 21*24*time.Hour, now) {
+				case "expired":
+					pn.CertClass = "high"
+				case "expiring":
+					pn.CertClass = "medium"
+				}
+				if ni.CertMismatch {
+					pn.Cert = "does not cover this name; " + pn.Cert
+					pn.CertClass = "medium"
+				}
+			}
+			pw.Names = append(pw.Names, pn)
+		}
+		for d, ns := range w.Snap.ZoneTransfer {
+			pw.ZoneTransfer = append(pw.ZoneTransfer, d+" (from "+strings.Join(ns, ", ")+")")
 		}
 		for i := len(w.Changes) - 1; i >= 0 && len(pw.Changes) < 200; i-- {
 			c := w.Changes[i]
@@ -340,11 +405,16 @@ code{font:12px ui-monospace,Menlo,monospace}
 <div class="tile"><b>{{.Ports}}</b><span>open ports</span></div>
 <div class="tile"><b class="{{if .Alerts24h}}high{{end}}">{{.Alerts24h}}</b><span>medium/high alerts, 24h</span></div>
 </div>
-<h2>Devices</h2>
+{{if .ZoneTransfer}}<p class="high">Zone transfers are open for {{range .ZoneTransfer}}{{.}} {{end}}: anyone can list every name in the zone.</p>{{end}}
+{{if .Names}}<h2>Websites and names</h2>
+<div class="wrap"><table><tr><th>Name</th><th>Points to</th><th>Web</th><th>Certificate</th></tr>
+{{range .Names}}<tr><td><b>{{.Name}}</b></td><td class="muted">{{.IPs}}</td><td>{{.Web}}</td><td class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">{{.Cert}}</td></tr>
+{{end}}</table></div>{{end}}
+{{if .HostRows}}<h2>Devices</h2>
 <div class="wrap"><table><tr><th>Host</th><th>Open ports and services</th></tr>
 {{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Gateway}} <span class="muted">(gateway)</span>{{end}}{{if .Device}}<br><span class="muted">{{.Device}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}</td>
 <td>{{if not .Services}}<span class="muted">no open ports</span>{{end}}{{range .Services}}<div class="svc"><code>{{.Key}}</code> {{.Label}}{{if .Unconfirmed}} <span class="muted">(unconfirmed)</span>{{end}}{{if .Cert}} <span class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">cert: {{.Cert}}</span>{{end}}</div>{{end}}</td></tr>
-{{end}}</table></div>
+{{end}}</table></div>{{end}}
 <h2>Recent changes</h2>
 {{if .Changes}}<div class="wrap"><table><tr><th>When</th><th>Severity</th><th>Change</th></tr>
 {{range .Changes}}<tr><td class="muted nw">{{.When}}</td><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Text}}</td></tr>

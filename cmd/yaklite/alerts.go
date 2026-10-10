@@ -177,6 +177,8 @@ func Annotate(changes []Change, inv *Inventory) []Change {
 				c.Severity, c.Detail = sevHigh, why
 			case hasExpect:
 				c.Severity, c.Detail = sevMedium, "not in expected ports"
+			case c.Outside:
+				c.Severity, c.Detail = sevMedium, "reachable from the internet"
 			default:
 				c.Severity = sevLow
 			}
@@ -208,8 +210,19 @@ func Annotate(changes []Change, inv *Inventory) []Change {
 			default:
 				c.Severity = sevLow // DHCP often hands an address to a different device
 			}
-		case "gateway_impersonated":
+		case "gateway_impersonated", "zone_transfer_open":
 			c.Severity = sevHigh
+		case "name_new":
+			c.Severity = sevLow
+		case "name_gone":
+			c.Severity = sevInfo
+		case "dns_changed", "cert_mismatch":
+			c.Severity = sevMedium
+		case "web_changed":
+			c.Severity = sevLow
+			if strings.HasPrefix(c.After, "5") || c.After == "unreachable" {
+				c.Severity, c.Detail = sevMedium, "site down"
+			}
 		default:
 			c.Severity = sevLow
 		}

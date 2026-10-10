@@ -59,6 +59,11 @@ type Snapshot struct {
 	Devices map[string]*Device `json:"devices,omitempty"`
 	// Gateway is the default gateway's IP when it was on a scanned network.
 	Gateway string `json:"gateway,omitempty"`
+	// Outside view only (yaklite outside).
+	Domains      []string             `json:"domains,omitempty"`
+	Names        map[string]*NameInfo `json:"names,omitempty"`
+	ZoneTransfer map[string][]string  `json:"zone_transfer,omitempty"` // domain -> name servers that allowed AXFR
+	SourceErrors []string             `json:"source_errors,omitempty"`
 	// Misses counts consecutive scans in which a previously seen host did not
 	// answer. It lets watch mode wait before reporting a host as gone.
 	Misses map[string]int `json:"misses,omitempty"`
@@ -105,6 +110,7 @@ type Change struct {
 	Before   string    `json:"before,omitempty"`
 	After    string    `json:"after,omitempty"`
 	Detail   string    `json:"detail,omitempty"`
+	Outside  bool      `json:"outside,omitempty"` // seen from the internet (yaklite outside)
 }
 
 func (c Change) who() string {
@@ -137,6 +143,18 @@ func (c Change) String() string {
 		msg = fmt.Sprintf("MAC CHANGED   %s %s -> %s", c.who(), c.Before, c.After)
 	case "gateway_impersonated":
 		msg = fmt.Sprintf("GATEWAY MAC CLAIMED %s also answers with the router's MAC %s", c.who(), c.After)
+	case "name_new":
+		msg = fmt.Sprintf("NEW NAME      %s -> %s", c.who(), c.After)
+	case "name_gone":
+		msg = fmt.Sprintf("NAME GONE     %s (was %s)", c.who(), c.Before)
+	case "dns_changed":
+		msg = fmt.Sprintf("DNS CHANGED   %s %s -> %s", c.who(), c.Before, c.After)
+	case "web_changed":
+		msg = fmt.Sprintf("SITE CHANGED  %s %s -> %s", c.who(), c.Before, c.After)
+	case "cert_mismatch":
+		msg = fmt.Sprintf("CERT WRONG NAME %s certificate on 443 does not cover this name: %s", c.who(), c.After)
+	case "zone_transfer_open":
+		msg = fmt.Sprintf("ZONE TRANSFER OPEN %s: name servers %s hand out the whole zone", c.who(), c.After)
 	default:
 		msg = c.Kind + " " + c.who()
 	}
@@ -308,6 +326,12 @@ func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
 				}
 			}
 		}
+	}
+	if len(cur.Domains) > 0 {
+		for i := range changes {
+			changes[i].Outside = true
+		}
+		changes = append(changes, diffNames(prev, cur, opt, now)...)
 	}
 	var before map[string]bool
 	if prev != nil {

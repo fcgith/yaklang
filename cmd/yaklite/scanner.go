@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -311,6 +312,35 @@ func printSnapshot(s *Snapshot) {
 			}
 			fmt.Fprintf(os.Stdout, "  %-10s %s%s\n", svc.Key(), svc.Label(), mark)
 		}
+	}
+	printNames(s)
+}
+
+func printNames(s *Snapshot) {
+	if len(s.Domains) == 0 {
+		return
+	}
+	names := make([]string, 0, len(s.Names))
+	for n := range s.Names {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	fmt.Fprintf(os.Stdout, "\n%d names under %s\n", len(names), strings.Join(s.Domains, ", "))
+	for _, n := range names {
+		ni := s.Names[n]
+		fmt.Fprintf(os.Stdout, "\n%s -> %s  [%s]\n", n, strings.Join(ni.IPs, ", "), strings.Join(ni.Sources, ","))
+		fmt.Fprintf(os.Stdout, "  web:  %s\n", ni.Web.Short())
+		if ni.HTTPS != nil && ni.HTTPS.TLS != nil {
+			t := ni.HTTPS.TLS
+			line := fmt.Sprintf("  cert: %s, %s, issued by %s", t.Version, daysLeft(t, time.Now()), t.Issuer)
+			if ni.CertMismatch {
+				line += "  (DOES NOT COVER THIS NAME)"
+			}
+			fmt.Fprintln(os.Stdout, line)
+		}
+	}
+	for d, ns := range s.ZoneTransfer {
+		fmt.Fprintf(os.Stdout, "\nWARNING: %s allows zone transfers from %s, which lists every name in the zone to anyone\n", d, strings.Join(ns, ", "))
 	}
 }
 

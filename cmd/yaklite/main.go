@@ -33,6 +33,7 @@ Usage:
   yaklite watch -t TARGETS [-p PORTS] [--every 1h] [--state DIR] [--webhook URL] [--once]
   yaklite diff  OLD.json NEW.json
   yaklite serve [--state DIR] [--listen 127.0.0.1:9842]   dashboard + Prometheus metrics
+  yaklite outside -d example.com [--ip 203.0.113.7] [--once]   what the internet sees of you
 
 TARGETS  IPs, CIDRs, ranges or hostnames, comma separated (192.168.1.0/24,10.0.0.5)
 PORTS    "top" (default, ~80 common LAN ports), "all", or a list like 22,80,8000-8100
@@ -59,6 +60,8 @@ func main() {
 		err = cmdDiff(os.Args[2:])
 	case "serve":
 		err = cmdServe(ctx, os.Args[2:])
+	case "outside":
+		err = cmdOutside(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -179,60 +182,161 @@ func cmdWatch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
 	var opt ScanOptions
 	quiet := scanFlags(fs, &opt)
-	every := fs.Duration("every", time.Hour, "time between scans")
-	stateDir := fs.String("state", defaultStateDir(), "where the last snapshot and the change log are kept (created 0700)")
-	name := fs.String("name", "", "name for this watch, so several networks can share one state dir (default: derived from -t)")
-	webhook := fs.String("webhook", "", "POST changes to this URL (Slack, Mattermost, Discord, Telegram, Gotify, ntfy or plain JSON)")
-	webhookFormat := fs.String("webhook-format", "auto", "webhook body: "+strings.Join(webhookFormats, ", ")+" (auto picks from the URL)")
-	af := alertFlags(fs)
-	goneAfter := fs.Int("gone-after", 2, "report a host as gone only after this many scans in a row without it")
-	once := fs.Bool("once", false, "run one scan, report changes and exit; exit code 3 means something changed (for cron or systemd timers)")
-	asJSON := fs.Bool("json", false, "print changes as JSON lines")
-	listen := fs.String("listen", "", "also serve the dashboard and /metrics on this address, e.g. 127.0.0.1:9842")
+	wf := addWatchFlags(fs, time.Hour)
 	fs.Parse(args)
 	if opt.Targets == "" {
 		return errors.New("-t is required")
 	}
 	opt.Progress = progress(*quiet)
-	ac, err := af.load()
+	w, err := wf.build(func(ctx context.Context) (*Snapshot, error) { return Scan(ctx, opt) }, opt.Progress, opt.Targets+"_"+opt.Ports)
 	if err != nil {
 		return err
 	}
-	ac.webhook, ac.webhookFormat = *webhook, *webhookFormat
-	if !contains(webhookFormats, *webhookFormat) {
-		return fmt.Errorf("unknown --webhook-format %q", *webhookFormat)
+	return runWatch(ctx, w)
+}
+
+type watchFlags struct {
+	every                                   *time.Duration
+	stateDir, name, webhook, format, listen *string
+	goneAfter                               *int
+	once, asJSON                            *bool
+	af                                      *alertFlagValues
+}
+
+func addWatchFlags(fs *flag.FlagSet, every time.Duration) *watchFlags {
+	return &watchFlags{
+		every:     fs.Duration("every", every, "time between scans"),
+		stateDir:  fs.String("state", defaultStateDir(), "where the last snapshot and the change log are kept (created 0700)"),
+		name:      fs.String("name", "", "name for this watch, so several can share one state dir (default: derived from the targets)"),
+		webhook:   fs.String("webhook", "", "POST changes to this URL (Slack, Mattermost, Discord, Telegram, Gotify, ntfy or plain JSON)"),
+		format:    fs.String("webhook-format", "auto", "webhook body: "+strings.Join(webhookFormats, ", ")+" (auto picks from the URL)"),
+		af:        alertFlags(fs),
+		goneAfter: fs.Int("gone-after", 2, "report a host or name as gone only after this many scans in a row without it"),
+		once:      fs.Bool("once", false, "run one scan, report changes and exit; exit code 3 means something changed (for cron or systemd timers)"),
+		asJSON:    fs.Bool("json", false, "print changes as JSON lines"),
+		listen:    fs.String("listen", "", "also serve the dashboard and /metrics on this address, e.g. 127.0.0.1:9842"),
 	}
-	if *webhook != "" && !strings.HasPrefix(*webhook, "https://") && !strings.HasPrefix(*webhook, "http://127.0.0.1") && !strings.HasPrefix(*webhook, "http://localhost") {
-		return errors.New("--webhook must use https:// (plain http is only allowed to localhost)")
+}
+
+func (wf *watchFlags) build(scan scanFunc, progress func(string, ...any), defaultName string) (watchRun, error) {
+	ac, err := wf.af.load()
+	if err != nil {
+		return watchRun{}, err
 	}
-	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
+	ac.webhook, ac.webhookFormat = *wf.webhook, *wf.format
+	if !contains(webhookFormats, *wf.format) {
+		return watchRun{}, fmt.Errorf("unknown --webhook-format %q", *wf.format)
+	}
+	if *wf.webhook != "" && !strings.HasPrefix(*wf.webhook, "https://") && !strings.HasPrefix(*wf.webhook, "http://127.0.0.1") && !strings.HasPrefix(*wf.webhook, "http://localhost") {
+		return watchRun{}, errors.New("--webhook must use https:// (plain http is only allowed to localhost)")
+	}
+	name := *wf.name
+	if name == "" {
+		name = safeName(defaultName)
+	}
+	return watchRun{
+		scan: scan, progress: progress, ac: ac, stateDir: *wf.stateDir, name: name,
+		every: *wf.every, once: *wf.once, asJSON: *wf.asJSON, listen: *wf.listen, goneAfter: *wf.goneAfter,
+	}, nil
+}
+
+func cmdOutside(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("outside", flag.ExitOnError)
+	domains := fs.String("d", "", "domains you own, comma separated (required unless --ip is given)")
+	ips := fs.String("ip", "", "public IPs or ranges you own to port scan, e.g. your home IP or a VPS")
+	scanNames := fs.Bool("scan-resolved", false, "also port scan the IPs your names resolve to (only if you own them: they are often a CDN or host)")
+	brute := fs.Bool("brute", false, "also guess names with a DNS brute force wordlist (many DNS queries)")
+	noCT := fs.Bool("no-ct", false, "skip certificate transparency lookups (crt.sh and certspotter receive the domain name)")
+	dns := fs.String("dns", "1.1.1.1,8.8.8.8", "DNS resolvers to use, comma separated")
+	maxNames := fs.Int("max-names", 300, "most names to check per run")
+	var opt ScanOptions
+	fs.StringVar(&opt.Ports, "p", "top", `ports to scan on public IPs: "top", "all" or a list`)
+	fs.IntVar(&opt.Concurrency, "c", 100, "concurrent connection attempts")
+	fs.DurationVar(&opt.DialTimeout, "dial-timeout", 3*time.Second, "connect timeout per port")
+	fs.DurationVar(&opt.ProbeTimeout, "probe-timeout", 5*time.Second, "timeout per probe and certificate read")
+	fs.BoolVar(&opt.NoFingerprint, "no-fp", false, "only report open ports on public IPs")
+	quiet := fs.Bool("q", false, "quiet: no progress output on stderr")
+	scanOnly := fs.Bool("scan", false, "print the current outside view and exit, without comparing or alerting")
+	wf := addWatchFlags(fs, 6*time.Hour)
+	fs.Parse(args)
+	if *domains == "" && *ips == "" {
+		return errors.New("give -d DOMAINS and/or --ip ADDRESSES you own")
+	}
+	var ds []string
+	for _, d := range strings.Split(*domains, ",") {
+		if d = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(d, "."))); d != "" {
+			ds = append(ds, d)
+		}
+	}
+	var servers []string
+	for _, s := range strings.Split(*dns, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			servers = append(servers, s)
+		}
+	}
+	oo := OutsideOptions{
+		Domains: ds, IPs: *ips, ScanNames: *scanNames, Brute: *brute, NoCT: *noCT,
+		DNSServers: servers, Scan: opt, MaxNames: *maxNames, ProgressFor: progress(*quiet),
+	}
+	scan := func(ctx context.Context) (*Snapshot, error) { return ScanOutside(ctx, oo) }
+	if *scanOnly {
+		snap, err := scan(ctx)
+		if err != nil {
+			return err
+		}
+		if *wf.asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(snap)
+		}
+		printSnapshot(snap)
+		return nil
+	}
+	w, err := wf.build(scan, oo.ProgressFor, "outside_"+*domains+"_"+*ips)
+	if err != nil {
 		return err
 	}
-	if *name == "" {
-		*name = safeName(opt.Targets + "_" + opt.Ports)
+	return runWatch(ctx, w)
+}
+
+type watchRun struct {
+	scan      scanFunc
+	progress  func(string, ...any)
+	ac        *alertConfig
+	stateDir  string
+	name      string
+	every     time.Duration
+	once      bool
+	asJSON    bool
+	listen    string
+	goneAfter int
+}
+
+func runWatch(ctx context.Context, w watchRun) error {
+	if err := os.MkdirAll(w.stateDir, 0o700); err != nil {
+		return err
 	}
-	snapPath := filepath.Join(*stateDir, *name+".snapshot.json")
-	logPath := filepath.Join(*stateDir, *name+".changes.jsonl")
-	if *listen != "" && !*once {
-		srv, err := startWeb(*listen, &stateReader{dir: *stateDir, inv: ac.inv})
+	snapPath := filepath.Join(w.stateDir, w.name+".snapshot.json")
+	logPath := filepath.Join(w.stateDir, w.name+".changes.jsonl")
+	if w.listen != "" && !w.once {
+		srv, err := startWeb(w.listen, &stateReader{dir: w.stateDir, inv: w.ac.inv})
 		if err != nil {
 			return err
 		}
 		defer srv.Close()
 	}
-
 	for {
-		ac.goneAfter = *goneAfter
-		if err := watchOnce(ctx, opt, ac, snapPath, logPath, *asJSON); err != nil {
+		w.ac.goneAfter = w.goneAfter
+		if err := watchOnce(ctx, w.scan, w.progress, w.ac, snapPath, logPath, w.asJSON); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			fmt.Fprintln(os.Stderr, "[yaklite] scan failed:", err)
-			if *once {
+			if w.once {
 				return err
 			}
 		}
-		if *once {
+		if w.once {
 			if lastChangeCount > 0 {
 				os.Exit(3) // lets cron or a systemd unit react to changes
 			}
@@ -241,7 +345,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(*every):
+		case <-time.After(w.every):
 		}
 	}
 }
@@ -249,15 +353,20 @@ func cmdWatch(ctx context.Context, args []string) error {
 // lastChangeCount is the number of changes the most recent watch cycle reported.
 var lastChangeCount int
 
-func watchOnce(ctx context.Context, opt ScanOptions, ac *alertConfig, snapPath, logPath string, asJSON bool) error {
+type scanFunc func(ctx context.Context) (*Snapshot, error)
+
+func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any), ac *alertConfig, snapPath, logPath string, asJSON bool) error {
 	lastChangeCount = 0
 	prev, err := LoadSnapshot(snapPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	cur, err := Scan(ctx, opt)
+	cur, err := scan(ctx)
 	if err != nil {
 		return err
+	}
+	for _, e := range cur.SourceErrors {
+		fmt.Fprintln(os.Stderr, "[yaklite] source failed:", e)
 	}
 	firstRun := prev == nil
 	all := Annotate(Diff(prev, cur, DiffOptions{GoneAfter: ac.goneAfter, TLSWarn: ac.tlsWarn}, cur.Finished), ac.inv)
@@ -283,8 +392,8 @@ func watchOnce(ctx context.Context, opt ScanOptions, ac *alertConfig, snapPath, 
 	}
 	changes := filterSeverity(all, min)
 	if len(changes) == 0 {
-		if opt.Progress != nil {
-			opt.Progress("no changes at or above %s (%d hosts, %d open ports)", min, len(cur.Hosts), cur.OpenPortCount())
+		if progress != nil {
+			progress("no changes at or above %s (%d hosts, %d open ports)", min, len(cur.Hosts), cur.OpenPortCount())
 		}
 		return nil
 	}

@@ -43,6 +43,9 @@ sudo ./yaklite scan -t 192.168.1.0/24 -p top --syn
 
 # compare two saved scans (exit code 3 when anything changed)
 ./yaklite diff monday.json friday.json
+
+# your domains and public IP, seen from the internet
+./yaklite outside -d example.com --ip 203.0.113.7 --scan
 ```
 
 `-p` accepts `top` (default, ~80 ports common on home and office networks:
@@ -100,6 +103,58 @@ SSDP/UPnP, STUN, SIP, mDNS, CoAP, Ubiquiti discovery and memcached
 (`--udp-ports` to change). A UDP port is only reported when the service
 answers, since silence proves nothing. TFTP, SNMP and IPMI count as risky.
 It adds roughly 5 to 10 seconds per device, run in parallel.
+
+## Outside view: what the internet sees of you
+
+`yaklite outside` watches domains and public IPs you own from the outside:
+
+```sh
+# one look, no alerts
+./yaklite outside -d example.com --scan
+
+# every 6 hours, alerting like watch does
+./yaklite outside -d example.com,example.org --ip 203.0.113.7 --webhook https://ntfy.sh/your-topic
+
+# from a cheap VPS, to see your home connection the way an attacker does
+./yaklite outside --ip $(curl -s https://ifconfig.me) --once
+```
+
+Each run:
+
+1. **Finds names.** It searches the certificate transparency logs (crt.sh and
+   certspotter, which receive only the domain name) for every certificate ever
+   issued under your domains. `--brute` also guesses names with yaklang's DNS
+   wordlist, and `--no-ct` skips the log search. Names that no longer resolve
+   are dropped.
+2. **Checks your DNS servers for open zone transfers.** It uses yaklang's AXFR
+   check against your domain's own name servers. An open zone transfer hands
+   your whole zone to anyone.
+3. **Resolves every name and checks its website.** For each name it reads
+   the certificate on 443 and checks that it covers the name, then loads the
+   home page to record the status, `Server` header and title.
+4. **Port scans the public IPs you list with `--ip`,** with the same
+   fingerprinting as `scan`. IPs that your names resolve to are not scanned by
+   default, because they often belong to a CDN or hosting provider rather
+   than to you. Add `--scan-resolved` when you own them.
+
+Alerts:
+
+| Change | Severity |
+| --- | --- |
+| Your DNS servers allow zone transfers | high |
+| A risky port (RDP, SMB, databases, ...) is reachable from the internet | high |
+| Any other port opens on a public IP | medium |
+| A name now resolves to different IPs (a move, or a hijack) | medium |
+| The certificate on a name does not cover it | medium |
+| A site starts failing (5xx or unreachable) | medium |
+| A certificate expires soon, expires, or changes issuer | medium/high, as for the LAN |
+| A new name appears (for example a new certificate was issued) | low |
+| The `Server` header or status class changes | low |
+
+Scanning your public IP from inside your own network goes through your
+router's NAT loopback, which can show ports the internet cannot reach (or
+hide ones it can). Run `outside --ip` from a machine outside your network,
+such as a small VPS, for the real picture.
 
 ## Monitoring with watch
 

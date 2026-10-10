@@ -24,6 +24,10 @@ type TLSInfo struct {
 	Version    string    `json:"version"`
 }
 
+func (t *TLSInfo) identity() string {
+	return t.Subject + "|" + t.Issuer + "|" + t.NotAfter.UTC().Format("2006-01-02")
+}
+
 func (t *TLSInfo) Short() string {
 	if t == nil {
 		return "none"
@@ -123,7 +127,11 @@ func tlsChanges(host string, prev, cur *Service, warn time.Duration, now time.Ti
 	if prev != nil {
 		prevTLS = prev.TLS
 	}
-	sameCert := prevTLS != nil && prevTLS.SHA256 == cur.TLS.SHA256
+	// CDNs and load balancers often serve several copies of the same
+	// certificate (same names, issuer and expiry, different keys) from
+	// different edges, so compare what a person would call "the same
+	// certificate" rather than the exact bytes.
+	sameCert := prevTLS != nil && prevTLS.identity() == cur.TLS.identity()
 
 	if prevTLS != nil && !sameCert {
 		c := base
