@@ -1,0 +1,25 @@
+# docker compose -f cmd/yaklite/contrib/docker/compose.yaml up -d --build
+# Host networking is needed to see the LAN (MAC addresses, the router, UPnP).
+# Change 192.168.1.0/24 to your own network.
+services:
+  yaklite:
+    build:
+      context: ../../../..
+      dockerfile: cmd/yaklite/contrib/docker/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - yaklite-data:/data
+    # add --webhook https://ntfy.sh/your-topic to get phone alerts
+    command: ["watch", "-t", "192.168.1.0/24", "--checks", "--every", "1h", "--listen", "127.0.0.1:9842"]
+  yaklite-outside:
+    build:
+      context: ../../../..
+      dockerfile: cmd/yaklite/contrib/docker/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - yaklite-data:/data
+    profiles: ["outside"]
+    command: ["outside", "-d", "example.com", "--every", "6h"]
+volumes:
+  yaklite-data:
