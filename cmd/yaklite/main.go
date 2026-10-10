@@ -26,29 +26,46 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 )
 
-const usage = `yaklite: network inventory and change monitoring (built from yaklang)
+const usage = `yaklite: home network monitoring and alerts (built from yaklang)
 
 Set and forget (laptops and desktops):
-  yaklite install                 check in the background, notify on problems
+  yaklite install [--webhook URL]   check in the background, notify on problems
   yaklite status                  current network, trust, last check
   yaklite trust [--name Home]     monitor every device on the current network
   yaklite untrust                 only check this computer on the current network
   yaklite name IP|MAC "Name" [--expect 22,443]   name a device
   yaklite uninstall [--purge]
+  yaklite update [--check]        install the latest build (checksum verified)
+
+What it found:
+  yaklite alerts [--since 7d]     recent alerts, with the key to acknowledge each
+  yaklite ack KEY [--for 1w]      "I know about this" (or snooze it for a while)
+  yaklite summary                 the weekly summary, now
+  yaklite history                 when each device was first and last seen
+  yaklite serve                   dashboard on http://127.0.0.1:9842 + Prometheus metrics
+
+Checks:
+  yaklite check [--only upnp,dns] [--list]   router, DNS, Wi-Fi, this computer's settings, ...
+  yaklite conns                   this computer's internet connections, with owner and country
+  yaklite connwatch               alert on connections from the internet or with known attackers
+  yaklite outside -d example.com [--ip 203.0.113.7]   your domains and public IP, seen from outside
 
 By hand:
   yaklite scan  -t TARGETS [-p PORTS] [--udp] [-o snapshot.json]
-  yaklite watch -t TARGETS [--every 1h] [--inventory FILE] [--webhook URL] [--once]
+  yaklite watch -t TARGETS [--every 1h] [--checks] [--inventory FILE] [--webhook URL] [--once]
   yaklite diff  OLD.json NEW.json
-  yaklite outside -d example.com [--ip 203.0.113.7] [--once]   what the internet sees of you
-  yaklite serve [--listen 127.0.0.1:9842]                      dashboard + Prometheus metrics
   yaklite auto                    one check of the current network (what install schedules)
+  yaklite block device IP | site DOMAIN   through AdGuard Home or Pi-hole (yaklite block --help)
+  yaklite mcp                     let Claude read the results (Model Context Protocol, read-only)
 
 TARGETS  IPs, CIDRs, ranges or hostnames, comma separated (192.168.1.0/24,10.0.0.5)
 PORTS    "top" (default, ~80 common LAN ports), "all", or a list like 22,80,8000-8100
 
 Only scan networks you own or are authorised to test.
 `
+
+// version is set at build time: -ldflags "-X main.version=..."
+var version = "dev"
 
 func main() {
 	log.SetLevel(golog.ErrorLevel)
@@ -91,6 +108,18 @@ func main() {
 		err = cmdConnWatch(ctx, os.Args[2:])
 	case "summary":
 		err = cmdSummary(ctx, os.Args[2:])
+	case "history":
+		err = cmdHistory(os.Args[2:])
+	case "block":
+		err = cmdBlock(ctx, os.Args[2:], true)
+	case "unblock":
+		err = cmdBlock(ctx, os.Args[2:], false)
+	case "mcp":
+		err = cmdMCP(ctx, os.Args[2:])
+	case "update":
+		err = cmdUpdate(ctx, os.Args[2:])
+	case "version", "--version":
+		fmt.Println("yaklite", version)
 	case "check":
 		err = cmdCheck(ctx, os.Args[2:])
 	case "ack":
@@ -218,12 +247,26 @@ func cmdWatch(ctx context.Context, args []string) error {
 	var opt ScanOptions
 	quiet := scanFlags(fs, &opt)
 	wf := addWatchFlags(fs, time.Hour)
+	withChecks := fs.Bool("checks", false, "also run the other checks (yaklite check --list): router UPnP, DNS, connections, ... ; -t must be your own network")
 	fs.Parse(args)
 	if opt.Targets == "" {
 		return errors.New("-t is required")
 	}
 	opt.Progress = progress(*quiet)
-	w, err := wf.build(func(ctx context.Context) (*Snapshot, error) { return Scan(ctx, opt) }, opt.Progress, opt.Targets+"_"+opt.Ports)
+	scan := func(ctx context.Context) (*Snapshot, error) { return Scan(ctx, opt) }
+	if *withChecks {
+		scan = func(ctx context.Context) (*Snapshot, error) {
+			snap, err := Scan(ctx, opt)
+			if err != nil {
+				return nil, err
+			}
+			env := &checkEnv{trusted: true, snap: snap, stateDir: *wf.stateDir, prog: func(string, ...any) {}, opts: defaultCheckOptions(), inv: invFor(wf)}
+			env.net, _ = currentNetwork(ctx)
+			runChecks(ctx, env, nil)
+			return snap, nil
+		}
+	}
+	w, err := wf.build(scan, opt.Progress, opt.Targets+"_"+opt.Ports)
 	if err != nil {
 		return err
 	}
@@ -420,10 +463,12 @@ func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any)
 		fmt.Fprintln(os.Stderr, "[yaklite] source failed:", e)
 	}
 	firstRun := prev == nil
+	ac.inv.applyRules(cur)
 	all := Annotate(Diff(prev, cur, DiffOptions{GoneAfter: ac.goneAfter, TLSWarn: ac.tlsWarn}, cur.Finished), ac.inv)
 	if err := SaveSnapshot(snapPath, cur); err != nil {
 		return err
 	}
+	updateHistory(filepath.Dir(snapPath), strings.TrimSuffix(filepath.Base(snapPath), ".snapshot.json"), cur)
 	min := ac.minSev
 	if firstRun {
 		fmt.Fprintf(os.Stderr, "[yaklite] baseline recorded: %d hosts, %d open ports -> %s\n", len(cur.Hosts), cur.OpenPortCount(), snapPath)
@@ -570,4 +615,13 @@ func safeName(s string) string {
 		out = out[:80]
 	}
 	return out
+}
+
+// invFor loads the inventory named on the command line, for checks.
+func invFor(wf *watchFlags) *Inventory {
+	if *wf.af.inventory == "" {
+		return nil
+	}
+	inv, _ := LoadInventory(*wf.af.inventory)
+	return inv
 }

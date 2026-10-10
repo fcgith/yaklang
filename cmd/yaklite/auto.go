@@ -87,6 +87,7 @@ type knownNetwork struct {
 	CIDR    string `yaml:"cidr"`
 	Gateway string `yaml:"gateway"`
 	Trusted bool   `yaml:"trusted"`
+	SSID    string `yaml:"wifi,omitempty"`
 	Seen    string `yaml:"first_seen,omitempty"`
 }
 
@@ -252,6 +253,11 @@ func cmdAuto(ctx context.Context, args []string) error {
 		name = n.ID()
 		opt := ScanOptions{Targets: n.CIDR, Ports: "top", UDP: o.udp, Progress: prog, Concurrency: 200,
 			DialTimeout: 1500 * time.Millisecond, ProbeTimeout: 5 * time.Second}
+		if onBattery(ctx) {
+			// gentler on battery: fewer connections at once, no UDP probes
+			opt.Concurrency, opt.UDP = 60, false
+			prog("on battery: scanning gently")
+		}
 		scan = func(ctx context.Context) (*Snapshot, error) { return Scan(ctx, opt) }
 	} else {
 		name = n.ID() + "-self"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -22,6 +23,10 @@ type TLSInfo struct {
 	SHA256     string    `json:"sha256"`
 	SelfSigned bool      `json:"self_signed"`
 	Version    string    `json:"version"`
+	// OldTLS is set when the server also accepts TLS 1.0 or 1.1, which
+	// browsers dropped in 2020 because of known weaknesses.
+	OldTLS  bool `json:"old_tls,omitempty"`
+	KeyBits int  `json:"key_bits,omitempty"` // RSA key size; 0 for other key types
 }
 
 func (t *TLSInfo) identity() string {
@@ -70,7 +75,19 @@ func inspectTLS(ctx context.Context, host string, port int, timeout time.Duratio
 	if len(st.PeerCertificates) == 0 {
 		return nil
 	}
-	return certInfo(st.PeerCertificates[0], st.Version)
+	info := certInfo(st.PeerCertificates[0], st.Version)
+	if st.Version >= tls.VersionTLS12 {
+		old := cfg.Clone()
+		old.MaxVersion = tls.VersionTLS11
+		d := tls.Dialer{NetDialer: dialer, Config: old}
+		if c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port))); err == nil {
+			info.OldTLS = true
+			c.Close()
+		}
+	} else {
+		info.OldTLS = true
+	}
+	return info
 }
 
 func certInfo(cert *x509.Certificate, version uint16) *TLSInfo {
@@ -79,7 +96,12 @@ func certInfo(cert *x509.Certificate, version uint16) *TLSInfo {
 	if v == "" {
 		v = fmt.Sprintf("0x%04x", version)
 	}
+	bits := 0
+	if k, ok := cert.PublicKey.(*rsa.PublicKey); ok {
+		bits = k.N.BitLen()
+	}
 	return &TLSInfo{
+		KeyBits:    bits,
 		Subject:    cert.Subject.String(),
 		Issuer:     cert.Issuer.String(),
 		DNSNames:   cert.DNSNames,

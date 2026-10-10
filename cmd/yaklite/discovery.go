@@ -25,6 +25,7 @@ type Device struct {
 	Randomized bool   `json:"randomized_mac,omitempty"` // locally administered MAC, as phones use for privacy
 	Hostname   string `json:"hostname,omitempty"`       // from reverse DNS, usually the router's DHCP name
 	Self       bool   `json:"self,omitempty"`           // the machine running yaklite
+	Kind       string `json:"kind,omitempty"`           // from your own rules in the inventory, e.g. "camera"
 }
 
 func (d *Device) describe() string {
@@ -32,6 +33,9 @@ func (d *Device) describe() string {
 		return ""
 	}
 	var parts []string
+	if d.Kind != "" {
+		parts = append(parts, d.Kind)
+	}
 	if d.Hostname != "" {
 		parts = append(parts, d.Hostname)
 	}

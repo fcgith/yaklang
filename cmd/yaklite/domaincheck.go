@@ -80,6 +80,7 @@ func domainChecks(ctx context.Context, snap *Snapshot, domains, candidates []str
 	go func() { defer wg.Done(); add(takeoverFindings(ctx, o.resolver, candidates)...) }()
 	wg.Wait()
 	add(newCertFindings(certs, time.Now())...)
+	add(websiteFindings(snap.Names)...)
 	progress("domain checks done")
 }
 

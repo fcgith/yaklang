@@ -263,7 +263,9 @@ func TestSelfChecks(t *testing.T) {
 		"spctl --status":  "assessments enabled",
 		"defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled": "1",
 	}
-	run := func(_ context.Context, name string, args ...string) string { return fake[strings.Join(append([]string{name}, args...), " ")] }
+	run := func(_ context.Context, name string, args ...string) string {
+		return fake[strings.Join(append([]string{name}, args...), " ")]
+	}
 	fs := macSelfCheck(context.Background(), run)
 	if len(fs) != 1 || fs[0].ID != "self:firewall-off" {
 		t.Errorf("%+v", fs)

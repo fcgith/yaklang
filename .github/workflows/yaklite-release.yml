@@ -45,8 +45,8 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: |
-          GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o yaklite-arm64 ./cmd/yaklite
-          GOARCH=amd64 CC="clang -arch x86_64" go build -trimpath -ldflags "-s -w" -o yaklite-amd64 ./cmd/yaklite
+          GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o yaklite-arm64 ./cmd/yaklite
+          GOARCH=amd64 CC="clang -arch x86_64" go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o yaklite-amd64 ./cmd/yaklite
           lipo -create -output ${{ matrix.asset }} yaklite-arm64 yaklite-amd64
           codesign --force --sign - ${{ matrix.asset }}
           lipo -info ${{ matrix.asset }}
@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           CGO_ENABLED: "1"
-        run: go build -trimpath -ldflags "-s -w" -o ${{ matrix.asset }} ./cmd/yaklite
+        run: go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o ${{ matrix.asset }} ./cmd/yaklite
 
       - name: Smoke test
         run: |

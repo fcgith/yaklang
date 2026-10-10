@@ -314,10 +314,10 @@ func sortedHosts(s *Snapshot) []string {
 // ---- HTML ----
 
 type pageHost struct {
-	Host, Name, Device string
-	Gateway            bool
-	Missed             int
-	Services           []pageService
+	Host, Name, Device, FirstSeen string
+	Gateway                       bool
+	Missed                        int
+	Services                      []pageService
 }
 
 type pageService struct {
@@ -357,6 +357,7 @@ type pageData struct {
 func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 	var out []pageWatch
 	acks := loadAcks()
+	hist := loadHistory(r.dir)
 	for _, w := range states {
 		pw := pageWatch{
 			Name: w.Name, Targets: w.Snap.Targets, Method: w.Snap.Method,
@@ -366,6 +367,9 @@ func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 		}
 		for _, h := range sortedHosts(w.Snap) {
 			row := pageHost{Host: h, Name: r.hostName(h, w.Snap), Missed: w.Snap.Misses[h], Gateway: h == w.Snap.Gateway}
+			if t := hist.firstSeen(w.Name, h, w.Snap.mac(h)); !t.IsZero() {
+				row.FirstSeen = t.Local().Format("2 Jan 2006")
+			}
 			if d := w.Snap.Devices[h]; d != nil {
 				row.Device = strings.TrimSpace(d.MAC + "  " + d.describe())
 			}
@@ -486,7 +490,7 @@ form.name input{font:13px system-ui,sans-serif;padding:2px 6px;border:1px solid 
 {{end}}</table></div>{{end}}
 {{if .HostRows}}<h2>Devices</h2>
 <div class="wrap"><table><tr><th>Host</th><th>Open ports and services</th></tr>
-{{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Gateway}} <span class="muted">(gateway)</span>{{end}}{{if .Device}}<br><span class="muted">{{.Device}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}{{if not .Name}}<form class="act name" method="post" action="name"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="host" value="{{.Host}}"><input name="name" placeholder="Name this device" maxlength="60"></form>{{end}}</td>
+{{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Gateway}} <span class="muted">(gateway)</span>{{end}}{{if .Device}}<br><span class="muted">{{.Device}}</span>{{end}}{{if .FirstSeen}}<br><span class="muted">first seen {{.FirstSeen}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}{{if not .Name}}<form class="act name" method="post" action="name"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="host" value="{{.Host}}"><input name="name" placeholder="Name this device" maxlength="60"></form>{{end}}</td>
 <td>{{if not .Services}}<span class="muted">no open ports</span>{{end}}{{range .Services}}<div class="svc"><code>{{.Key}}</code> {{.Label}}{{if .Unconfirmed}} <span class="muted">(unconfirmed)</span>{{end}}{{if .Cert}} <span class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">cert: {{.Cert}}</span>{{end}}</div>{{end}}</td></tr>
 {{end}}</table></div>{{end}}
 <h2>Recent changes</h2>
@@ -578,6 +582,15 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		fmt.Fprint(w, r.metrics(states))
+	})
+	mux.HandleFunc("/api/summary", func(w http.ResponseWriter, req *http.Request) {
+		states, err := r.load()
+		if err != nil {
+			http.Error(w, "could not read state", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(apiSummary(states, loadAcks(), time.Now()))
 	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, req *http.Request) {
 		states, err := r.load()
@@ -684,4 +697,62 @@ func startWeb(addr string, r *stateReader) (*http.Server, error) {
 	go srv.Serve(ln)
 	fmt.Fprintf(os.Stderr, "[yaklite] dashboard on http://%s/ (metrics at /metrics)\n", ln.Addr())
 	return srv, nil
+}
+
+// apiSummary is the small status the menu bar plugin shows.
+type summaryJSON struct {
+	Status      string   `json:"status"` // ok, warn or alert
+	OpenHigh    int      `json:"open_high"`
+	OpenMedium  int      `json:"open_medium"`
+	Alerts24h   int      `json:"alerts_24h"`
+	LastCheck   string   `json:"last_check,omitempty"`
+	TopProblems []string `json:"top_problems,omitempty"`
+}
+
+func apiSummary(states []*watchState, acks *acksFile, now time.Time) summaryJSON {
+	var s summaryJSON
+	var last time.Time
+	type p struct {
+		sev, title string
+	}
+	var probs []p
+	for _, st := range states {
+		if st.Snap.Finished.After(last) && st.Snap.Method != "connections" {
+			last = st.Snap.Finished
+		}
+		for _, f := range st.Snap.Findings {
+			if acks.matches(f.ID, now) {
+				continue
+			}
+			switch f.Severity {
+			case sevHigh:
+				s.OpenHigh++
+				probs = append(probs, p{f.Severity, f.Title})
+			case sevMedium:
+				s.OpenMedium++
+				probs = append(probs, p{f.Severity, f.Title})
+			}
+		}
+		for _, c := range st.Changes {
+			if now.Sub(c.Time) < 24*time.Hour && sevRank[c.Severity] >= sevRank[sevMedium] && !acks.matches(c.Key(), now) {
+				s.Alerts24h++
+			}
+		}
+	}
+	sort.SliceStable(probs, func(i, j int) bool { return sevRank[probs[i].sev] > sevRank[probs[j].sev] })
+	for i := 0; i < len(probs) && i < 5; i++ {
+		s.TopProblems = append(s.TopProblems, probs[i].title)
+	}
+	if !last.IsZero() {
+		s.LastCheck = last.Local().Format("15:04")
+	}
+	switch {
+	case s.OpenHigh > 0:
+		s.Status = "alert"
+	case s.OpenMedium > 0 || s.Alerts24h > 0:
+		s.Status = "warn"
+	default:
+		s.Status = "ok"
+	}
+	return s
 }

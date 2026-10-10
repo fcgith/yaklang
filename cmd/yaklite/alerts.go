@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -23,15 +24,84 @@ import (
 //	    name: Guest laptop
 //	    ignore: true              # never alert about this host
 //	risky_ports: [23, 445]        # optional, replaces the built-in list
+//	rules:                        # recognise devices it cannot name by itself
+//	  - kind: Security camera
+//	    vendor: Hikvision         # MAC maker contains this (any case)
+//	  - kind: NAS
+//	    ports: [5000, 5001]       # all of these are open
+//	  - kind: Printer
+//	    banner: "(?i)laserjet"    # a fingerprint or banner matches this regex
 type Inventory struct {
 	Hosts      map[string]*HostEntry `yaml:"hosts"`
 	RiskyPorts []int                 `yaml:"risky_ports,omitempty"`
+	Rules      []*DeviceRule         `yaml:"rules,omitempty"`
 }
 
 type HostEntry struct {
 	Name   string `yaml:"name"`
 	Expect []int  `yaml:"expect,omitempty"`
 	Ignore bool   `yaml:"ignore,omitempty"`
+}
+
+// DeviceRule names devices by what they look like. Every given field must match.
+type DeviceRule struct {
+	Kind     string `yaml:"kind"`
+	Vendor   string `yaml:"vendor,omitempty"`
+	Hostname string `yaml:"hostname,omitempty"` // contains, any case
+	Ports    []int  `yaml:"ports,omitempty"`
+	Banner   string `yaml:"banner,omitempty"`
+	re       *regexp.Regexp
+}
+
+func (r *DeviceRule) matches(d *Device, svcs []*Service) bool {
+	if r.Vendor != "" && (d == nil || !strings.Contains(strings.ToLower(d.Vendor), strings.ToLower(r.Vendor))) {
+		return false
+	}
+	if r.Hostname != "" && (d == nil || !strings.Contains(strings.ToLower(d.Hostname), strings.ToLower(r.Hostname))) {
+		return false
+	}
+	open := map[int]bool{}
+	for _, s := range svcs {
+		open[s.Port] = true
+	}
+	for _, p := range r.Ports {
+		if !open[p] {
+			return false
+		}
+	}
+	if r.re != nil {
+		hit := false
+		for _, s := range svcs {
+			if r.re.MatchString(s.Label() + " " + s.Banner + " " + strings.Join(s.CPEs, " ")) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			return false
+		}
+	}
+	return true
+}
+
+// applyRules labels devices that match one of the inventory's rules.
+func (inv *Inventory) applyRules(s *Snapshot) {
+	if inv == nil || len(inv.Rules) == 0 {
+		return
+	}
+	for h, svcs := range s.Hosts {
+		d := s.Devices[h]
+		for _, r := range inv.Rules {
+			if r.matches(d, svcs) {
+				if d == nil {
+					d = &Device{}
+					s.Devices[h] = d
+				}
+				d.Kind = r.Kind
+				break
+			}
+		}
+	}
 }
 
 func (h *HostEntry) expects(port int) bool {
@@ -67,6 +137,19 @@ func LoadInventory(path string) (*Inventory, error) {
 		}
 	}
 	inv.Hosts = hosts
+	for i, r := range inv.Rules {
+		if r == nil || r.Kind == "" {
+			return nil, fmt.Errorf("%s: rule %d needs a kind", path, i+1)
+		}
+		if r.Banner != "" {
+			if r.re, err = regexp.Compile(r.Banner); err != nil {
+				return nil, fmt.Errorf("%s: rule %q: %w", path, r.Kind, err)
+			}
+		}
+		if r.Vendor == "" && len(r.Ports) == 0 && r.Banner == "" && r.Hostname == "" {
+			return nil, fmt.Errorf("%s: rule %q matches everything; give vendor, hostname, ports or banner", path, r.Kind)
+		}
+	}
 	return &inv, nil
 }
 

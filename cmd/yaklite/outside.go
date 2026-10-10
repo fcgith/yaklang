@@ -59,6 +59,7 @@ type WebInfo struct {
 	Title  string `json:"title,omitempty"`
 	Server string `json:"server,omitempty"`
 	Error  string `json:"error,omitempty"`
+	HSTS   bool   `json:"hsts,omitempty"`
 }
 
 func (w *WebInfo) Short() string {
@@ -235,7 +236,7 @@ func fetchWeb(ctx context.Context, name string, timeout time.Duration) *WebInfo 
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 		resp.Body.Close()
-		w := &WebInfo{URL: u, Status: resp.StatusCode, Server: resp.Header.Get("Server")}
+		w := &WebInfo{URL: u, Status: resp.StatusCode, Server: resp.Header.Get("Server"), HSTS: resp.Header.Get("Strict-Transport-Security") != ""}
 		if m := titleRe.FindSubmatch(body); m != nil {
 			w.Title = strings.Join(strings.Fields(html.UnescapeString(string(m[1]))), " ")
 			if len(w.Title) > 80 {
