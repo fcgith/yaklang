@@ -21,7 +21,7 @@ these. yaklite links none of them:
 | --- | --- |
 | Resets umask to 0, so files and the CA key end up world-readable or world-writable | Leaves your umask alone. State dir is `0700`, files are `0600` |
 | Creates `~/yakit-projects` | Keeps yaklang's working files in `~/.local/state/yaklite/engine` (`0700`) |
-| gRPC, MCP, AI gateway and reverse listeners, some on `0.0.0.0` | Opens no listening sockets |
+| gRPC, MCP, AI gateway and reverse listeners, some on `0.0.0.0` | Opens no listening sockets, except the optional read-only dashboard, which is localhost-only unless you set a password |
 | Self-update and plugin downloads with TLS verification off | No update or download code. The webhook uses Go's default client with certificate checks, and plain `http://` is refused except to localhost |
 | AI provider calls to the vendor cloud by default | No AI code |
 
@@ -146,7 +146,61 @@ Priorities follow the worst severity in the batch, so a phone can ring for
 `high` and stay quiet for `low`. Webhook URLs contain secrets, so keep them in
 a root-owned unit file or environment file rather than shell history.
 
-### systemd timer (Linux LAN box)
+## Dashboard and Prometheus metrics
+
+`yaklite serve` shows a read-only web page with each watched network's
+devices, open ports, certificate status and recent changes, plus a
+Prometheus `/metrics` endpoint. It reads the state directory on every
+request, so it works next to a systemd timer that runs `watch --once`.
+`watch --listen ADDR` serves the same thing from a long-running watch.
+
+```sh
+./yaklite serve --inventory home.yaml                # http://127.0.0.1:9842/
+YAKLITE_WEB_PASSWORD=change-me ./yaklite serve --listen 0.0.0.0:9842
+```
+
+It listens on localhost only by default. Any other address is refused unless
+`YAKLITE_WEB_PASSWORD` is set, because the page is a map of your network; the
+browser or Prometheus then logs in with HTTP basic auth (any user name). The
+server answers only GET, sets a strict Content-Security-Policy and runs no
+JavaScript.
+
+Metrics:
+
+| Metric | Meaning |
+| --- | --- |
+| `yaklite_hosts`, `yaklite_open_ports` | Totals in the last snapshot, per `watch` |
+| `yaklite_host_open_ports{host,name}` | Open ports per device |
+| `yaklite_host_missed_scans{host,name}` | Scans in a row a known device did not answer |
+| `yaklite_service_info{host,port,service,product,version,verified}` | One series per open port |
+| `yaklite_tls_cert_expiry_timestamp_seconds{host,port,subject}` | When each certificate expires |
+| `yaklite_changes_total{kind,severity}` | Counter of logged changes |
+| `yaklite_last_scan_timestamp_seconds`, `yaklite_scan_duration_seconds` | Scan health |
+
+Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: yaklite
+    scrape_interval: 1m
+    static_configs: [{targets: ['127.0.0.1:9842']}]
+    # basic_auth: {username: prometheus, password: change-me}
+```
+
+`contrib/grafana-dashboard.json` is a ready Grafana dashboard (import it and
+pick your Prometheus data source): hosts and ports over time, changes by
+severity, certificate days left and the open-port table. Useful alert rules:
+
+```yaml
+- alert: YakliteHighSeverityChange
+  expr: increase(yaklite_changes_total{severity="high"}[1h]) > 0
+- alert: YakliteCertExpiring
+  expr: yaklite_tls_cert_expiry_timestamp_seconds - time() < 14 * 86400
+- alert: YakliteNotScanning
+  expr: time() - yaklite_last_scan_timestamp_seconds > 3 * 3600
+```
+
+## systemd timer (Linux LAN box)
 
 `/etc/systemd/system/yaklite-lan.service`
 
@@ -180,6 +234,12 @@ WantedBy=timers.target
 Enable it with `systemctl enable --now yaklite-lan.timer`. Drop `--syn` and
 `AmbientCapabilities` to run without raw sockets.
 
+For the dashboard, add `/etc/systemd/system/yaklite-web.service` with
+`User=yaklite`, `Environment=XDG_STATE_HOME=/var/lib`,
+`ExecStart=/usr/local/bin/yaklite serve --inventory /etc/yaklite/home.yaml`,
+`Restart=on-failure` and an `[Install]` section with
+`WantedBy=multi-user.target`.
+
 ## What was not extracted, and what to pair it with
 
 These parts of yaklang were tested and were too weak to carry over:
@@ -195,8 +255,8 @@ These parts of yaklang were tested and were too weak to carry over:
 - **Host monitoring (HIDS).** Well-tested code, but it only reports to the
   closed-source Legion platform, is excluded from normal builds, and its eBPF
   exec events carry no arguments. Use **Wazuh**, **osquery** or **Falco**.
-- **Metrics and dashboards.** yaklang has none. Use Prometheus with
-  node_exporter, or Uptime Kuma for simple availability checks.
+- **Host metrics.** yaklang has none. yaklite exports network inventory
+  metrics; for CPU, disk and uptime use Prometheus node_exporter or Uptime Kuma.
 
 ## Licence
 

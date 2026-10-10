@@ -2,8 +2,9 @@
 // yaklang's port scanner and service fingerprinter.
 //
 // It deliberately leaves out the rest of the yak engine: there is no script
-// VM, gRPC server, AI agent, MITM CA, plugin store or self-updater, and it
-// never listens on a network port. Files it writes are owner-only.
+// VM, gRPC server, AI agent, MITM CA, plugin store or self-updater. It only
+// listens on a port when asked to (serve, or watch --listen), read-only and on
+// localhost by default. Files it writes are owner-only.
 package main
 
 import (
@@ -31,6 +32,7 @@ Usage:
   yaklite scan  -t TARGETS [-p PORTS] [-o snapshot.json] [--syn]
   yaklite watch -t TARGETS [-p PORTS] [--every 1h] [--state DIR] [--webhook URL] [--once]
   yaklite diff  OLD.json NEW.json
+  yaklite serve [--state DIR] [--listen 127.0.0.1:9842]   dashboard + Prometheus metrics
 
 TARGETS  IPs, CIDRs, ranges or hostnames, comma separated (192.168.1.0/24,10.0.0.5)
 PORTS    "top" (default, ~80 common LAN ports), "all", or a list like 22,80,8000-8100
@@ -55,6 +57,8 @@ func main() {
 		err = cmdWatch(ctx, os.Args[2:])
 	case "diff":
 		err = cmdDiff(os.Args[2:])
+	case "serve":
+		err = cmdServe(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -180,6 +184,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	goneAfter := fs.Int("gone-after", 2, "report a host as gone only after this many scans in a row without it")
 	once := fs.Bool("once", false, "run one scan, report changes and exit; exit code 3 means something changed (for cron or systemd timers)")
 	asJSON := fs.Bool("json", false, "print changes as JSON lines")
+	listen := fs.String("listen", "", "also serve the dashboard and /metrics on this address, e.g. 127.0.0.1:9842")
 	fs.Parse(args)
 	if opt.Targets == "" {
 		return errors.New("-t is required")
@@ -204,6 +209,13 @@ func cmdWatch(ctx context.Context, args []string) error {
 	}
 	snapPath := filepath.Join(*stateDir, *name+".snapshot.json")
 	logPath := filepath.Join(*stateDir, *name+".changes.jsonl")
+	if *listen != "" && !*once {
+		srv, err := startWeb(*listen, &stateReader{dir: *stateDir, inv: ac.inv})
+		if err != nil {
+			return err
+		}
+		defer srv.Close()
+	}
 
 	for {
 		ac.goneAfter = *goneAfter
@@ -293,6 +305,28 @@ func appendChanges(path string, changes []Change) error {
 	defer f.Close()
 	emit(f, changes, true)
 	return nil
+}
+
+func cmdServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	stateDir := fs.String("state", defaultStateDir(), "state directory written by yaklite watch")
+	listen := fs.String("listen", "127.0.0.1:9842", "address to listen on; anything but loopback needs YAKLITE_WEB_PASSWORD")
+	inventory := fs.String("inventory", "", "inventory YAML, to show device names")
+	fs.Parse(args)
+	r := &stateReader{dir: *stateDir}
+	if *inventory != "" {
+		inv, err := LoadInventory(*inventory)
+		if err != nil {
+			return err
+		}
+		r.inv = inv
+	}
+	srv, err := startWeb(*listen, r)
+	if err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return srv.Close()
 }
 
 type alertFlagValues struct {
