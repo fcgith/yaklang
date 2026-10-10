@@ -238,9 +238,9 @@ func sortedHosts(s *Snapshot) []string {
 
 type pageHost struct {
 	Host, Name, Device string
-	Gateway    bool
-	Missed     int
-	Services   []pageService
+	Gateway            bool
+	Missed             int
+	Services           []pageService
 }
 
 type pageService struct {
