@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,8 +31,10 @@ type watchState struct {
 }
 
 type stateReader struct {
-	dir string
-	inv *Inventory
+	dir           string
+	inv           *Inventory
+	invFromConfig bool // inv comes from ~/.config/yaklite/inventory.yaml and is reloaded when it changes
+	invMod        time.Time
 
 	mu    sync.Mutex
 	cache map[string]cachedChanges
@@ -43,6 +47,7 @@ type cachedChanges struct {
 }
 
 func (r *stateReader) load() ([]*watchState, error) {
+	r.refreshInventory()
 	snaps, err := filepath.Glob(filepath.Join(r.dir, "*.snapshot.json"))
 	if err != nil {
 		return nil, err
@@ -59,6 +64,27 @@ func (r *stateReader) load() ([]*watchState, error) {
 		out = append(out, &watchState{Name: name, Snap: snap, Changes: ch})
 	}
 	return out, nil
+}
+
+// refreshInventory re-reads ~/.config/yaklite/inventory.yaml when it was
+// the source of names and has changed (yaklite name, or the dashboard).
+func (r *stateReader) refreshInventory() {
+	if !r.invFromConfig {
+		return
+	}
+	p := filepath.Join(configDir(), "inventory.yaml")
+	st, err := os.Stat(p)
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st.ModTime().Equal(r.invMod) {
+		return
+	}
+	if inv, err := LoadInventory(p); err == nil {
+		r.inv, r.invMod = inv, st.ModTime()
+	}
 }
 
 // changes parses a change log, re-reading it only when it has grown.
@@ -251,6 +277,19 @@ func (r *stateReader) metrics(states []*watchState) string {
 			p.sample("yaklite_changes_total", float64(counts[k]), "watch", w.Name, "kind", k[0], "severity", k[1])
 		}
 	}
+	p.metric("yaklite_findings", "gauge", "Open problems found by checks, by severity (acknowledged ones excluded).")
+	acks := loadAcks()
+	for _, w := range states {
+		counts := map[string]int{}
+		for _, f := range w.Snap.Findings {
+			if !acks.matches(f.ID, time.Now()) {
+				counts[f.Severity]++
+			}
+		}
+		for _, sev := range []string{sevHigh, sevMedium, sevLow, sevInfo} {
+			p.sample("yaklite_findings", float64(counts[sev]), "watch", w.Name, "severity", sev)
+		}
+	}
 	return p.b.String()
 }
 
@@ -287,7 +326,13 @@ type pageService struct {
 }
 
 type pageChange struct {
-	When, Severity, Text string
+	When, Severity, Text, Key string
+	Acked                     bool
+}
+
+type pageFinding struct {
+	Severity, Title, Detail, Fix, ID string
+	Acked                            bool
 }
 
 type pageName struct {
@@ -301,10 +346,17 @@ type pageWatch struct {
 	Names                                 []pageName
 	ZoneTransfer                          []string
 	Changes                               []pageChange
+	Findings                              []pageFinding
+}
+
+type pageData struct {
+	Watches []pageWatch
+	Token   string // for the acknowledge and name forms
 }
 
 func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 	var out []pageWatch
+	acks := loadAcks()
 	for _, w := range states {
 		pw := pageWatch{
 			Name: w.Name, Targets: w.Snap.Targets, Method: w.Snap.Method,
@@ -368,8 +420,21 @@ func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 			if c.Severity != "" {
 				text = strings.TrimSpace(text[len(c.Severity):])
 			}
-			pw.Changes = append(pw.Changes, pageChange{When: c.Time.Local().Format("Jan 02 15:04"), Severity: c.Severity, Text: text})
+			pw.Changes = append(pw.Changes, pageChange{When: c.Time.Local().Format("Jan 02 15:04"), Severity: c.Severity, Text: text, Key: c.Key(), Acked: acks.matches(c.Key(), now)})
 		}
+		for _, f := range w.Snap.Findings {
+			pw.Findings = append(pw.Findings, pageFinding{Severity: f.Severity, Title: f.Title, Detail: f.Detail, Fix: f.Fix, ID: f.ID, Acked: acks.matches(f.ID, now)})
+		}
+		sort.Slice(pw.Findings, func(i, j int) bool {
+			a, b := pw.Findings[i], pw.Findings[j]
+			if a.Acked != b.Acked {
+				return !a.Acked
+			}
+			if sevRank[a.Severity] != sevRank[b.Severity] {
+				return sevRank[a.Severity] > sevRank[b.Severity]
+			}
+			return a.ID < b.ID
+		})
 		out = append(out, pw)
 	}
 	return out
@@ -393,11 +458,15 @@ th,td{text-align:left;padding:7px 10px;border-top:1px solid var(--line);vertical
 .sev{display:inline-block;min-width:58px;font-size:12px;font-weight:700;text-transform:uppercase}
 .high{color:var(--high)}.medium{color:var(--medium)}.low{color:var(--low)}.info{color:var(--info)}
 code{font:12px ui-monospace,Menlo,monospace}
+form.act{display:inline;margin:0}form.act button{font:12px system-ui,sans-serif;padding:2px 8px;margin:2px 4px 2px 0;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg);cursor:pointer}
+.acked{opacity:.55}.fix{color:var(--muted);font-size:13px}
+form.name input{font:13px system-ui,sans-serif;padding:2px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg);width:150px}
 </style></head><body><main>
 <h1>yaklite</h1>
-<p class="sub">Read-only view of the state directory. Refreshes every minute. <a href="metrics">Prometheus metrics</a></p>
-{{if not .}}<p>No snapshots yet. Run <code>yaklite watch</code> first.</p>{{end}}
-{{range .}}
+<p class="sub">What yaklite has found. Refreshes every minute. Buttons only change yaklite's own settings on this computer. <a href="metrics">Prometheus metrics</a></p>
+{{$tok := .Token}}
+{{if not .Watches}}<p>No snapshots yet. Run <code>yaklite watch</code> first.</p>{{end}}
+{{range .Watches}}
 <h2>{{.Name}}</h2>
 <p class="sub">{{.Targets}} · {{.Method}} scan · last run {{.LastScan}} ({{.Took}})</p>
 <div class="tiles">
@@ -406,18 +475,23 @@ code{font:12px ui-monospace,Menlo,monospace}
 <div class="tile"><b class="{{if .Alerts24h}}high{{end}}">{{.Alerts24h}}</b><span>medium/high alerts, 24h</span></div>
 </div>
 {{if .ZoneTransfer}}<p class="high">Zone transfers are open for {{range .ZoneTransfer}}{{.}} {{end}}: anyone can list every name in the zone.</p>{{end}}
+{{if .Findings}}<h2>Problems found</h2>
+<div class="wrap"><table><tr><th>Severity</th><th>Problem</th><th></th></tr>
+{{range .Findings}}<tr class="{{if .Acked}}acked{{end}}"><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Title}}{{if .Detail}}<br><span class="muted">{{.Detail}}</span>{{end}}{{if .Fix}}<br><span class="fix">Fix: {{.Fix}}</span>{{end}}</td>
+<td class="nw">{{if .Acked}}<span class="muted">acknowledged</span>{{else}}<form class="act" method="post" action="ack"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="key" value="{{.ID}}"><button name="for" value="forever">I know about this</button><button name="for" value="1w">Snooze 1 week</button></form>{{end}}</td></tr>
+{{end}}</table></div>{{end}}
 {{if .Names}}<h2>Websites and names</h2>
 <div class="wrap"><table><tr><th>Name</th><th>Points to</th><th>Web</th><th>Certificate</th></tr>
 {{range .Names}}<tr><td><b>{{.Name}}</b></td><td class="muted">{{.IPs}}</td><td>{{.Web}}</td><td class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">{{.Cert}}</td></tr>
 {{end}}</table></div>{{end}}
 {{if .HostRows}}<h2>Devices</h2>
 <div class="wrap"><table><tr><th>Host</th><th>Open ports and services</th></tr>
-{{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Gateway}} <span class="muted">(gateway)</span>{{end}}{{if .Device}}<br><span class="muted">{{.Device}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}</td>
+{{range .HostRows}}<tr><td><b>{{if .Name}}{{.Name}}{{else}}{{.Host}}{{end}}</b>{{if .Name}}<br><span class="muted">{{.Host}}</span>{{end}}{{if .Gateway}} <span class="muted">(gateway)</span>{{end}}{{if .Device}}<br><span class="muted">{{.Device}}</span>{{end}}{{if .Missed}}<br><span class="medium">missed {{.Missed}} scan(s)</span>{{end}}{{if not .Name}}<form class="act name" method="post" action="name"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="host" value="{{.Host}}"><input name="name" placeholder="Name this device" maxlength="60"></form>{{end}}</td>
 <td>{{if not .Services}}<span class="muted">no open ports</span>{{end}}{{range .Services}}<div class="svc"><code>{{.Key}}</code> {{.Label}}{{if .Unconfirmed}} <span class="muted">(unconfirmed)</span>{{end}}{{if .Cert}} <span class="{{if .CertClass}}{{.CertClass}}{{else}}muted{{end}}">cert: {{.Cert}}</span>{{end}}</div>{{end}}</td></tr>
 {{end}}</table></div>{{end}}
 <h2>Recent changes</h2>
-{{if .Changes}}<div class="wrap"><table><tr><th>When</th><th>Severity</th><th>Change</th></tr>
-{{range .Changes}}<tr><td class="muted nw">{{.When}}</td><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Text}}</td></tr>
+{{if .Changes}}<div class="wrap"><table><tr><th>When</th><th>Severity</th><th>Change</th><th></th></tr>
+{{range .Changes}}<tr class="{{if .Acked}}acked{{end}}"><td class="muted nw">{{.When}}</td><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Text}}</td><td class="nw">{{if or (eq .Severity "high") (eq .Severity "medium")}}{{if .Acked}}<span class="muted">acknowledged</span>{{else}}<form class="act" method="post" action="ack"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="key" value="{{.Key}}"><button name="for" value="forever">I know</button><button name="for" value="1w">Snooze</button></form>{{end}}{{end}}</td></tr>
 {{end}}</table></div>{{else}}<p class="muted">No changes recorded yet.</p>{{end}}
 {{end}}
 </main></body></html>`))
@@ -439,7 +513,50 @@ func isLoopback(addr string) bool {
 // newWebHandler serves the dashboard, /metrics and /api/*. When password is
 // set every request needs HTTP basic auth with that password (any user name).
 func newWebHandler(r *stateReader, password string) http.Handler {
+	tb := make([]byte, 18)
+	rand.Read(tb)
+	token := hex.EncodeToString(tb)
 	mux := http.NewServeMux()
+	// The two forms only change yaklite's own settings (acks.yaml and
+	// inventory.yaml). Each needs the page's random token, so another
+	// website open in the browser cannot submit them.
+	mux.HandleFunc("/ack", func(w http.ResponseWriter, req *http.Request) {
+		d, err := parseDuration(req.PostFormValue("for"))
+		key := req.PostFormValue("key")
+		if err != nil || key == "" || len(key) > 300 {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if _, err := addAck(key, d, "from the dashboard"); err != nil {
+			http.Error(w, "could not save", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, req, "./", http.StatusSeeOther)
+	})
+	mux.HandleFunc("/name", func(w http.ResponseWriter, req *http.Request) {
+		host, name := req.PostFormValue("host"), strings.TrimSpace(req.PostFormValue("name"))
+		if net.ParseIP(host) == nil || name == "" || len(name) > 60 {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		// prefer the MAC, which survives a new IP from the router
+		key := host
+		if states, err := r.load(); err == nil {
+			for _, st := range states {
+				if m := st.Snap.mac(host); m != "" {
+					key = m
+				}
+			}
+		}
+		if err := cmdName([]string{key, name}); err != nil {
+			http.Error(w, "could not save", http.StatusInternalServerError)
+			return
+		}
+		if r.inv == nil {
+			r.invFromConfig = true
+		}
+		http.Redirect(w, req, "./", http.StatusSeeOther)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/" {
 			http.NotFound(w, req)
@@ -451,7 +568,7 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		pageTmpl.Execute(w, r.page(states, time.Now()))
+		pageTmpl.Execute(w, pageData{Watches: r.page(states, time.Now()), Token: token})
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 		states, err := r.load()
@@ -487,12 +604,33 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cache-Control", "no-store")
-		if req.Method != http.MethodGet && req.Method != http.MethodHead {
-			http.Error(w, "read-only", http.StatusMethodNotAllowed)
+		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+		if !hostAllowed(req.Host, password != "") {
+			// a page on another site that rebinds its name to 127.0.0.1
+			http.Error(w, "unexpected Host header", http.StatusForbidden)
+			return
+		}
+		switch req.Method {
+		case http.MethodGet, http.MethodHead:
+		case http.MethodPost:
+			if req.URL.Path != "/ack" && req.URL.Path != "/name" {
+				http.Error(w, "not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			req.Body = http.MaxBytesReader(w, req.Body, 4096)
+			if o := req.Header.Get("Origin"); o != "" && o != "http://"+req.Host && o != "https://"+req.Host {
+				http.Error(w, "cross-site request refused", http.StatusForbidden)
+				return
+			}
+			if subtle.ConstantTimeCompare([]byte(req.PostFormValue("token")), []byte(token)) != 1 {
+				http.Error(w, "stale page, reload it", http.StatusForbidden)
+				return
+			}
+		default:
+			http.Error(w, "not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if password != "" {
@@ -505,6 +643,24 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 		}
 		mux.ServeHTTP(w, req)
 	})
+}
+
+// hostAllowed accepts loopback names, and any name when a password is set
+// (then the dashboard is meant to be reached from elsewhere).
+func hostAllowed(host string, hasPassword bool) bool {
+	if hasPassword {
+		return true
+	}
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	h = strings.Trim(h, "[]")
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // startWeb listens on addr. Non-loopback addresses need YAKLITE_WEB_PASSWORD,

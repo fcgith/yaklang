@@ -497,6 +497,8 @@ func cmdServe(ctx context.Context, args []string) error {
 			return err
 		}
 		r.inv = inv
+	} else {
+		r.invFromConfig = true // names set with yaklite name or on the page
 	}
 	srv, err := startWeb(*listen, r)
 	if err != nil {
