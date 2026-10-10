@@ -7,14 +7,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -79,6 +77,7 @@ func scanFlags(fs *flag.FlagSet, opt *ScanOptions) *bool {
 	fs.DurationVar(&opt.DialTimeout, "dial-timeout", 1500*time.Millisecond, "connect timeout per port")
 	fs.DurationVar(&opt.ProbeTimeout, "probe-timeout", 5*time.Second, "timeout per fingerprint probe")
 	fs.BoolVar(&opt.NoFingerprint, "no-fp", false, "only report open ports, skip service fingerprinting")
+	fs.BoolVar(&opt.NoTLS, "no-tls", false, "skip reading TLS certificates on HTTPS and other TLS ports")
 	return fs.Bool("q", false, "quiet: no progress output on stderr")
 }
 
@@ -121,6 +120,7 @@ func cmdScan(ctx context.Context, args []string) error {
 func cmdDiff(args []string) error {
 	fs := flag.NewFlagSet("diff", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "print changes as JSON lines")
+	af := alertFlags(fs)
 	fs.Parse(args)
 	if fs.NArg() != 2 {
 		return errors.New("usage: yaklite diff OLD.json NEW.json")
@@ -133,7 +133,11 @@ func cmdDiff(args []string) error {
 	if err != nil {
 		return err
 	}
-	changes := Diff(a, b, 1, b.Finished)
+	ac, err := af.load()
+	if err != nil {
+		return err
+	}
+	changes := filterSeverity(Annotate(Diff(a, b, DiffOptions{GoneAfter: 1, TLSWarn: ac.tlsWarn}, b.Finished), ac.inv), ac.minSev)
 	emit(os.Stdout, changes, *asJSON)
 	if len(changes) > 0 {
 		os.Exit(3) // like diff(1): non-zero when something changed
@@ -170,7 +174,9 @@ func cmdWatch(ctx context.Context, args []string) error {
 	every := fs.Duration("every", time.Hour, "time between scans")
 	stateDir := fs.String("state", defaultStateDir(), "where the last snapshot and the change log are kept (created 0700)")
 	name := fs.String("name", "", "name for this watch, so several networks can share one state dir (default: derived from -t)")
-	webhook := fs.String("webhook", "", `POST changes here as JSON {"text": ..., "changes": [...]} (Slack, Mattermost and ntfy accept this)`)
+	webhook := fs.String("webhook", "", "POST changes to this URL (Slack, Mattermost, Discord, Telegram, Gotify, ntfy or plain JSON)")
+	webhookFormat := fs.String("webhook-format", "auto", "webhook body: "+strings.Join(webhookFormats, ", ")+" (auto picks from the URL)")
+	af := alertFlags(fs)
 	goneAfter := fs.Int("gone-after", 2, "report a host as gone only after this many scans in a row without it")
 	once := fs.Bool("once", false, "run one scan, report changes and exit; exit code 3 means something changed (for cron or systemd timers)")
 	asJSON := fs.Bool("json", false, "print changes as JSON lines")
@@ -179,6 +185,14 @@ func cmdWatch(ctx context.Context, args []string) error {
 		return errors.New("-t is required")
 	}
 	opt.Progress = progress(*quiet)
+	ac, err := af.load()
+	if err != nil {
+		return err
+	}
+	ac.webhook, ac.webhookFormat = *webhook, *webhookFormat
+	if !contains(webhookFormats, *webhookFormat) {
+		return fmt.Errorf("unknown --webhook-format %q", *webhookFormat)
+	}
 	if *webhook != "" && !strings.HasPrefix(*webhook, "https://") && !strings.HasPrefix(*webhook, "http://127.0.0.1") && !strings.HasPrefix(*webhook, "http://localhost") {
 		return errors.New("--webhook must use https:// (plain http is only allowed to localhost)")
 	}
@@ -192,7 +206,8 @@ func cmdWatch(ctx context.Context, args []string) error {
 	logPath := filepath.Join(*stateDir, *name+".changes.jsonl")
 
 	for {
-		if err := watchOnce(ctx, opt, snapPath, logPath, *webhook, *goneAfter, *asJSON); err != nil {
+		ac.goneAfter = *goneAfter
+		if err := watchOnce(ctx, opt, ac, snapPath, logPath, *asJSON); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -218,7 +233,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 // lastChangeCount is the number of changes the most recent watch cycle reported.
 var lastChangeCount int
 
-func watchOnce(ctx context.Context, opt ScanOptions, snapPath, logPath, webhook string, goneAfter int, asJSON bool) error {
+func watchOnce(ctx context.Context, opt ScanOptions, ac *alertConfig, snapPath, logPath string, asJSON bool) error {
 	lastChangeCount = 0
 	prev, err := LoadSnapshot(snapPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -229,30 +244,41 @@ func watchOnce(ctx context.Context, opt ScanOptions, snapPath, logPath, webhook 
 		return err
 	}
 	firstRun := prev == nil
-	changes := Diff(prev, cur, goneAfter, cur.Finished)
+	all := Annotate(Diff(prev, cur, DiffOptions{GoneAfter: ac.goneAfter, TLSWarn: ac.tlsWarn}, cur.Finished), ac.inv)
 	if err := SaveSnapshot(snapPath, cur); err != nil {
 		return err
 	}
+	min := ac.minSev
 	if firstRun {
 		fmt.Fprintf(os.Stderr, "[yaklite] baseline recorded: %d hosts, %d open ports -> %s\n", len(cur.Hosts), cur.OpenPortCount(), snapPath)
 		if !asJSON {
 			printSnapshot(cur)
 		}
-		return nil // a baseline is not a change; do not page anyone
+		// Everything is "new" on a first run. Without an inventory only risky
+		// exposures are worth an alert; with one, report what doesn't match it.
+		if ac.inv == nil && sevRank[min] < sevRank[sevHigh] {
+			min = sevHigh
+		}
 	}
+	if len(all) > 0 {
+		if err := appendChanges(logPath, all); err != nil {
+			fmt.Fprintln(os.Stderr, "[yaklite] could not write change log:", err)
+		}
+	}
+	changes := filterSeverity(all, min)
 	if len(changes) == 0 {
 		if opt.Progress != nil {
-			opt.Progress("no changes (%d hosts, %d open ports)", len(cur.Hosts), cur.OpenPortCount())
+			opt.Progress("no changes at or above %s (%d hosts, %d open ports)", min, len(cur.Hosts), cur.OpenPortCount())
 		}
 		return nil
 	}
 	lastChangeCount = len(changes)
-	emit(os.Stdout, changes, asJSON)
-	if err := appendChanges(logPath, changes); err != nil {
-		fmt.Fprintln(os.Stderr, "[yaklite] could not write change log:", err)
+	if firstRun && !asJSON {
+		fmt.Fprintln(os.Stdout, "\nFindings in the baseline:")
 	}
-	if webhook != "" {
-		if err := postWebhook(ctx, webhook, changes); err != nil {
+	emit(os.Stdout, changes, asJSON)
+	if ac.webhook != "" {
+		if err := postWebhook(ctx, ac.webhook, ac.webhookFormat, changes); err != nil {
 			fmt.Fprintln(os.Stderr, "[yaklite] webhook failed:", err)
 		}
 	}
@@ -269,30 +295,50 @@ func appendChanges(path string, changes []Change) error {
 	return nil
 }
 
-func postWebhook(ctx context.Context, url string, changes []Change) error {
-	var text strings.Builder
-	fmt.Fprintf(&text, "yaklite: %d network change(s)\n", len(changes))
-	for _, c := range changes {
-		text.WriteString(c.String() + "\n")
+type alertFlagValues struct {
+	inventory *string
+	minSev    *string
+	tlsDays   *int
+}
+
+type alertConfig struct {
+	inv           *Inventory
+	minSev        string
+	tlsWarn       time.Duration
+	goneAfter     int
+	webhook       string
+	webhookFormat string
+}
+
+func alertFlags(fs *flag.FlagSet) *alertFlagValues {
+	return &alertFlagValues{
+		inventory: fs.String("inventory", "", "YAML file naming your devices and the ports each may expose; alerts then focus on surprises"),
+		minSev:    fs.String("min-severity", "low", "only print and send changes at or above this level: info, low, medium, high (the log keeps everything)"),
+		tlsDays:   fs.Int("tls-warn-days", 21, "warn this many days before a certificate expires (0 to disable)"),
 	}
-	body, _ := json.Marshal(map[string]any{"text": text.String(), "changes": changes})
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
+}
+
+func (f *alertFlagValues) load() (*alertConfig, error) {
+	ac := &alertConfig{tlsWarn: time.Duration(*f.tlsDays) * 24 * time.Hour}
+	var err error
+	if ac.minSev, err = parseSeverity(*f.minSev); err != nil {
+		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	// default client: system CA store, certificate verification on
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+	if *f.inventory != "" {
+		if ac.inv, err = LoadInventory(*f.inventory); err != nil {
+			return nil, err
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook returned %s", resp.Status)
+	return ac, nil
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
 	}
-	return nil
+	return false
 }
 
 func safeName(s string) string {

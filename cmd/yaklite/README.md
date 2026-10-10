@@ -61,19 +61,90 @@ does not raise an alert.
 - `host_new`, `host_gone` (only after `--gone-after` scans in a row, default 2, so a sleeping laptop does not alert every hour)
 - `port_open`, `port_closed`
 - `service_changed` (for example `OpenSSH 8.9p1 -> Dropbear sshd 2022.83`)
+- `tls_expiring`, `tls_expired`, `tls_cert_changed` for HTTPS and other TLS
+  ports (see below)
 
-The first run records a baseline and does not alert. Every change is
-appended to `<state>/<name>.changes.jsonl` and can be posted to a webhook as
-`{"text": "...", "changes": [...]}`. Slack and Mattermost incoming webhooks,
-and ntfy topics, accept that body as is.
+Every change gets a severity (`info`, `low`, `medium`, `high`) and is appended
+to `<state>/<name>.changes.jsonl`. Only changes at or above `--min-severity`
+(default `low`) are printed, posted and counted for the exit code.
 
 ```sh
 # long-running
-./yaklite watch -t 192.168.1.0/24 --every 1h --webhook https://ntfy.sh/your-topic
+./yaklite watch -t 192.168.1.0/24 --every 1h --inventory home.yaml --webhook https://ntfy.sh/your-topic
 
 # one cycle, for cron or a systemd timer (exit 3 = changes found)
-./yaklite watch -t 192.168.1.0/24 --once
+./yaklite watch -t 192.168.1.0/24 --once --inventory home.yaml
 ```
+
+### Device inventory (optional, recommended)
+
+Tell yaklite what your devices are and which ports they are allowed to
+expose. Alerts then use names instead of IPs and only escalate what does not
+match.
+
+```yaml
+# home.yaml
+hosts:
+  192.168.1.1:
+    name: Router
+    expect: [53, 80, 443]
+  192.168.1.10:
+    name: NAS
+    expect: [22, 443, 5000, 5001]
+  192.168.1.20:
+    name: Living room TV          # known device, any ports
+  192.168.1.99:
+    name: Guest laptop
+    ignore: true                  # never alert about this host
+# risky_ports: [23, 445, 3389]    # optional, replaces the built-in list
+```
+
+How severities are assigned:
+
+| Change | Severity |
+| --- | --- |
+| Port opens on a risky port (Telnet, FTP, SMB, RDP, VNC, Redis, MongoDB, Docker API without TLS, databases, ...) and it is not in `expect`, or a service changes into one of those | high |
+| TLS certificate expired | high |
+| New host that is not in the inventory | medium (low without an inventory) |
+| Port opens that is not in the host's `expect` list | medium |
+| A port in `expect` stops answering | medium |
+| TLS certificate expires within `--tls-warn-days` (default 21) | medium |
+| Certificate replaced by one from a different issuer | medium |
+| Other new ports, service version changes, same-issuer renewals, a known device going offline | low |
+| Expected ports, known devices joining, other ports closing, unknown devices leaving | info |
+
+The first run records a baseline. With an inventory it reports anything that
+already does not match it. Without one it only reports `high` findings, such
+as an exposed Telnet or Redis port, so the first run is not a wall of
+"new host" lines.
+
+### TLS certificate checks
+
+On common TLS ports (443, 8443, 993, 5001, ...) and on anything the
+fingerprinter identifies as SSL/TLS, yaklite reads the certificate the
+service presents: subject, issuer, expiry, fingerprint, TLS version and
+whether it is self-signed. It sends no application data. Expiry is alerted
+once when the certificate enters the warning window and once when it expires,
+not on every scan. `--tls-warn-days 0` turns expiry warnings off and
+`--no-tls` skips certificate reads entirely.
+
+### Notifications
+
+`--webhook` takes an `https://` URL (plain `http://` only to localhost). The
+body is picked from the URL, or set it with `--webhook-format`:
+
+| Service | Example URL | Format |
+| --- | --- | --- |
+| ntfy | `https://ntfy.sh/your-topic` | text with title, priority and tags headers |
+| Discord | `https://discord.com/api/webhooks/<id>/<token>` | `content` |
+| Telegram | `https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>` | `text` |
+| Slack, Mattermost | `https://hooks.slack.com/services/...` | `text` |
+| Gotify | `https://gotify.example/message?token=<APP_TOKEN>` | title, message, priority |
+| Anything else | your own endpoint | `{"text": "...", "changes": [...]}` (`json`) |
+
+Priorities follow the worst severity in the batch, so a phone can ring for
+`high` and stay quiet for `low`. Webhook URLs contain secrets, so keep them in
+a root-owned unit file or environment file rather than shell history.
 
 ### systemd timer (Linux LAN box)
 
@@ -86,7 +157,7 @@ Description=yaklite LAN change check
 [Service]
 Type=oneshot
 User=yaklite
-ExecStart=/usr/local/bin/yaklite watch -t 192.168.1.0/24 --once --syn -q --webhook https://ntfy.sh/your-topic
+ExecStart=/usr/local/bin/yaklite watch -t 192.168.1.0/24 --once --syn -q --inventory /etc/yaklite/home.yaml --webhook https://ntfy.sh/your-topic
 SuccessExitStatus=3
 AmbientCapabilities=CAP_NET_RAW
 NoNewPrivileges=yes

@@ -29,6 +29,7 @@ type ScanOptions struct {
 	DialTimeout   time.Duration
 	ProbeTimeout  time.Duration
 	NoFingerprint bool
+	NoTLS         bool
 	Progress      func(format string, args ...any)
 }
 
@@ -215,6 +216,9 @@ func Scan(ctx context.Context, opt ScanOptions) (*Snapshot, error) {
 					r = nil
 				}
 				svc := toService(hp.port, r)
+				if !opt.NoTLS && wantsTLSCheck(svc) {
+					svc.TLS = inspectTLS(ctx, hp.host, hp.port, opt.ProbeTimeout)
+				}
 				mu.Lock()
 				snap.Add(hp.host, svc)
 				mu.Unlock()
@@ -240,6 +244,13 @@ func printSnapshot(s *Snapshot) {
 			mark := ""
 			if !svc.Verified {
 				mark = " (unconfirmed)"
+			}
+			if svc.TLS != nil {
+				mark += fmt.Sprintf("  [cert %s, %s", svc.TLS.Version, daysLeft(svc.TLS, time.Now()))
+				if svc.TLS.SelfSigned {
+					mark += ", self-signed"
+				}
+				mark += "]"
 			}
 			fmt.Fprintf(os.Stdout, "  %-10s %s%s\n", svc.Key(), svc.Label(), mark)
 		}

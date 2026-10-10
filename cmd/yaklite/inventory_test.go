@@ -25,7 +25,7 @@ func kinds(cs []Change) []string {
 
 func TestDiffFirstRunReportsEverythingNew(t *testing.T) {
 	cur := snap(map[string][]*Service{"10.0.0.2": {{Port: 22, Proto: "tcp"}}})
-	cs := Diff(nil, cur, 2, time.Now())
+	cs := Diff(nil, cur, DiffOptions{GoneAfter: 2}, time.Now())
 	if len(cs) != 2 || cs[0].Kind != "host_new" || cs[1].Kind != "port_open" {
 		t.Fatalf("got %v", kinds(cs))
 	}
@@ -40,7 +40,7 @@ func TestDiffPortsAndServices(t *testing.T) {
 		{Port: 22, Proto: "tcp", Product: "OpenSSH", Version: "9.6", Verified: true},
 		{Port: 443, Proto: "tcp", Service: "https"},
 	}})
-	cs := Diff(prev, cur, 2, time.Now())
+	cs := Diff(prev, cur, DiffOptions{GoneAfter: 2}, time.Now())
 	want := map[string]bool{"service_changed 10.0.0.2": true, "port_open 10.0.0.2": true, "port_closed 10.0.0.2": true}
 	if len(cs) != 3 {
 		t.Fatalf("got %v", kinds(cs))
@@ -55,7 +55,7 @@ func TestDiffPortsAndServices(t *testing.T) {
 func TestDiffUnverifiedFingerprintIsNotAServiceChange(t *testing.T) {
 	prev := snap(map[string][]*Service{"h": {{Port: 6379, Proto: "tcp", Service: "redis", Verified: true}}})
 	cur := snap(map[string][]*Service{"h": {{Port: 6379, Proto: "tcp", Service: "opsec-ela", Verified: false}}})
-	if cs := Diff(prev, cur, 1, time.Now()); len(cs) != 0 {
+	if cs := Diff(prev, cur, DiffOptions{GoneAfter: 1}, time.Now()); len(cs) != 0 {
 		t.Fatalf("flaky probe reported as change: %v", kinds(cs))
 	}
 }
@@ -63,20 +63,20 @@ func TestDiffUnverifiedFingerprintIsNotAServiceChange(t *testing.T) {
 func TestDiffHostGoneNeedsConsecutiveMisses(t *testing.T) {
 	prev := snap(map[string][]*Service{"a": {{Port: 22, Proto: "tcp"}}, "b": {{Port: 80, Proto: "tcp"}}})
 	cur := snap(map[string][]*Service{"a": {{Port: 22, Proto: "tcp"}}})
-	if cs := Diff(prev, cur, 2, time.Now()); len(cs) != 0 {
+	if cs := Diff(prev, cur, DiffOptions{GoneAfter: 2}, time.Now()); len(cs) != 0 {
 		t.Fatalf("first miss should be silent, got %v", kinds(cs))
 	}
 	if cur.Misses["b"] != 1 || cur.Hosts["b"] == nil {
 		t.Fatalf("missing host not carried forward: %+v", cur)
 	}
 	next := snap(map[string][]*Service{"a": {{Port: 22, Proto: "tcp"}}})
-	cs := Diff(cur, next, 2, time.Now())
+	cs := Diff(cur, next, DiffOptions{GoneAfter: 2}, time.Now())
 	if len(cs) != 1 || cs[0].Kind != "host_gone" || cs[0].Host != "b" {
 		t.Fatalf("got %v", kinds(cs))
 	}
 	// a host that comes back resets its miss count
 	back := snap(map[string][]*Service{"a": {{Port: 22, Proto: "tcp"}}, "b": {{Port: 80, Proto: "tcp"}}})
-	if cs := Diff(cur, back, 2, time.Now()); len(cs) != 0 || back.Misses["b"] != 0 {
+	if cs := Diff(cur, back, DiffOptions{GoneAfter: 2}, time.Now()); len(cs) != 0 || back.Misses["b"] != 0 {
 		t.Fatalf("returning host: %v misses=%d", kinds(cs), back.Misses["b"])
 	}
 }

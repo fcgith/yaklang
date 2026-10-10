@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,10 @@ type Service struct {
 	CPEs     []string `json:"cpes,omitempty"`
 	Banner   string   `json:"banner,omitempty"`
 	Verified bool     `json:"verified"` // false when only the port is known to be open
+	TLS      *TLSInfo `json:"tls,omitempty"`
+	// TLSState is "", "expiring" or "expired" as of this snapshot, so expiry is
+	// alerted once when it is first seen rather than on every scan.
+	TLSState string `json:"tls_state,omitempty"`
 }
 
 // Key identifies a service across snapshots.
@@ -83,29 +88,64 @@ func (s *Snapshot) OpenPortCount() int {
 
 // Change is one difference between two snapshots.
 type Change struct {
-	Time   time.Time `json:"time"`
-	Kind   string    `json:"kind"` // host_new, host_gone, port_open, port_closed, service_changed
-	Host   string    `json:"host"`
-	Port   int       `json:"port,omitempty"`
-	Proto  string    `json:"proto,omitempty"`
-	Before string    `json:"before,omitempty"`
-	After  string    `json:"after,omitempty"`
+	Time     time.Time `json:"time"`
+	Kind     string    `json:"kind"` // host_new, host_gone, port_open, port_closed, service_changed, tls_expiring, tls_expired, tls_cert_changed
+	Severity string    `json:"severity,omitempty"`
+	Host     string    `json:"host"`
+	Name     string    `json:"name,omitempty"` // friendly name from the inventory file
+	Port     int       `json:"port,omitempty"`
+	Proto    string    `json:"proto,omitempty"`
+	Before   string    `json:"before,omitempty"`
+	After    string    `json:"after,omitempty"`
+	Detail   string    `json:"detail,omitempty"`
+}
+
+func (c Change) who() string {
+	if c.Name != "" {
+		return fmt.Sprintf("%s (%s)", c.Name, c.Host)
+	}
+	return c.Host
 }
 
 func (c Change) String() string {
+	var msg string
 	switch c.Kind {
 	case "host_new":
-		return fmt.Sprintf("NEW HOST      %s (%s)", c.Host, c.After)
+		msg = fmt.Sprintf("NEW HOST      %s (%s)", c.who(), c.After)
 	case "host_gone":
-		return fmt.Sprintf("HOST GONE     %s (was %s)", c.Host, c.Before)
+		msg = fmt.Sprintf("HOST GONE     %s (was %s)", c.who(), c.Before)
 	case "port_open":
-		return fmt.Sprintf("PORT OPENED   %s %s/%d %s", c.Host, c.Proto, c.Port, c.After)
+		msg = fmt.Sprintf("PORT OPENED   %s %s/%d %s", c.who(), c.Proto, c.Port, c.After)
 	case "port_closed":
-		return fmt.Sprintf("PORT CLOSED   %s %s/%d (was %s)", c.Host, c.Proto, c.Port, c.Before)
+		msg = fmt.Sprintf("PORT CLOSED   %s %s/%d (was %s)", c.who(), c.Proto, c.Port, c.Before)
 	case "service_changed":
-		return fmt.Sprintf("SERVICE CHANGED %s %s/%d %s -> %s", c.Host, c.Proto, c.Port, c.Before, c.After)
+		msg = fmt.Sprintf("SERVICE CHANGED %s %s/%d %s -> %s", c.who(), c.Proto, c.Port, c.Before, c.After)
+	case "tls_expiring":
+		msg = fmt.Sprintf("CERT EXPIRING %s %s/%d %s", c.who(), c.Proto, c.Port, c.After)
+	case "tls_expired":
+		msg = fmt.Sprintf("CERT EXPIRED  %s %s/%d %s", c.who(), c.Proto, c.Port, c.After)
+	case "tls_cert_changed":
+		msg = fmt.Sprintf("CERT CHANGED  %s %s/%d %s -> %s", c.who(), c.Proto, c.Port, c.Before, c.After)
+	default:
+		msg = c.Kind + " " + c.who()
 	}
-	return c.Kind
+	if c.Detail != "" {
+		msg += " [" + c.Detail + "]"
+	}
+	if c.Severity != "" {
+		msg = fmt.Sprintf("%-6s %s", strings.ToUpper(c.Severity), msg)
+	}
+	return msg
+}
+
+// DiffOptions tunes how two snapshots are compared.
+type DiffOptions struct {
+	// GoneAfter is how many consecutive scans a host must be missing before
+	// it is reported as gone.
+	GoneAfter int
+	// TLSWarn is how far ahead of expiry a certificate is reported. Zero
+	// disables expiry warnings.
+	TLSWarn time.Duration
 }
 
 func portList(svcs []*Service) string {
@@ -126,7 +166,8 @@ func portList(svcs []*Service) string {
 // once they have been missing for goneAfter consecutive scans; until then they
 // are carried forward into cur so the next comparison still knows them.
 // A nil prev means a first run: every host is reported as new.
-func Diff(prev, cur *Snapshot, goneAfter int, now time.Time) []Change {
+func Diff(prev, cur *Snapshot, opt DiffOptions, now time.Time) []Change {
+	goneAfter := opt.GoneAfter
 	if goneAfter < 1 {
 		goneAfter = 1
 	}
@@ -163,6 +204,7 @@ func Diff(prev, cur *Snapshot, goneAfter int, now time.Time) []Change {
 			changes = append(changes, Change{Time: now, Kind: "host_new", Host: h, After: portList(curSvcs)})
 			for _, s := range curSvcs {
 				changes = append(changes, Change{Time: now, Kind: "port_open", Host: h, Port: s.Port, Proto: s.Proto, After: s.Label()})
+				changes = append(changes, tlsChanges(h, nil, s, opt.TLSWarn, now)...)
 			}
 		case !inCur && inPrev:
 			misses := prev.Misses[h] + 1
@@ -186,8 +228,10 @@ func Diff(prev, cur *Snapshot, goneAfter int, now time.Time) []Change {
 				p, ok := prevBy[s.Key()]
 				if !ok {
 					changes = append(changes, Change{Time: now, Kind: "port_open", Host: h, Port: s.Port, Proto: s.Proto, After: s.Label()})
+					changes = append(changes, tlsChanges(h, nil, s, opt.TLSWarn, now)...)
 					continue
 				}
+				changes = append(changes, tlsChanges(h, p, s, opt.TLSWarn, now)...)
 				// only compare fingerprints when both sides identified something,
 				// so a flaky probe does not look like a service swap
 				if s.Verified && p.Verified && p.Label() != s.Label() {
