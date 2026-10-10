@@ -4,10 +4,17 @@ A small network inventory and change-monitoring tool built from the parts of
 yaklang that held up in testing: the port scanner (connect and SYN) and the
 service fingerprinter (nmap-derived probes plus ~11.8k web/CPE rules).
 
-It answers two questions for a network you own:
+It answers these questions for a network you own:
 
 - **What is on my network right now?** `yaklite scan`
 - **What changed since last time?** `yaklite watch` / `yaklite diff`
+- **Is anyone from the internet talking to this computer, or is it talking
+  to known attackers?** `yaklite conns` / `yaklite connwatch`
+- **Is my router, Wi-Fi, DNS or this computer set up safely?** `yaklite check`
+- **What does the internet see of me?** `yaklite outside`
+
+It detects and warns. It can block a device or site only through an AdGuard
+Home or Pi-hole you already run (`yaklite block`).
 
 Only scan networks you own or are authorised to test.
 
@@ -24,11 +31,17 @@ asks whether the network you are on is yours, and sets up two background jobs
 for your user (no admin password):
 
 - a check that runs at login, every hour, and **whenever you join a network**
-  (launchd watches the network configuration), and
+  (launchd watches the network configuration), including the safety checks
+  below,
+- a watch on this computer's own connections every 30 seconds
+  (`--no-connwatch` to skip it),
+- a weekly summary on Monday at 9:00 (`--no-summary` to skip it), and
 - the dashboard on <http://127.0.0.1:9842/>.
 
 Problems show up as normal macOS notifications. Add
-`--webhook https://ntfy.sh/your-topic` to also get them on your phone.
+`--webhook https://ntfy.sh/your-topic` to also get them on your phone, with
+buttons to acknowledge, snooze or re-check (see [Alerts](#alerts-on-your-phone-email-and-chat)).
+`yaklite update` later fetches the newest build and checks its checksum.
 
 What a check does depends on the network:
 
@@ -69,9 +82,8 @@ Good to know:
 - On Linux, `install` creates systemd user units (`yaklite-auto.timer`,
   `yaklite-web.service`) that check every hour; notifications use
   `notify-send`.
-- yaklite detects and warns. It cannot block anything, because that needs
-  control of the router or firewall. Each alert says what changed, so you know
-  what to fix.
+- yaklite detects and warns. Each alert says what changed and, where it
+  can, how to fix it. Blocking needs AdGuard Home or Pi-hole (`yaklite block`).
 
 ## What it leaves out, on purpose
 
@@ -83,8 +95,8 @@ these. yaklite links none of them:
 | --- | --- |
 | Resets umask to 0, so files and the CA key end up world-readable or world-writable | Leaves your umask alone. State dir is `0700`, files are `0600` |
 | Creates `~/yakit-projects` | Keeps yaklang's working files in `~/.local/state/yaklite/engine` (`0700`) |
-| gRPC, MCP, AI gateway and reverse listeners, some on `0.0.0.0` | Opens no listening sockets, except the optional read-only dashboard, which is localhost-only unless you set a password |
-| Self-update and plugin downloads with TLS verification off | No update or download code. The webhook uses Go's default client with certificate checks, and plain `http://` is refused except to localhost |
+| gRPC, MCP, AI gateway and reverse listeners, some on `0.0.0.0` | Opens no listening sockets except the optional dashboard, which is localhost-only unless you set a password. `yaklite mcp` talks over stdin/stdout only and is read-only |
+| Self-update and plugin downloads with TLS verification off | Every download uses Go's default client with certificate checks. `yaklite update` only accepts GitHub hosts, verifies the SHA-256 and test-runs the new binary before swapping it in. No plugins. Plain `http://` is refused except to localhost |
 | AI provider calls to the vendor cloud by default | No AI code |
 
 Binary size: about 57 MB (stripped) against 310 MB.
@@ -292,9 +304,26 @@ once when the certificate enters the warning window and once when it expires,
 not on every scan. `--tls-warn-days 0` turns expiry warnings off and
 `--no-tls` skips certificate reads entirely.
 
-### Notifications
+### Recognising devices with rules
 
-`--webhook` takes an `https://` URL (plain `http://` only to localhost). The
+Rules in the inventory label devices yaklite cannot name on its own. The
+label shows first on the dashboard and in alerts, and the `iot` check uses it.
+
+```yaml
+rules:
+  - kind: Security camera
+    vendor: Hikvision         # MAC maker contains this (any case)
+  - kind: NAS
+    ports: [5000, 5001]       # all of these are open
+  - kind: Printer
+    banner: "(?i)laserjet"    # a fingerprint or banner matches this regex
+    hostname: printer         # optional, name contains this
+```
+
+### Alerts on your phone, email and chat
+
+`--webhook` takes an `https://` URL (plain `http://` only to localhost) or an
+email address. Several destinations can be given, comma separated. The
 body is picked from the URL, or set it with `--webhook-format`:
 
 | Service | Example URL | Format |
@@ -304,17 +333,51 @@ body is picked from the URL, or set it with `--webhook-format`:
 | Telegram | `https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>` | `text` |
 | Slack, Mattermost | `https://hooks.slack.com/services/...` | `text` |
 | Gotify | `https://gotify.example/message?token=<APP_TOKEN>` | title, message, priority |
+| Pushover | `https://api.pushover.net/1/messages.json?token=APP&user=USER` | title, message, priority |
+| Home Assistant | `https://homeassistant.local:8123/api/webhook/<ID>` | `json` |
+| Email | `smtps://you@smtp.example.com:465/you@example.com` or `smtp://...:587/...` (STARTTLS) | plain text |
 | Anything else | your own endpoint | `{"text": "...", "changes": [...]}` (`json`) |
 
 Priorities follow the worst severity in the batch, so a phone can ring for
 `high` and stay quiet for `low`. Webhook URLs contain secrets, so keep them in
-a root-owned unit file or environment file rather than shell history.
+a root-owned unit file or environment file rather than shell history. The
+email password is never part of the URL: put it in `YAKLITE_SMTP_PASSWORD` or
+`~/.config/yaklite/smtp-password` (`chmod 600`). Email must use TLS.
+
+**Phone buttons (ntfy).** ntfy alerts carry three buttons: *Acknowledge*,
+*Snooze 1 week* and *Check again*. A press posts a signed message to
+`<your-topic>-actions`, which yaklite reads on its next run. The signature
+uses a secret in `~/.config/yaklite/action-secret`, so someone who knows the
+topic name cannot acknowledge alerts for you. Use a long, unguessable topic
+name all the same, because anyone who knows it can read your alerts.
+
+### Acknowledging and snoozing
+
+Each alert has a key. Acknowledging it stops that alert repeating; anything
+new still alerts.
+
+```sh
+yaklite alerts --since 7d                     # recent alerts with their keys
+yaklite ack port_open:192.168.1.10:tcp/23     # for good
+yaklite ack upnp:enabled --for 1w             # snooze (h, d, w, or forever)
+```
+
+The dashboard has the same buttons on each problem, and a box to name a
+device.
+
+### Weekly summary and device history
+
+`yaklite summary` prints a short report of the last week: devices, new ones,
+open problems and the worst alerts. `install` sends it every Monday at 9:00
+to the same destinations as the alerts (`summary --send` does it by hand).
+`yaklite history` lists every device ever seen, with first and last seen
+times.
 
 ## Dashboard and Prometheus metrics
 
-`yaklite serve` shows a read-only web page with each watched network's
-devices, open ports, certificate status and recent changes, plus a
-Prometheus `/metrics` endpoint. It reads the state directory on every
+`yaklite serve` shows a web page with each watched network's devices, open
+ports, certificate status, open problems and recent changes, plus a
+Prometheus `/metrics` endpoint and a small JSON summary at `/api/summary`. It reads the state directory on every
 request, so it works next to a systemd timer that runs `watch --once`.
 `watch --listen ADDR` serves the same thing from a long-running watch.
 
@@ -326,8 +389,10 @@ YAKLITE_WEB_PASSWORD=change-me ./yaklite serve --listen 0.0.0.0:9842
 It listens on localhost only by default. Any other address is refused unless
 `YAKLITE_WEB_PASSWORD` is set, because the page is a map of your network; the
 browser or Prometheus then logs in with HTTP basic auth (any user name). The
-server answers only GET, sets a strict Content-Security-Policy and runs no
-JavaScript.
+page runs no JavaScript and sets a strict Content-Security-Policy. Its only
+forms (acknowledge, snooze, name a device) need a per-run token, a same-site
+`Origin` and, without a password, a localhost `Host` header, so other web
+sites and DNS rebinding cannot use them.
 
 Metrics:
 
@@ -339,6 +404,7 @@ Metrics:
 | `yaklite_service_info{host,port,service,product,version,verified}` | One series per open port |
 | `yaklite_tls_cert_expiry_timestamp_seconds{host,port,subject}` | When each certificate expires |
 | `yaklite_changes_total{kind,severity}` | Counter of logged changes |
+| `yaklite_findings{watch,severity}` | Open problems from the safety checks |
 | `yaklite_last_scan_timestamp_seconds`, `yaklite_scan_duration_seconds` | Scan health |
 
 Prometheus scrape config:
@@ -363,6 +429,99 @@ severity, certificate days left and the open-port table. Useful alert rules:
 - alert: YakliteNotScanning
   expr: time() - yaklite_last_scan_timestamp_seconds > 3 * 3600
 ```
+
+## This computer's connections
+
+`yaklite conns` lists this computer's internet connections with the program,
+the remote address's owner (network operator) and country, using an IP table
+built into the binary, so no lookup leaves the machine. Connections to
+addresses on public lists of known attackers are marked.
+
+`yaklite connwatch` checks the same every 30 seconds and alerts on:
+
+| Alert | Severity |
+| --- | --- |
+| Someone on the internet connected **in** to this computer | high |
+| A connection to or from an address on a known-attackers list | high |
+| The first connection to a country not seen before (after 7 days of learning) | low (`--new-country-severity`) |
+
+The known-attacker lists are abuse.ch Feodo Tracker, Spamhaus DROP, DShield,
+blocklist.de and CINS Army. They are downloaded at most every 12 hours
+(`--no-threat-lists` to skip). `install` runs `connwatch` in the background
+on macOS and Linux.
+
+## Safety checks
+
+`yaklite check` runs these once and prints what it finds; `install` and
+`watch --checks` run them on every scan and alert when something new shows
+up. `--only` picks some, `--list` shows them all.
+
+| Check | Looks for |
+| --- | --- |
+| `self` | This computer: firewall off, stealth mode, FileVault or disk encryption, SIP, Gatekeeper, automatic updates, guest account, SSH password logins, file or screen sharing listening on the network |
+| `upnp` | Ports the router forwards from the internet through UPnP, and whether UPnP is on at all (trusted networks) |
+| `exposure` | What internet scanners recorded about your public address: open ports and known flaws, from Shodan InternetDB (trusted networks) |
+| `dns` | Whether this network tampers with name lookups: fake answers for missing names, answers that differ from DNS-over-HTTPS, the DNS server changing on a network you trust |
+| `dhcp` | Which device hands out network settings, and a second one appearing |
+| `wifi` | Open or WEP Wi-Fi, and a network with your Wi-Fi's name but a different router (a fake copy) |
+| `kev` | Devices running software on CISA's list of flaws attackers are actively using |
+| `tls` | Devices and sites still accepting TLS 1.0/1.1, or using RSA keys under 2048 bits |
+| `ipv6` | Devices with public IPv6 addresses and risky ports open on them (trusted networks) |
+| `iot` | Cameras, TVs and smart plugs on the same network as your computers (trusted networks) |
+| `ids` | Alerts from Suricata, if it runs on this machine (`/var/log/suricata/eve.json` or `$YAKLITE_SURICATA_EVE`) |
+| `conns` | As `connwatch` above, when run by hand |
+
+`yaklite outside` also checks each domain's email protection (SPF, DMARC),
+when it expires, subdomains pointing at deleted cloud services (takeover
+risk), certificates issued in the last 14 days, look-alike domains that
+exist, and whether the website forces HTTPS.
+
+## Blocking through AdGuard Home or Pi-hole
+
+```sh
+yaklite block site evil.example     # AdGuard Home or Pi-hole v6
+yaklite block device 192.168.1.66   # AdGuard Home only: stops its name lookups
+yaklite unblock site evil.example
+```
+
+Set it up once in `~/.config/yaklite/blocker.yaml` (`type: adguard` or
+`pihole`, `url:`, and `user:` for AdGuard) with the admin password in
+`~/.config/yaklite/blocker-password` (`chmod 600`).
+
+## Asking Claude about your network
+
+`yaklite mcp` is a read-only Model Context Protocol server over stdin/stdout.
+It lets Claude Desktop or Claude Code read the summary, alerts, open
+problems, devices and current connections. It cannot scan, change settings
+or acknowledge anything.
+
+```sh
+claude mcp add yaklite -- ~/Library/Application\ Support/yaklite/yaklite mcp
+```
+
+## Menu bar, Docker and Raspberry Pi
+
+- `contrib/swiftbar/yaklite.1m.sh` is a menu bar shield for SwiftBar or xbar.
+  It reads the local dashboard and shows the worst open problem.
+- `contrib/docker/compose.yaml` runs `watch --checks` on a Linux box or
+  Raspberry Pi with host networking (edit the network first). The release
+  has `yaklite-linux-arm64` for a Pi without Docker.
+
+## What yaklite connects to
+
+Scans and checks go to your own network. Beyond that, these are the only
+outside services it talks to, and each can be turned off:
+
+| Service | Why | Off switch |
+| --- | --- | --- |
+| abuse.ch, Spamhaus, DShield, blocklist.de, CINS Army | Known-attacker lists, at most every 12 h | `--no-threat-lists` |
+| CISA (`cisa.gov`) | The actively-exploited flaws list, daily | `check --only` without `kev` |
+| api.ipify.org | Your public IP, when the router does not say | `check --no-public-lookup` |
+| Shodan InternetDB | What scanners recorded about your public IP | `check --no-public-lookup` |
+| Cloudflare DNS-over-HTTPS | Comparing DNS answers | `check --only` without `dns` |
+| rdap.org, crt.sh, certspotter | Domain expiry and new certificates (`outside` only) | `--no-rdap`, `--no-ct` |
+| Your alert destinations, and `<topic>-actions` on ntfy | Alerts and phone buttons | leave `--webhook` out |
+| GitHub | `yaklite update`, only when you run it | do not run it |
 
 ## systemd timer (Linux LAN box)
 
