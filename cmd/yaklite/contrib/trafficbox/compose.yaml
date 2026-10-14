@@ -1,0 +1,37 @@
+# The traffic box: Suricata watches the home network's traffic for known
+# attacks and malware, and yaklite turns its alerts into plain alerts.
+#
+#   1. Set INTERFACE below to the network port that sees the traffic
+#      (see README.md for how to get the traffic to it).
+#   2. docker compose -f cmd/yaklite/contrib/trafficbox/compose.yaml up -d --build
+#   3. Download the rules once, then weekly:
+#      docker compose -f cmd/yaklite/contrib/trafficbox/compose.yaml exec suricata suricata-update
+#      docker compose -f cmd/yaklite/contrib/trafficbox/compose.yaml restart suricata
+services:
+  suricata:
+    image: jasonish/suricata:7.0.8
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW, SYS_NICE]
+    restart: unless-stopped
+    environment:
+      - INTERFACE=eth0
+    command: ["-i", "eth0"]
+    volumes:
+      - suricata-logs:/var/log/suricata
+      - suricata-rules:/var/lib/suricata
+  yaklite-traffic:
+    build:
+      context: ../../../..
+      dockerfile: cmd/yaklite/contrib/docker/Dockerfile
+    restart: unless-stopped
+    depends_on: [suricata]
+    user: "0" # Suricata's log is only readable by root; the log volume is read-only here
+    volumes:
+      - yaklite-data:/data
+      - suricata-logs:/var/log/suricata:ro
+    # add --webhook https://ntfy.sh/your-topic to get phone alerts
+    command: ["traffic", "--eve", "/var/log/suricata/eve.json", "-q"]
+volumes:
+  suricata-logs:
+  suricata-rules:
+  yaklite-data:

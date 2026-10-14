@@ -1,8 +1,18 @@
 name: yaklite release
 
-# Builds yaklite for macOS (one universal binary for Apple Silicon and Intel)
-# and Linux, smoke-tests each build, and publishes them on the rolling
+# Builds yaklite for macOS (one universal binary for Apple Silicon and Intel),
+# Linux and Windows, smoke-tests each build, and publishes them on the rolling
 # "yaklite-latest" release so they can be downloaded with one command.
+#
+# The macOS build is signed with a Developer ID and notarized by Apple when
+# these repository secrets exist (Settings > Secrets and variables > Actions);
+# without them it is ad-hoc signed as before:
+#   APPLE_CERT_P12       the "Developer ID Application" certificate and key,
+#                        exported from Keychain Access as .p12, base64 encoded
+#   APPLE_CERT_PASSWORD  the password chosen when exporting the .p12
+#   APPLE_ID             the Apple ID email of the developer account
+#   APPLE_TEAM_ID        the 10 character team ID (developer.apple.com > Membership)
+#   APPLE_APP_PASSWORD   an app-specific password for that Apple ID (appleid.apple.com)
 on:
   push:
     branches: [main, "claude/**"]
@@ -30,6 +40,8 @@ jobs:
           - os: ubuntu-24.04-arm
             asset: yaklite-linux-arm64
     runs-on: ${{ matrix.os }}
+    env:
+      HAS_SIGNING: ${{ secrets.APPLE_CERT_P12 != '' && secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -50,6 +62,35 @@ jobs:
           lipo -create -output ${{ matrix.asset }} yaklite-arm64 yaklite-amd64
           codesign --force --sign - ${{ matrix.asset }}
           lipo -info ${{ matrix.asset }}
+
+      - name: Sign and notarize (macOS, when the Apple secrets are set)
+        if: runner.os == 'macOS' && env.HAS_SIGNING == 'true'
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PW="$(openssl rand -hex 16)"
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          ID="$(security find-identity -v -p codesigning "$KC" | grep 'Developer ID Application' | head -1 | awk '{print $2}')"
+          test -n "$ID" || { echo "no Developer ID Application certificate in APPLE_CERT_P12"; exit 1; }
+          codesign --force --options runtime --timestamp --sign "$ID" ${{ matrix.asset }}
+          codesign --verify --strict --verbose=2 ${{ matrix.asset }}
+          ditto -c -k --keepParent ${{ matrix.asset }} notarize.zip
+          xcrun notarytool submit notarize.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
+          rm -f notarize.zip
+          security delete-keychain "$KC"
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
@@ -75,8 +116,60 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
 
+  # Windows: cross-compiled with MinGW (the regex library needs cgo), then
+  # started on a real Windows machine.
+  build-windows:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install MinGW
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Vet and build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+          CC: x86_64-w64-mingw32-gcc
+        run: |
+          go vet ./cmd/yaklite
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o yaklite-windows.exe ./cmd/yaklite
+          sha256sum yaklite-windows.exe > yaklite-windows.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yaklite-windows.exe
+          path: |
+            yaklite-windows.exe
+            yaklite-windows.exe.sha256
+
+  smoke-windows:
+    needs: build-windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: yaklite-windows.exe
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          ./yaklite-windows.exe --help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # a listener in this shell: the connection completes from the backlog
+          $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 18080)
+          $l.Start()
+          $c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 18080); $c.Close()
+          ./yaklite-windows.exe scan -t 127.0.0.1 -p 18080 --no-arp --no-fp | Tee-Object scan.txt
+          $l.Stop()
+          if (-not (Select-String -Path scan.txt -Pattern 'tcp/18080' -Quiet)) { exit 1 }
+          ./yaklite-windows.exe check --only self
+          ./yaklite-windows.exe conns
+          exit 0
+
   release:
-    needs: build
+    needs: [build, smoke-windows]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4

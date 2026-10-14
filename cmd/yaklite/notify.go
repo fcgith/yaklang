@@ -49,6 +49,9 @@ func summaryText(changes []Change) (title, body string) {
 	var b strings.Builder
 	for _, c := range changes {
 		b.WriteString(c.String() + "\n")
+		if c.Fix != "" && sevRank[c.Severity] >= sevRank[sevMedium] {
+			b.WriteString("  What to do: " + c.Fix + "\n")
+		}
 	}
 	return title, b.String()
 }

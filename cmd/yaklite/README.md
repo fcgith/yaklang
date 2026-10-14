@@ -12,6 +12,9 @@ It answers these questions for a network you own:
   to known attackers?** `yaklite conns` / `yaklite connwatch`
 - **Is my router, Wi-Fi, DNS or this computer set up safely?** `yaklite check`
 - **What does the internet see of me?** `yaklite outside`
+- **Has anything changed inside this computer?** `yaklite check --only host`
+- **How safe am I overall, and what should I fix first?** `yaklite score`
+- **Are my passwords in a data leak?** `yaklite password-check`, `yaklite breaches`
 
 It detects and warns. It can block a device or site only through an AdGuard
 Home or Pi-hole you already run (`yaklite block`).
@@ -37,6 +40,16 @@ for your user (no admin password):
   (`--no-connwatch` to skip it),
 - a weekly summary on Monday at 9:00 (`--no-summary` to skip it), and
 - the dashboard on <http://127.0.0.1:9842/>.
+
+Optional extras, each one flag on `install`:
+
+| Flag | Adds |
+| --- | --- |
+| `--router-log` | Reads the router's own log (the router sends it to this computer): failed and successful admin logins, new port forwards, settings changes, floods of blocked connections. See [Router log](#router-log) |
+| `--tripwire` | Fake services (Telnet, file sharing, remote desktop, printer, ...) that nothing should ever touch; anything on your network that tries them raises an alert |
+| `--tailscale` | The dashboard on your phone, over your own [Tailscale](https://tailscale.com) network, with a password |
+| `--accept-reports` | Other computers in the house send their results to this dashboard |
+| `--report-to URL --report-token T` | This computer sends its results to another computer's dashboard |
 
 Problems show up as normal macOS notifications. Add
 `--webhook https://ntfy.sh/your-topic` to also get them on your phone, with
@@ -71,17 +84,19 @@ Good to know:
 
 - **No admin rights are needed.** Everything uses normal connections and the
   OS neighbour table. Only the optional `--syn` scan needs root.
-- **Unsigned binary.** Downloading with `curl` as above avoids the Gatekeeper
-  prompt. If you download it in a browser, macOS will block the first run.
-  Allow it under System Settings > Privacy & Security, or run
-  `xattr -d com.apple.quarantine yaklite`. Signing and notarizing needs an
-  Apple Developer ID, which this build does not have.
+- **Unsigned binary, for now.** Downloading with `curl` as above avoids the
+  Gatekeeper prompt. If you download it in a browser, macOS will block the
+  first run. Allow it under System Settings > Privacy & Security, or run
+  `xattr -d com.apple.quarantine yaklite`. The release workflow signs and
+  notarizes the Mac build as soon as an Apple Developer ID is added to the
+  repository's secrets (see the top of `.github/workflows/yaklite-release.yml`).
 - **Local Network permission (macOS 15 and later).** macOS may ask whether
   yaklite can find devices on your local network. Say yes; without it,
   trusted-network scans see nothing beyond the router.
 - On Linux, `install` creates systemd user units (`yaklite-auto.timer`,
   `yaklite-web.service`) that check every hour; notifications use
   `notify-send`.
+- On Windows, see [Windows](#windows).
 - yaklite detects and warns. Each alert says what changed and, where it
   can, how to fix it. Blocking needs AdGuard Home or Pi-hole (`yaklite block`).
 
@@ -458,7 +473,10 @@ up. `--only` picks some, `--list` shows them all.
 
 | Check | Looks for |
 | --- | --- |
-| `self` | This computer: firewall off, stealth mode, FileVault or disk encryption, SIP, Gatekeeper, automatic updates, guest account, SSH password logins, file or screen sharing listening on the network |
+| `self` | This computer: firewall off, stealth mode, FileVault or disk encryption, SIP, Gatekeeper, automatic updates, guest account, SSH password logins, file or screen sharing listening on the network (Windows: firewall, Defender, drive encryption, UAC, Remote Desktop) |
+| `host` | Changes inside this computer since the first check: new startup programs (launch agents, login items, system extensions, cron, systemd, Run keys), newly trusted root certificates, a proxy or DNS server set behind your back, new configuration profiles or device management, new user or admin accounts, and many failed logins from one address. The first check asks you to look over what is already there; `yaklite check --accept` records the current state as normal |
+| `routeradmin` | Whether the router's admin page can be reached from the internet, and whether it only offers it unencrypted (trusted networks) |
+| `router` | With the router's admin login (`yaklite router setup`): its device list, log and settings. See [Router login](#router-login) |
 | `upnp` | Ports the router forwards from the internet through UPnP, and whether UPnP is on at all (trusted networks) |
 | `exposure` | What internet scanners recorded about your public address: open ports and known flaws, from Shodan InternetDB (trusted networks) |
 | `dns` | Whether this network tampers with name lookups: fake answers for missing names, answers that differ from DNS-over-HTTPS, the DNS server changing on a network you trust |
@@ -469,12 +487,164 @@ up. `--only` picks some, `--list` shows them all.
 | `ipv6` | Devices with public IPv6 addresses and risky ports open on them (trusted networks) |
 | `iot` | Cameras, TVs and smart plugs on the same network as your computers (trusted networks) |
 | `ids` | Alerts from Suricata, if it runs on this machine (`/var/log/suricata/eve.json` or `$YAKLITE_SURICATA_EVE`) |
-| `conns` | As `connwatch` above, when run by hand |
+| `conns` | As `connwatch` above, when run by hand, plus programs talking to the internet that are unsigned or run from odd places (Downloads, temporary folders) |
 
 `yaklite outside` also checks each domain's email protection (SPF, DMARC),
 when it expires, subdomains pointing at deleted cloud services (takeover
 risk), certificates issued in the last 14 days, look-alike domains that
-exist, and whether the website forces HTTPS.
+exist, whether the website forces HTTPS, and whether the domain is listed in
+a data leak (see [Leaked passwords](#leaked-passwords)).
+
+Every alert carries a **What to do** line with plain steps for that problem.
+
+## Score, quiet hours and outages
+
+```sh
+yaklite score                    # a number out of 100, and the three things to fix first
+yaklite quiet 22:00-07:00        # only high alerts at night; the rest arrive in the morning
+yaklite quiet --group 10         # collect alerts for 10 minutes and send them as one message
+yaklite quiet off
+yaklite outages                  # when the internet was down
+```
+
+The score counts open problems (high costs 15 points, medium 6, low 2; any
+high problem keeps it below 70). Acknowledged problems do not count. The
+dashboard shows it with the top three and a button to mark each done.
+
+The connection watch also notices internet outages (no answer from three
+public DNS providers while still on Wi-Fi) and logs them; three in a day
+raise an alert, and the weekly summary counts them.
+
+## Router log
+
+Most routers can send their log to another computer ("remote log", "syslog
+server" or "remote logging" in the router's settings). Point it at the
+computer running yaklite, UDP port 5514, then:
+
+```sh
+yaklite install --router-log     # or by hand: yaklite routerlog --notify
+```
+
+It alerts on repeated failed admin logins, a successful admin login from the
+internet, new port forwards, settings changes, and floods of blocked
+connections or blocked connections from known attackers. It only listens on
+a network you trust, and only takes log lines from the router (`--from` adds
+others).
+
+## Router login
+
+For OpenWrt, MikroTik (RouterOS 7), Fritz!Box and UniFi, yaklite can log in
+to the router and read its device list, log and a few settings. It never
+changes anything on the router.
+
+```sh
+yaklite router setup --type fritzbox          # or openwrt, mikrotik, unifi --user NAME
+yaklite router test                           # what it can read
+yaklite router forget
+```
+
+The password is asked once and kept in `~/.config/yaklite/router-password`
+(owner-only). yaklite only uses it on the network where you set it up, and
+for HTTPS routers it remembers the router's certificate and refuses to talk
+if it changes. A separate read-only admin account is safer where the router
+offers one. This was written against each router's documented API but not
+yet tried on real hardware, so please report what `router test` says.
+
+| Router | Device list | Log | Settings checked |
+| --- | --- | --- | --- |
+| OpenWrt | DHCP leases | system log | WAN firewall accepting connections, UPnP |
+| MikroTik | DHCP leases | log | unencrypted admin services open to all, UPnP |
+| Fritz!Box | all known devices | event log | remote access from the internet |
+| UniFi | connected clients | events | open alarms (including IPS alerts) |
+
+New devices in the router's list raise a low alert (yaklite names it by its
+MAC); the log goes through the same analysis as the router log above.
+
+## Tripwire
+
+```sh
+yaklite install --tripwire       # or by hand: yaklite tripwire --notify
+```
+
+Opens a few ports that look like Telnet, file sharing, remote desktop and a
+printer on this computer, on networks you trust. Nothing legitimate uses
+them, so any device that tries is scanning your network: a hacked gadget, a
+guest's infected laptop, or someone on your Wi-Fi. The automatic scan of this
+computer leaves them out.
+
+## Hardening this computer
+
+```sh
+sudo yaklite firewall install    # block known attackers in the OS firewall, refreshed every 12 hours
+yaklite firewall status
+sudo yaklite firewall uninstall
+yaklite private-dns              # macOS: a profile for encrypted DNS (Quad9, Cloudflare or Mullvad)
+sudo yaklite private-dns --apply # Linux: the same through systemd-resolved
+```
+
+The firewall lists are the same known-attacker lists as `connwatch` (pf on
+macOS, nftables on Linux, Windows Firewall). Public DNS servers are never
+blocked. Encrypted DNS stops the café Wi-Fi from seeing or changing your
+name lookups; open the downloaded profile and install it in System Settings.
+
+## Your phone and the family's computers
+
+- **Phone:** with [Tailscale](https://tailscale.com) on the computer and the
+  phone, `yaklite install --tailscale` also serves the dashboard on the
+  computer's Tailscale address, with a password (printed once, kept in
+  `~/.config/yaklite/web-password`). Nothing is opened to the internet.
+- **Other computers:** on the computer that has the dashboard,
+  `yaklite install --accept-reports` prints a token. On each other computer,
+  `yaklite install --report-to http://192.168.1.10:9842 --report-token TOKEN`.
+  Their own check results (settings, startup programs, certificates,
+  connections) then show under "Other computers" on the dashboard. Each still
+  alerts on its own. Plain `http://` is only allowed to an address on your
+  home network or Tailscale.
+
+## Leaked passwords
+
+Through [Have I Been Pwned](https://haveibeenpwned.com):
+
+```sh
+yaklite password-check           # is this password in a known leak?
+yaklite breaches -d example.com  # is anything at your domain in a leak?
+```
+
+`password-check` asks for the password without showing it and sends only the
+first 5 characters of its SHA-1 hash, never the password; the answer covers
+hundreds of hashes, so the service cannot tell which one was yours.
+
+`outside -d` and `breaches` check, for free, whether the service on your
+domain was itself breached. With an HIBP API key (paid, from
+haveibeenpwned.com/API/Key) in `~/.config/yaklite/hibp-key` or
+`$HIBP_API_KEY`, they also list every address at your domain found in a leak
+(the domain must be verified in your HIBP account), and the personal
+addresses you list one per line in `~/.config/yaklite/watch-emails`. Leaks
+that include passwords are high alerts, with which password to change.
+
+## Windows
+
+The release has `yaklite-windows.exe`. It is new and has had less testing
+than the Mac and Linux builds.
+
+```powershell
+Invoke-WebRequest https://github.com/fcgith/yaklang/releases/download/yaklite-latest/yaklite-windows.exe -OutFile yaklite.exe
+.\yaklite.exe install
+```
+
+`install` copies it to `%LOCALAPPDATA%\yaklite\` and registers hidden
+Task Scheduler jobs for your user (no admin rights), shows problems as
+Windows notifications, and runs the Windows safety checks above. Windows
+Defender SmartScreen may warn on the first run because the build is
+unsigned; choose "More info", then "Run anyway".
+
+## Traffic box
+
+`contrib/trafficbox/` sets up a small always-on computer (a Raspberry Pi is
+enough) running Suricata, a free intrusion detection system, next to
+`yaklite traffic`, which turns Suricata's alerts into plain alerts with what
+to do. It needs to see the network's traffic, usually through a cheap switch
+with port mirroring; its README explains the options.
 
 ## Blocking through AdGuard Home or Pi-hole
 
@@ -520,6 +690,10 @@ outside services it talks to, and each can be turned off:
 | Shodan InternetDB | What scanners recorded about your public IP | `check --no-public-lookup` |
 | Cloudflare DNS-over-HTTPS | Comparing DNS answers | `check --only` without `dns` |
 | rdap.org, crt.sh, certspotter | Domain expiry and new certificates (`outside` only) | `--no-rdap`, `--no-ct` |
+| haveibeenpwned.com | Whether your domain (and, with a key, its addresses) is in a data leak (`outside`, `breaches`) | `--no-hibp` |
+| api.pwnedpasswords.com | The first 5 characters of a password's hash, only when you run `password-check` | do not run it |
+| Your router | Its device list, log and settings, only after `yaklite router setup` | `yaklite router forget` |
+| Your other computers' dashboard | This computer's check results, only with `--report-to` | `install` without it |
 | Your alert destinations, and `<topic>-actions` on ntfy | Alerts and phone buttons | leave `--webhook` out |
 | GitHub | `yaklite update`, only when you run it | do not run it |
 

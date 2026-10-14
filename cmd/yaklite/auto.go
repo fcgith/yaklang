@@ -140,6 +140,8 @@ func notifyDesktop(title, body string) {
 		if p, err := exec.LookPath("notify-send"); err == nil {
 			exec.Command(p, "--app-name=yaklite", title, body).Run()
 		}
+	case "windows":
+		notifyWindows(title, body)
 	}
 }
 
@@ -258,7 +260,13 @@ func cmdAuto(ctx context.Context, args []string) error {
 			opt.Concurrency, opt.UDP = 60, false
 			prog("on battery: scanning gently")
 		}
-		scan = func(ctx context.Context) (*Snapshot, error) { return Scan(ctx, opt) }
+		scan = func(ctx context.Context) (*Snapshot, error) {
+			snap, err := Scan(ctx, opt)
+			if err == nil {
+				dropTripwirePorts(snap, o.stateDir)
+			}
+			return snap, err
+		}
 	} else {
 		name = n.ID() + "-self"
 		scan = func(ctx context.Context) (*Snapshot, error) { return guardScan(ctx, n, prog) }
@@ -272,6 +280,11 @@ func cmdAuto(ctx context.Context, args []string) error {
 			}
 			prog("running checks")
 			runChecks(ctx, &checkEnv{net: n, trusted: known.Trusted, snap: snap, stateDir: o.stateDir, prog: prog, opts: o.checks, inAuto: true, inv: ac.inv}, nil)
+			if t := loadReportTarget(); t != nil {
+				if err := sendReport(ctx, t.To, t.Token, snap); err != nil {
+					prog("could not report to %s: %v", t.To, err)
+				}
+			}
 			return snap, nil
 		}
 	}

@@ -22,9 +22,16 @@ const (
 	webLabel     = "io.github.yaklite.web"
 	connLabel    = "io.github.yaklite.conn"
 	summaryLabel = "io.github.yaklite.summary"
+	routerLabel  = "io.github.yaklite.routerlog"
+	tripLabel    = "io.github.yaklite.tripwire"
 )
 
-var allLabels = []string{agentLabel, webLabel, connLabel, summaryLabel}
+var allLabels = []string{agentLabel, webLabel, connLabel, summaryLabel, routerLabel, tripLabel}
+
+// jobArgs are the command lines of the background jobs.
+type jobArgs struct {
+	auto, conn, summary, web, router, trip []string
+}
 
 func homeDir() string {
 	h, _ := os.UserHomeDir()
@@ -32,6 +39,11 @@ func homeDir() string {
 }
 
 func installedBinPath() string {
+	if runtime.GOOS == "windows" {
+		if d := os.Getenv("LOCALAPPDATA"); d != "" {
+			return filepath.Join(d, "yaklite", "yaklite.exe")
+		}
+	}
 	if runtime.GOOS == "darwin" {
 		return filepath.Join(homeDir(), "Library", "Application Support", "yaklite", "yaklite")
 	}
@@ -40,6 +52,8 @@ func installedBinPath() string {
 
 func agentFiles() []string {
 	switch runtime.GOOS {
+	case "windows":
+		return []string{windowsMarker()}
 	case "darwin":
 		dir := filepath.Join(homeDir(), "Library", "LaunchAgents")
 		var out []string
@@ -124,7 +138,7 @@ func systemdQuote(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "%", "%%").Replace(s) + `"`
 }
 
-var systemdUnitNames = []string{"yaklite-auto.service", "yaklite-auto.timer", "yaklite-web.service", "yaklite-conn.service", "yaklite-summary.service", "yaklite-summary.timer"}
+var systemdUnitNames = []string{"yaklite-auto.service", "yaklite-auto.timer", "yaklite-web.service", "yaklite-conn.service", "yaklite-summary.service", "yaklite-summary.timer", "yaklite-routerlog.service", "yaklite-tripwire.service"}
 
 func systemdCmd(bin string, args []string) string {
 	cmd := systemdQuote(bin)
@@ -134,27 +148,37 @@ func systemdCmd(bin string, args []string) string {
 	return cmd
 }
 
-func systemdUnits(bin string, autoArgs, connArgs, summaryArgs []string, interval time.Duration) map[string]string {
-	cmd := systemdCmd(bin, autoArgs)
-	return map[string]string{
-		"yaklite-conn.service": `[Unit]
-Description=yaklite connection watch
+func systemdDaemon(desc, cmd string) string {
+	return `[Unit]
+Description=` + desc + `
 
 [Service]
-ExecStart=` + systemdCmd(bin, connArgs) + `
+ExecStart=` + cmd + `
 Restart=always
 RestartSec=30
 Nice=10
 
 [Install]
 WantedBy=default.target
-`,
+`
+}
+
+func systemdUnits(bin string, j jobArgs, interval time.Duration) map[string]string {
+	cmd := systemdCmd(bin, j.auto)
+	web := j.web
+	if len(web) == 0 {
+		web = []string{"serve"}
+	}
+	return map[string]string{
+		"yaklite-conn.service":      systemdDaemon("yaklite connection watch", systemdCmd(bin, j.conn)),
+		"yaklite-routerlog.service": systemdDaemon("yaklite router log reader", systemdCmd(bin, j.router)),
+		"yaklite-tripwire.service":  systemdDaemon("yaklite tripwire", systemdCmd(bin, j.trip)),
 		"yaklite-summary.service": `[Unit]
 Description=yaklite weekly summary
 
 [Service]
 Type=oneshot
-ExecStart=` + systemdCmd(bin, summaryArgs) + `
+ExecStart=` + systemdCmd(bin, j.summary) + `
 `,
 		"yaklite-summary.timer": `[Unit]
 Description=yaklite weekly summary timer
@@ -187,10 +211,10 @@ RandomizedDelaySec=2min
 WantedBy=timers.target
 `,
 		"yaklite-web.service": `[Unit]
-Description=yaklite dashboard (localhost only)
+Description=yaklite dashboard
 
 [Service]
-ExecStart=` + systemdQuote(bin) + ` serve
+ExecStart=` + systemdCmd(bin, web) + `
 Restart=on-failure
 
 [Install]
@@ -239,12 +263,26 @@ func cmdInstall(ctx context.Context, args []string) error {
 	noConn := fs.Bool("no-connwatch", false, "do not watch this computer's connections (from the internet, with known attackers, to new countries)")
 	noSummary := fs.Bool("no-summary", false, "do not send a weekly summary on Monday mornings")
 	yes := fs.Bool("y", false, "do not ask questions (the current network stays untrusted)")
+	routerLog := fs.Bool("router-log", false, "also read the router's log (set the router's remote log / syslog to this computer, UDP port 5514)")
+	tripwire := fs.Bool("tripwire", false, "also run a tripwire: fake services that alert when anything on your network tries them")
+	tailscale := fs.Bool("tailscale", false, "also show the dashboard on your Tailscale network, so you can open it on your phone (password protected)")
+	acceptReports := fs.Bool("accept-reports", false, "let other computers in the house send their results to this dashboard")
+	reportTo := fs.String("report-to", "", "send this computer's results to another computer's dashboard, e.g. http://192.168.1.10:9842")
+	reportTok := fs.String("report-token", "", "the token that dashboard printed (with --report-to)")
 	fs.Parse(args)
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		return errors.New("install supports macOS and Linux; on other systems run `yaklite auto` from a scheduled task")
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		return errors.New("install supports macOS, Linux and Windows; elsewhere run `yaklite auto` from a scheduled job")
 	}
 	if err := validateWebhooks(*webhook); err != nil {
 		return err
+	}
+	if *reportTo != "" {
+		if *reportTok == "" {
+			return errors.New("--report-to needs --report-token (printed by yaklite install --accept-reports on the other computer)")
+		}
+		if err := saveReportTarget(*reportTo, *reportTok); err != nil {
+			return err
+		}
 	}
 
 	self, err := os.Executable()
@@ -280,27 +318,51 @@ func cmdInstall(ctx context.Context, args []string) error {
 		}
 	}
 
-	autoArgs := []string{"auto", "-q"}
-	connArgs := []string{"connwatch", "-q", "--notify"}
-	summaryArgs := []string{"summary", "--send"}
+	j := jobArgs{
+		auto:    []string{"auto", "-q"},
+		conn:    []string{"connwatch", "-q", "--notify"},
+		summary: []string{"summary", "--send"},
+		web:     []string{"serve"},
+		router:  []string{"routerlog", "-q", "--notify"},
+		trip:    []string{"tripwire", "-q", "--notify"},
+	}
 	if *webhook != "" {
-		autoArgs = append(autoArgs, "--webhook", *webhook)
-		connArgs = append(connArgs, "--webhook", *webhook)
-		summaryArgs = append(summaryArgs, "--webhook", *webhook)
+		j.auto = append(j.auto, "--webhook", *webhook)
+		j.conn = append(j.conn, "--webhook", *webhook)
+		j.summary = append(j.summary, "--webhook", *webhook)
+		j.router = append(j.router, "--webhook", *webhook)
+		j.trip = append(j.trip, "--webhook", *webhook)
+	}
+	webPass := ""
+	if *tailscale {
+		j.web = append(j.web, "--tailscale")
+		p, _, err := ensureWebPassword()
+		if err != nil {
+			return err
+		}
+		webPass = p
+	}
+	if *acceptReports {
+		j.web = append(j.web, "--accept-reports")
+	}
+	if (*tailscale || *acceptReports) && *noDash {
+		return errors.New("--tailscale and --accept-reports need the dashboard; drop --no-dashboard")
 	}
 	logDir := filepath.Join(defaultStateDir())
 	os.MkdirAll(logDir, 0o700)
-	want := map[string]bool{agentLabel: true, webLabel: !*noDash, connLabel: !*noConn, summaryLabel: !*noSummary}
+	want := map[string]bool{agentLabel: true, webLabel: !*noDash, connLabel: !*noConn, summaryLabel: !*noSummary, routerLabel: *routerLog, tripLabel: *tripwire}
 
 	switch runtime.GOOS {
 	case "darwin":
 		uid := strconv.Itoa(os.Getuid())
 		dir := filepath.Join(homeDir(), "Library", "LaunchAgents")
 		contents := map[string]string{
-			agentLabel:   launchdPlist(agentLabel, append([]string{bin}, autoArgs...), *every, false, filepath.Join(logDir, "auto.log")),
-			webLabel:     launchdPlist(webLabel, []string{bin, "serve"}, 0, true, filepath.Join(logDir, "web.log")),
-			connLabel:    launchdPlist(connLabel, append([]string{bin}, connArgs...), 0, true, filepath.Join(logDir, "conn.log")),
-			summaryLabel: launchdPlistAt(summaryLabel, append([]string{bin}, summaryArgs...), 0, false, 1, filepath.Join(logDir, "summary.log")),
+			agentLabel:   launchdPlist(agentLabel, append([]string{bin}, j.auto...), *every, false, filepath.Join(logDir, "auto.log")),
+			webLabel:     launchdPlist(webLabel, append([]string{bin}, j.web...), 0, true, filepath.Join(logDir, "web.log")),
+			connLabel:    launchdPlist(connLabel, append([]string{bin}, j.conn...), 0, true, filepath.Join(logDir, "conn.log")),
+			summaryLabel: launchdPlistAt(summaryLabel, append([]string{bin}, j.summary...), 0, false, 1, filepath.Join(logDir, "summary.log")),
+			routerLabel:  launchdPlist(routerLabel, append([]string{bin}, j.router...), 0, true, filepath.Join(logDir, "routerlog.log")),
+			tripLabel:    launchdPlist(tripLabel, append([]string{bin}, j.trip...), 0, true, filepath.Join(logDir, "tripwire.log")),
 		}
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -324,8 +386,9 @@ func cmdInstall(ctx context.Context, args []string) error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
-		units := systemdUnits(bin, autoArgs, connArgs, summaryArgs, *every)
-		skip := map[string]bool{"yaklite-web.service": *noDash, "yaklite-conn.service": *noConn, "yaklite-summary.service": *noSummary, "yaklite-summary.timer": *noSummary}
+		units := systemdUnits(bin, j, *every)
+		skip := map[string]bool{"yaklite-web.service": *noDash, "yaklite-conn.service": *noConn, "yaklite-summary.service": *noSummary, "yaklite-summary.timer": *noSummary,
+			"yaklite-routerlog.service": !*routerLog, "yaklite-tripwire.service": !*tripwire}
 		for name, content := range units {
 			if skip[name] {
 				os.Remove(filepath.Join(dir, name))
@@ -339,15 +402,21 @@ func cmdInstall(ctx context.Context, args []string) error {
 			return err
 		}
 		enable := []string{"--user", "enable", "--now", "yaklite-auto.timer"}
-		for _, u := range []string{"yaklite-web.service", "yaklite-conn.service", "yaklite-summary.timer"} {
+		for _, u := range []string{"yaklite-web.service", "yaklite-conn.service", "yaklite-summary.timer", "yaklite-routerlog.service", "yaklite-tripwire.service"} {
 			if !skip[u] {
 				enable = append(enable, u)
+			} else {
+				exec.Command("systemctl", "--user", "disable", "--now", u).Run()
 			}
 		}
 		if err := run("systemctl", enable...); err != nil {
 			return err
 		}
 		exec.Command("systemctl", "--user", "start", "yaklite-auto.service").Start()
+	case "windows":
+		if err := installWindows(bin, j, want, *every); err != nil {
+			return err
+		}
 	}
 
 	fmt.Println("\nBackground checks are on. yaklite checks every", every.String(), "and when you join a network (macOS),")
@@ -360,6 +429,24 @@ func cmdInstall(ctx context.Context, args []string) error {
 	}
 	if !*noDash {
 		fmt.Println("Dashboard: http://127.0.0.1:9842/")
+	}
+	if *tailscale {
+		host := tailscaleAddr()
+		if host == "" {
+			host = "THIS-COMPUTER"
+		}
+		fmt.Println("On your phone (with Tailscale on): http://" + host + ":9842/  (any user name, password: " + webPass + ")")
+	}
+	if *acceptReports {
+		if tok, err := reportToken(); err == nil {
+			fmt.Println("Other computers can report here with: yaklite install --report-to http://THIS-COMPUTER-IP:9842 --report-token", tok)
+		}
+	}
+	if *routerLog {
+		fmt.Println("Router log: in the router's settings, send its log (remote log / syslog) to this computer, UDP port 5514.")
+	}
+	if *tripwire {
+		fmt.Println("Tripwire is on: anything on your network that tries its fake services raises an alert.")
 	}
 	fmt.Println("\nUseful next steps:")
 	fmt.Println("  yaklite status                       what network you are on and when it was last checked")
@@ -380,7 +467,9 @@ func cmdUninstall(args []string) error {
 			exec.Command("launchctl", "bootout", "gui/"+uid+"/"+l).Run()
 		}
 	case "linux":
-		exec.Command("systemctl", "--user", "disable", "--now", "yaklite-auto.timer", "yaklite-web.service", "yaklite-conn.service", "yaklite-summary.timer").Run()
+		exec.Command("systemctl", "--user", "disable", "--now", "yaklite-auto.timer", "yaklite-web.service", "yaklite-conn.service", "yaklite-summary.timer", "yaklite-routerlog.service", "yaklite-tripwire.service").Run()
+	case "windows":
+		uninstallWindows()
 	}
 	for _, f := range agentFiles() {
 		os.Remove(f)

@@ -98,6 +98,16 @@ func mcpTools(stateDir string) []mcpTool {
 				}
 				return orNone(b.String()), nil
 			}},
+		{Name: "security_score", Description: "A score out of 100 for how safe the network and this computer look right now, and the three problems to fix first.",
+			InputSchema: obj(map[string]any{}),
+			run: func(ctx context.Context, a map[string]any) (string, error) {
+				r := &stateReader{dir: stateDir, invFromConfig: true}
+				states, err := r.load()
+				if err != nil {
+					return "", err
+				}
+				return computeScore(states, r.inv, loadAcks(), time.Now()).String(), nil
+			}},
 		{Name: "list_devices", Description: "Devices seen on each watched network, with first and last time seen, IP, MAC, maker and open ports.",
 			InputSchema: obj(map[string]any{}),
 			run: func(ctx context.Context, a map[string]any) (string, error) {

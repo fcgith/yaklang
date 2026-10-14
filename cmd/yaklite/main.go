@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,6 +31,8 @@ const usage = `yaklite: home network monitoring and alerts (built from yaklang)
 
 Set and forget (laptops and desktops):
   yaklite install [--webhook URL]   check in the background, notify on problems
+          [--router-log] [--tripwire] [--tailscale] [--accept-reports]
+          [--report-to URL --report-token T]
   yaklite status                  current network, trust, last check
   yaklite trust [--name Home]     monitor every device on the current network
   yaklite untrust                 only check this computer on the current network
@@ -43,12 +46,29 @@ What it found:
   yaklite summary                 the weekly summary, now
   yaklite history                 when each device was first and last seen
   yaklite serve                   dashboard on http://127.0.0.1:9842 + Prometheus metrics
+  yaklite score                   a safety score out of 100 and what to fix first
+  yaklite quiet [22:00-07:00|off] [--group 10]   quiet hours and grouped alerts
+  yaklite outages                 when the internet was down
 
 Checks:
   yaklite check [--only upnp,dns] [--list]   router, DNS, Wi-Fi, this computer's settings, ...
   yaklite conns                   this computer's internet connections, with owner and country
   yaklite connwatch               alert on connections from the internet or with known attackers
   yaklite outside -d example.com [--ip 203.0.113.7]   your domains and public IP, seen from outside
+  yaklite check --accept          record this computer's startup programs, certificates, ... as normal
+
+More watches:
+  yaklite routerlog               read the log your router sends here (UDP 5514)
+  yaklite router setup|test|forget   log in to the router to read its devices, log, settings
+  yaklite tripwire                fake services that catch anything scanning your network
+  yaklite traffic --eve FILE      alerts from Suricata on a traffic box (contrib/trafficbox)
+
+Hardening and leaks:
+  yaklite firewall install|status|uninstall   block known attackers in the OS firewall (admin)
+  yaklite private-dns [--provider quad9]      encrypted DNS for this computer
+  yaklite password-check          is a password in a known data leak (only a hash prefix is sent)
+  yaklite breaches -d example.com is your domain or its addresses in a data leak
+  yaklite report --to URL --token T   send this computer's results to another dashboard
 
 By hand:
   yaklite scan  -t TARGETS [-p PORTS] [--udp] [-o snapshot.json]
@@ -122,6 +142,30 @@ func main() {
 		fmt.Println("yaklite", version)
 	case "check":
 		err = cmdCheck(ctx, os.Args[2:])
+	case "routerlog":
+		err = cmdRouterLog(ctx, os.Args[2:])
+	case "tripwire":
+		err = cmdTripwire(ctx, os.Args[2:])
+	case "firewall":
+		err = cmdFirewall(ctx, os.Args[2:])
+	case "private-dns":
+		err = cmdPrivateDNS(os.Args[2:])
+	case "score":
+		err = cmdScore(os.Args[2:])
+	case "outages":
+		err = cmdOutages(os.Args[2:])
+	case "router":
+		err = cmdRouter(ctx, os.Args[2:])
+	case "password-check":
+		err = cmdPasswordCheck(ctx, os.Args[2:])
+	case "breaches":
+		err = cmdBreaches(ctx, os.Args[2:])
+	case "traffic":
+		err = cmdTraffic(ctx, os.Args[2:])
+	case "quiet":
+		err = cmdQuiet(os.Args[2:])
+	case "report":
+		err = cmdReport(ctx, os.Args[2:])
 	case "ack":
 		err = cmdAck(os.Args[2:])
 	case "alerts":
@@ -330,6 +374,7 @@ func cmdOutside(ctx context.Context, args []string) error {
 	noDomainChecks := fs.Bool("no-domain-checks", false, "skip the email spoofing, expiry, hijackable subdomain, new certificate and look-alike checks")
 	lookalikes := fs.Bool("lookalikes", true, "look for typo and look-alike versions of your domains (a few hundred DNS lookups)")
 	noRDAP := fs.Bool("no-rdap", false, "skip the registration expiry lookup (rdap.org receives the domain name)")
+	noHIBP := fs.Bool("no-hibp", false, "skip the data leak lookup (haveibeenpwned.com receives the domain name)")
 	var opt ScanOptions
 	fs.StringVar(&opt.Ports, "p", "top", `ports to scan on public IPs: "top", "all" or a list`)
 	fs.IntVar(&opt.Concurrency, "c", 100, "concurrent connection attempts")
@@ -358,7 +403,7 @@ func cmdOutside(ctx context.Context, args []string) error {
 	oo := OutsideOptions{
 		Domains: ds, IPs: *ips, ScanNames: *scanNames, Brute: *brute, NoCT: *noCT,
 		DNSServers: servers, Scan: opt, MaxNames: *maxNames, ProgressFor: progress(*quiet),
-		NoDomainChecks: *noDomainChecks, Lookalikes: *lookalikes, NoRDAP: *noRDAP,
+		NoDomainChecks: *noDomainChecks, Lookalikes: *lookalikes, NoRDAP: *noRDAP, NoHIBP: *noHIBP,
 	}
 	scan := func(ctx context.Context) (*Snapshot, error) { return ScanOutside(ctx, oo) }
 	if *scanOnly {
@@ -451,6 +496,7 @@ type scanFunc func(ctx context.Context) (*Snapshot, error)
 
 func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any), ac *alertConfig, snapPath, logPath string, asJSON bool) error {
 	lastChangeCount = 0
+	flushHeld(ctx, filepath.Dir(snapPath))
 	prev, err := LoadSnapshot(snapPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -510,12 +556,7 @@ func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any)
 		fmt.Fprintln(os.Stdout, "\nFindings in the baseline:")
 	}
 	emit(os.Stdout, changes, asJSON)
-	if ac.desktop != "" {
-		notifyChanges(ac.desktop, changes)
-	}
-	for _, err := range sendAlerts(ctx, ac.webhook, ac.webhookFormat, changes) {
-		fmt.Fprintln(os.Stderr, "[yaklite] alert delivery failed:", err)
-	}
+	deliver(ctx, ac, filepath.Dir(snapPath), changes)
 	return nil
 }
 
@@ -534,8 +575,18 @@ func cmdServe(ctx context.Context, args []string) error {
 	stateDir := fs.String("state", defaultStateDir(), "state directory written by yaklite watch")
 	listen := fs.String("listen", "127.0.0.1:9842", "address to listen on; anything but loopback needs YAKLITE_WEB_PASSWORD")
 	inventory := fs.String("inventory", "", "inventory YAML, to show device names")
+	tailscale := fs.Bool("tailscale", false, "also serve on this computer's Tailscale address, to open the dashboard from your phone (a password is created if none is set)")
+	accept := fs.Bool("accept-reports", false, "let other computers send their results here (yaklite report / install --report-to); prints the token they need")
 	fs.Parse(args)
 	r := &stateReader{dir: *stateDir}
+	if *accept {
+		tok, err := reportToken()
+		if err != nil {
+			return err
+		}
+		r.reportToken = tok
+		fmt.Fprintf(os.Stderr, "[yaklite] other computers can report here with: yaklite install --report-to http://THIS-COMPUTER:%s --report-token %s\n", portOf(*listen), tok)
+	}
 	if *inventory != "" {
 		inv, err := LoadInventory(*inventory)
 		if err != nil {
@@ -549,8 +600,36 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer srv.Close()
+	if *tailscale {
+		pw, created, err := ensureWebPassword()
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Fprintf(os.Stderr, "[yaklite] dashboard password (saved in %s): %s\n", webPasswordPath(), pw)
+		}
+		go func() {
+			// Tailscale may come up after login: keep looking
+			for ctx.Err() == nil {
+				if ts := tailscaleAddr(); ts != "" {
+					tsrv, err := startWeb(net.JoinHostPort(ts, portOf(*listen)), r)
+					if err == nil {
+						<-ctx.Done()
+						tsrv.Close()
+						return
+					}
+					fmt.Fprintln(os.Stderr, "[yaklite] tailscale:", err)
+				}
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Minute):
+				}
+			}
+		}()
+	}
 	<-ctx.Done()
-	return srv.Close()
+	return nil
 }
 
 type alertFlagValues struct {
@@ -589,6 +668,13 @@ func (f *alertFlagValues) load() (*alertConfig, error) {
 		}
 	}
 	return ac, nil
+}
+
+func portOf(addr string) string {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		return p
+	}
+	return "9842"
 }
 
 func contains(list []string, s string) bool {

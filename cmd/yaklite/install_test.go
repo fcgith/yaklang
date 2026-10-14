@@ -37,7 +37,7 @@ func TestLaunchdPlistIsWellFormed(t *testing.T) {
 }
 
 func TestSystemdUnits(t *testing.T) {
-	u := systemdUnits("/home/a b/.local/bin/yaklite", []string{"auto", "-q", "--webhook", "https://ntfy.sh/100%"}, []string{"connwatch"}, []string{"summary", "--send"}, 30*time.Minute)
+	u := systemdUnits("/home/a b/.local/bin/yaklite", jobArgs{auto: []string{"auto", "-q", "--webhook", "https://ntfy.sh/100%"}, conn: []string{"connwatch"}, summary: []string{"summary", "--send"}, router: []string{"routerlog"}, trip: []string{"tripwire"}}, 30*time.Minute)
 	for _, n := range systemdUnitNames {
 		if u[n] == "" {
 			t.Errorf("unit %s missing", n)

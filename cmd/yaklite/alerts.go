@@ -315,6 +315,9 @@ func Annotate(changes []Change, inv *Inventory) []Change {
 		default:
 			c.Severity = sevLow
 		}
+		if c.Fix == "" && sevRank[c.Severity] >= sevRank[sevLow] {
+			c.Fix = fixFor(c)
+		}
 		out = append(out, c)
 	}
 	return out

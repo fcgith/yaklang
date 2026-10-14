@@ -38,6 +38,8 @@ func releaseAssetName() (string, error) {
 		return "yaklite-linux-amd64", nil
 	case "linux/arm64":
 		return "yaklite-linux-arm64", nil
+	case "windows/amd64":
+		return "yaklite-windows.exe", nil
 	}
 	return "", fmt.Errorf("no published build for %s/%s", runtime.GOOS, runtime.GOARCH)
 }
@@ -165,6 +167,9 @@ func cmdUpdate(ctx context.Context, args []string) error {
 		}
 	}
 	tmp := filepath.Join(filepath.Dir(target), ".yaklite-update")
+	if runtime.GOOS == "windows" {
+		tmp += ".exe"
+	}
 	if err := os.WriteFile(tmp, bin, 0o700); err != nil {
 		return err
 	}
@@ -174,6 +179,14 @@ func cmdUpdate(ctx context.Context, args []string) error {
 	if out, err := exec.CommandContext(ctx, tmp, "version").Output(); err != nil || !strings.HasPrefix(string(out), "yaklite") {
 		os.Remove(tmp)
 		return errors.New("the new build did not start; keeping the current one")
+	}
+	if runtime.GOOS == "windows" {
+		// a running program cannot be replaced on Windows, but it can be renamed
+		os.Remove(target + ".old")
+		if err := os.Rename(target, target+".old"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			os.Remove(tmp)
+			return err
+		}
 	}
 	if err := os.Rename(tmp, target); err != nil {
 		os.Remove(tmp)
@@ -189,10 +202,13 @@ func restartAgents() {
 	switch runtime.GOOS {
 	case "darwin":
 		uid := strconv.Itoa(os.Getuid())
-		for _, l := range []string{webLabel, connLabel} {
+		for _, l := range []string{webLabel, connLabel, routerLabel, tripLabel} {
 			exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+l).Run()
 		}
 	case "linux":
-		exec.Command("systemctl", "--user", "try-restart", "yaklite-web.service", "yaklite-conn.service").Run()
+		exec.Command("systemctl", "--user", "try-restart", "yaklite-web.service", "yaklite-conn.service", "yaklite-routerlog.service", "yaklite-tripwire.service").Run()
+	case "windows":
+		exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+			`Get-ScheduledTask -TaskPath '\yaklite\' -ErrorAction SilentlyContinue | Where-Object State -eq 'Running' | ForEach-Object { Stop-ScheduledTask -InputObject $_; Start-ScheduledTask -InputObject $_ }`).Run()
 	}
 }
