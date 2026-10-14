@@ -41,6 +41,7 @@ type OutsideOptions struct {
 	NoDomainChecks bool
 	Lookalikes     bool
 	NoRDAP         bool
+	NoHIBP         bool
 }
 
 // NameInfo is one DNS name under a watched domain.
@@ -374,7 +375,7 @@ func ScanOutside(ctx context.Context, opt OutsideOptions) (*Snapshot, error) {
 	wg.Wait()
 	progress("%d names resolve", len(snap.Names))
 	if !opt.NoDomainChecks && len(opt.Domains) > 0 {
-		domainChecks(ctx, snap, opt.Domains, all, certs, domainCheckOptions{resolver: resolver, lookalikes: opt.Lookalikes, noRDAP: opt.NoRDAP}, progress)
+		domainChecks(ctx, snap, opt.Domains, all, certs, domainCheckOptions{resolver: resolver, lookalikes: opt.Lookalikes, noRDAP: opt.NoRDAP, noHIBP: opt.NoHIBP}, progress)
 	}
 
 	// Port scan: IPs the user listed, plus resolved IPs when asked. Resolved

@@ -135,6 +135,14 @@ func main() {
 		err = cmdScore(os.Args[2:])
 	case "outages":
 		err = cmdOutages(os.Args[2:])
+	case "router":
+		err = cmdRouter(ctx, os.Args[2:])
+	case "password-check":
+		err = cmdPasswordCheck(ctx, os.Args[2:])
+	case "breaches":
+		err = cmdBreaches(ctx, os.Args[2:])
+	case "quiet":
+		err = cmdQuiet(os.Args[2:])
 	case "report":
 		err = cmdReport(ctx, os.Args[2:])
 	case "ack":
@@ -345,6 +353,7 @@ func cmdOutside(ctx context.Context, args []string) error {
 	noDomainChecks := fs.Bool("no-domain-checks", false, "skip the email spoofing, expiry, hijackable subdomain, new certificate and look-alike checks")
 	lookalikes := fs.Bool("lookalikes", true, "look for typo and look-alike versions of your domains (a few hundred DNS lookups)")
 	noRDAP := fs.Bool("no-rdap", false, "skip the registration expiry lookup (rdap.org receives the domain name)")
+	noHIBP := fs.Bool("no-hibp", false, "skip the data leak lookup (haveibeenpwned.com receives the domain name)")
 	var opt ScanOptions
 	fs.StringVar(&opt.Ports, "p", "top", `ports to scan on public IPs: "top", "all" or a list`)
 	fs.IntVar(&opt.Concurrency, "c", 100, "concurrent connection attempts")
@@ -373,7 +382,7 @@ func cmdOutside(ctx context.Context, args []string) error {
 	oo := OutsideOptions{
 		Domains: ds, IPs: *ips, ScanNames: *scanNames, Brute: *brute, NoCT: *noCT,
 		DNSServers: servers, Scan: opt, MaxNames: *maxNames, ProgressFor: progress(*quiet),
-		NoDomainChecks: *noDomainChecks, Lookalikes: *lookalikes, NoRDAP: *noRDAP,
+		NoDomainChecks: *noDomainChecks, Lookalikes: *lookalikes, NoRDAP: *noRDAP, NoHIBP: *noHIBP,
 	}
 	scan := func(ctx context.Context) (*Snapshot, error) { return ScanOutside(ctx, oo) }
 	if *scanOnly {
@@ -466,6 +475,7 @@ type scanFunc func(ctx context.Context) (*Snapshot, error)
 
 func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any), ac *alertConfig, snapPath, logPath string, asJSON bool) error {
 	lastChangeCount = 0
+	flushHeld(ctx, filepath.Dir(snapPath))
 	prev, err := LoadSnapshot(snapPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -525,12 +535,7 @@ func watchOnce(ctx context.Context, scan scanFunc, progress func(string, ...any)
 		fmt.Fprintln(os.Stdout, "\nFindings in the baseline:")
 	}
 	emit(os.Stdout, changes, asJSON)
-	if ac.desktop != "" {
-		notifyChanges(ac.desktop, changes)
-	}
-	for _, err := range sendAlerts(ctx, ac.webhook, ac.webhookFormat, changes) {
-		fmt.Fprintln(os.Stderr, "[yaklite] alert delivery failed:", err)
-	}
+	deliver(ctx, ac, filepath.Dir(snapPath), changes)
 	return nil
 }
 

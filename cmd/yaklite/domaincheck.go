@@ -25,11 +25,13 @@ import (
 //     longer use, which anyone can claim and serve pages from
 //   - new certificates: someone getting an HTTPS certificate for your names
 //   - look-alike domains: typo versions of your domain that exist
+//   - data leaks: through Have I Been Pwned (breaches.go)
 
 type domainCheckOptions struct {
 	resolver   *net.Resolver
 	lookalikes bool
 	noRDAP     bool
+	noHIBP     bool
 }
 
 func domainChecks(ctx context.Context, snap *Snapshot, domains, candidates []string, certs []ctCert, o domainCheckOptions, progress func(string, ...any)) {
@@ -78,6 +80,17 @@ func domainChecks(ctx context.Context, snap *Snapshot, domains, candidates []str
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); add(takeoverFindings(ctx, o.resolver, candidates)...) }()
+	if !o.noHIBP && len(domains) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fs, errs := breachFindings(ctx, domains)
+			mu.Lock()
+			snap.SourceErrors = append(snap.SourceErrors, errs...)
+			mu.Unlock()
+			add(fs...)
+		}()
+	}
 	wg.Wait()
 	add(newCertFindings(certs, time.Now())...)
 	add(websiteFindings(snap.Names)...)
