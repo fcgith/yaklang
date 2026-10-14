@@ -126,6 +126,10 @@ func main() {
 		err = cmdRouterLog(ctx, os.Args[2:])
 	case "tripwire":
 		err = cmdTripwire(ctx, os.Args[2:])
+	case "firewall":
+		err = cmdFirewall(ctx, os.Args[2:])
+	case "private-dns":
+		err = cmdPrivateDNS(os.Args[2:])
 	case "ack":
 		err = cmdAck(os.Args[2:])
 	case "alerts":

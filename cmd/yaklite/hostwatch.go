@@ -331,6 +331,9 @@ func macNetItems(ctx context.Context, h *hostOS) []hostItem {
 		out = append(out, hostItem{Cat: "dns", Key: svc + "=" + servers, Label: servers + " on " + svc})
 	}
 	for _, m := range regexp.MustCompile(`profileIdentifier: (\S+)`).FindAllStringSubmatch(h.run(ctx, "profiles", "list"), -1) {
+		if strings.HasPrefix(m[1], "io.github.yaklite.") {
+			continue // yaklite private-dns
+		}
 		out = append(out, hostItem{Cat: "profile", Key: m[1], Label: m[1]})
 	}
 	if s := h.run(ctx, "profiles", "status", "-type", "enrollment"); regexp.MustCompile(`MDM enrollment: Yes`).MatchString(s) {
@@ -490,7 +493,7 @@ func linuxNetItems(ctx context.Context, h *hostOS) []hostItem {
 		}
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "DNS=") && len(line) > 4 {
+			if strings.HasPrefix(line, "DNS=") && len(line) > 4 && !strings.Contains(f, "yaklite") {
 				out = append(out, hostItem{Cat: "dns", Key: f + ":" + line, Label: line[4:] + " in " + f})
 			}
 		}
