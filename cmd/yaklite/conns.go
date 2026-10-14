@@ -32,7 +32,11 @@ func init() {
 
 type connMemory struct {
 	Started   time.Time            `json:"started"`
-	Countries map[string]time.Time `json:"countries"` // first seen
+	Countries map[string]time.Time `json:"countries"`          // first seen
+	Programs  map[string]time.Time `json:"programs,omitempty"` // first seen online
+	// ProgramsSince is when programs started being remembered; the first
+	// days are learned quietly, also for people updating from older versions.
+	ProgramsSince time.Time `json:"programs_since,omitempty"`
 }
 
 func loadConnMemory(dir string) (*connMemory, string) {
@@ -43,6 +47,12 @@ func loadConnMemory(dir string) (*connMemory, string) {
 	}
 	if m.Countries == nil {
 		m.Countries = map[string]time.Time{}
+	}
+	if m.Programs == nil {
+		m.Programs = map[string]time.Time{}
+	}
+	if m.ProgramsSince.IsZero() {
+		m.ProgramsSince = time.Now()
 	}
 	if m.Started.IsZero() {
 		m.Started = time.Now()
@@ -124,6 +134,7 @@ func connsCheck(ctx context.Context, env *checkEnv) ([]*Finding, error) {
 	var out []*Finding
 	views := classify(socks, threats)
 	out = append(out, programFindings(ctx, views, now)...)
+	out = append(out, firstOnlineFindings(mem, views, now, learning || now.Sub(mem.ProgramsSince) < 3*24*time.Hour)...)
 	for _, c := range views {
 		proc := ""
 		if p := c.proc(); p != "" {

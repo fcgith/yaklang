@@ -377,46 +377,47 @@ func appleProtectionFindings(items []installEntry, now time.Time) []*Finding {
 	return out
 }
 
-type tmDestination struct {
-	SnapshotDates            []time.Time `json:"SnapshotDates"`
-	LastKnownEncryptionState string      `json:"LastKnownEncryptionState"`
-}
+var (
+	tmDatesRe  = regexp.MustCompile(`(?s)SnapshotDates = +\((.*?)\);`)
+	tmDateRe   = regexp.MustCompile(`"?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4})"?`)
+	tmLatestRe = regexp.MustCompile(`(\d{4}-\d{2}-\d{2}-\d{6})`)
+)
 
-// backupFindings judges Time Machine's settings (plutil -convert json of
-// /Library/Preferences/com.apple.TimeMachine.plist).
-func backupFindings(js string, now time.Time) []*Finding {
-	var tm struct {
-		AutoBackup   *bool           `json:"AutoBackup"`
-		Destinations []tmDestination `json:"Destinations"`
+// backupFindings judges Time Machine from `tmutil destinationinfo`,
+// `defaults read /Library/Preferences/com.apple.TimeMachine` and
+// `tmutil latestbackup`. When the age of the last backup cannot be read
+// (macOS may need Full Disk Access for it), it says nothing about age.
+func backupFindings(dests, prefs, latest string, now time.Time) []*Finding {
+	if strings.TrimSpace(dests) == "" {
+		return nil // could not ask
 	}
-	if strings.TrimSpace(js) == "" || json.Unmarshal([]byte(js), &tm) != nil || len(tm.Destinations) == 0 {
+	if strings.Contains(dests, "No destinations configured") {
 		return []*Finding{{ID: "self:no-backup", Severity: sevMedium,
 			Title: "No Time Machine backup is set up",
 			Fix:   "Plug in an external drive and choose it in System Settings > General > Time Machine, with \"Encrypt backup\" on. A recent backup is the only real answer to ransomware. If you use another backup service, acknowledge this alert."}}
 	}
 	var out []*Finding
 	var last time.Time
-	encrypted := true
-	for _, d := range tm.Destinations {
-		for _, t := range d.SnapshotDates {
-			if t.After(last) {
+	for _, block := range tmDatesRe.FindAllStringSubmatch(prefs, -1) {
+		for _, m := range tmDateRe.FindAllStringSubmatch(block[1], -1) {
+			if t, err := time.Parse("2006-01-02 15:04:05 -0700", m[1]); err == nil && t.After(last) {
 				last = t
 			}
 		}
-		if d.LastKnownEncryptionState == "NotEncrypted" {
-			encrypted = false
+	}
+	if m := tmLatestRe.FindStringSubmatch(latest); m != nil {
+		if t, err := time.ParseInLocation("2006-01-02-150405", m[1], time.Local); err == nil && t.After(last) {
+			last = t
 		}
 	}
-	if tm.AutoBackup != nil && !*tm.AutoBackup {
+	encrypted := !strings.Contains(prefs, "NotEncrypted")
+	if regexp.MustCompile(`AutoBackup = 0;`).MatchString(prefs) {
 		out = append(out, &Finding{ID: "self:backup-manual", Severity: sevLow,
 			Title: "Time Machine only backs up when you ask it to",
 			Fix:   "Turn on automatic backups in System Settings > General > Time Machine > Options."})
 	}
 	switch days := int(now.Sub(last).Hours() / 24); {
 	case last.IsZero():
-		out = append(out, &Finding{ID: "self:backup-never", Severity: sevMedium,
-			Title: "Time Machine is set up but has never finished a backup",
-			Fix:   "Connect the backup drive and choose \"Back Up Now\" from the Time Machine menu."})
 	case days >= 7:
 		out = append(out, &Finding{ID: "self:backup-old", Severity: sevMedium,
 			Title: fmt.Sprintf("The last Time Machine backup was %d days ago", days),
@@ -476,7 +477,7 @@ func macExtraSelfCheck(ctx context.Context, run runner, now time.Time, exists fu
 		}
 	}
 	out = append(out, appleProtectionFindings(parseInstallHistory(run(ctx, "system_profiler", "-json", "SPInstallHistoryDataType")), now)...)
-	out = append(out, backupFindings(run(ctx, "plutil", "-convert", "json", "-o", "-", "/Library/Preferences/com.apple.TimeMachine.plist"), now)...)
+	out = append(out, backupFindings(run(ctx, "tmutil", "destinationinfo"), run(ctx, "defaults", "read", "/Library/Preferences/com.apple.TimeMachine"), run(ctx, "tmutil", "latestbackup"), now)...)
 	if !exists("/Applications/LuLu.app") && !exists("/Applications/Little Snitch.app") && !exists("/Applications/Little Snitch Mini.app") {
 		out = append(out, &Finding{ID: "self:no-outgoing-firewall", Severity: sevInfo,
 			Title: "Nothing asks before an app connects out to the internet",
