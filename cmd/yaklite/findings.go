@@ -140,6 +140,7 @@ type check struct {
 	trustedOnly bool // only on networks the user said are theirs (it talks to other devices)
 	autoSkip    bool // has its own background job, so the hourly check leaves it out
 	after       bool // runs once the others are done, so it can use what they found
+	last        bool // runs after the "after" checks
 	run         func(ctx context.Context, env *checkEnv) ([]*Finding, error)
 }
 
@@ -160,10 +161,16 @@ func runChecks(ctx context.Context, env *checkEnv, only map[string]bool) {
 	list := append([]*check(nil), checks...)
 	checksMu.Unlock()
 	mu := &env.mu
-	for _, after := range []bool{false, true} {
+	for phase := 0; phase < 3; phase++ {
 		var wg sync.WaitGroup
 		for _, c := range list {
-			if c.after != after || (only != nil && !only[c.name]) {
+			p := 0
+			if c.last {
+				p = 2
+			} else if c.after {
+				p = 1
+			}
+			if p != phase || (only != nil && !only[c.name]) {
 				continue
 			}
 			if (c.trustedOnly && !env.trusted) || (c.autoSkip && env.inAuto) {
@@ -199,7 +206,16 @@ func cmdCheck(ctx context.Context, args []string) error {
 	list := fs.Bool("list", false, "list the checks and exit")
 	noThreat := fs.Bool("no-threat-lists", false, "do not download public lists of known bad addresses")
 	noPublic := fs.Bool("no-public-lookup", false, "do not ask public services for this network's public IP")
+	accept := fs.Bool("accept", false, "accept this computer's current startup programs, certificates, proxy/DNS settings, profiles and accounts as normal (the host check then reports only what is new)")
 	fs.Parse(args)
+	if *accept {
+		items := collectHostItems(ctx, realHostOS())
+		if err := saveHostBaseline(defaultStateDir(), items, false); err != nil {
+			return err
+		}
+		fmt.Printf("Recorded %d startup programs, certificates, settings and accounts as normal.\n", len(items))
+		return nil
+	}
 	if *list {
 		checksMu.Lock()
 		defer checksMu.Unlock()

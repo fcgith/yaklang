@@ -72,6 +72,24 @@ func listSockets(ctx context.Context) ([]sock, error) {
 			}
 		}
 		return out, nil
+	case "windows":
+		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		data, err := exec.CommandContext(cctx, "netstat", "-ano", "-p", "TCP").Output()
+		if err != nil {
+			return nil, fmt.Errorf("netstat: %w", err)
+		}
+		out := parseWindowsNetstat(string(data))
+		if data6, err := exec.CommandContext(cctx, "netstat", "-ano", "-p", "TCPv6").Output(); err == nil {
+			out = append(out, parseWindowsNetstat(string(data6))...)
+		}
+		if tl, err := exec.CommandContext(cctx, "tasklist", "/fo", "csv", "/nh").Output(); err == nil {
+			names := parseTasklist(string(tl))
+			for i := range out {
+				out[i].Process = names[out[i].PID]
+			}
+		}
+		return out, nil
 	}
 	return nil, fmt.Errorf("listing connections is not supported on %s", runtime.GOOS)
 }
@@ -280,4 +298,62 @@ func splitLsofAddr(s string) (net.IP, int, bool) {
 		ip = v4
 	}
 	return ip, p, true
+}
+
+var windowsStates = map[string]string{"LISTENING": "LISTEN", "SYN_RECEIVED": "SYN_RECV"}
+
+// parseWindowsNetstat reads `netstat -ano -p TCP`:
+//
+//	TCP    192.168.1.5:50000      1.2.3.4:443      ESTABLISHED     1234
+func parseWindowsNetstat(data string) []sock {
+	var out []sock
+	for _, line := range strings.Split(data, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 5 || f[0] != "TCP" {
+			continue
+		}
+		lip, lport, ok1 := splitHostPortIP(f[1])
+		rip, rport, ok2 := splitHostPortIP(f[2])
+		pid, err := strconv.Atoi(f[4])
+		if !ok1 || !ok2 || err != nil {
+			continue
+		}
+		st := f[3]
+		if w, ok := windowsStates[st]; ok {
+			st = w
+		}
+		out = append(out, sock{LocalIP: lip, LocalPort: lport, RemoteIP: rip, RemotePort: rport, State: st, PID: pid})
+	}
+	return out
+}
+
+func splitHostPortIP(s string) (net.IP, int, bool) {
+	h, p, err := net.SplitHostPort(s)
+	if err != nil {
+		return nil, 0, false
+	}
+	if i := strings.IndexByte(h, '%'); i >= 0 {
+		h = h[:i]
+	}
+	ip := net.ParseIP(h)
+	port, err := strconv.Atoi(p)
+	if ip == nil || err != nil {
+		return nil, 0, false
+	}
+	return ip, port, true
+}
+
+// parseTasklist reads `tasklist /fo csv /nh`: "name.exe","1234","Console",...
+func parseTasklist(data string) map[int]string {
+	out := map[int]string{}
+	for _, line := range strings.Split(data, "\n") {
+		f := strings.Split(strings.TrimSpace(line), `","`)
+		if len(f) < 2 {
+			continue
+		}
+		if pid, err := strconv.Atoi(strings.Trim(f[1], `"`)); err == nil {
+			out[pid] = strings.Trim(f[0], `"`)
+		}
+	}
+	return out
 }

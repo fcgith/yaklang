@@ -162,8 +162,8 @@ func sharingFindings(socks []sock) []*Finding {
 	var out []*Finding
 	seen := map[int]bool{}
 	for _, s := range socks {
-		if s.State != "LISTEN" || s.LocalIP.IsLoopback() || seen[s.LocalPort] {
-			continue
+		if s.State != "LISTEN" || s.LocalIP.IsLoopback() || seen[s.LocalPort] || isOwnProcess(s.Process) {
+			continue // yaklite's own tripwire is not a sharing service
 		}
 		sp, ok := sharingPorts[s.LocalPort]
 		if !ok {

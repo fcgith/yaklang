@@ -122,7 +122,9 @@ func connsCheck(ctx context.Context, env *checkEnv) ([]*Finding, error) {
 	now := time.Now()
 	learning := now.Sub(mem.Started) < env.opts.learnFor
 	var out []*Finding
-	for _, c := range classify(socks, threats) {
+	views := classify(socks, threats)
+	out = append(out, programFindings(ctx, views, now)...)
+	for _, c := range views {
 		proc := ""
 		if p := c.proc(); p != "" {
 			proc = " by " + p

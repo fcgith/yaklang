@@ -258,7 +258,13 @@ func cmdAuto(ctx context.Context, args []string) error {
 			opt.Concurrency, opt.UDP = 60, false
 			prog("on battery: scanning gently")
 		}
-		scan = func(ctx context.Context) (*Snapshot, error) { return Scan(ctx, opt) }
+		scan = func(ctx context.Context) (*Snapshot, error) {
+			snap, err := Scan(ctx, opt)
+			if err == nil {
+				dropTripwirePorts(snap, o.stateDir)
+			}
+			return snap, err
+		}
 	} else {
 		name = n.ID() + "-self"
 		scan = func(ctx context.Context) (*Snapshot, error) { return guardScan(ctx, n, prog) }

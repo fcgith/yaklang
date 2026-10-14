@@ -122,6 +122,10 @@ func main() {
 		fmt.Println("yaklite", version)
 	case "check":
 		err = cmdCheck(ctx, os.Args[2:])
+	case "routerlog":
+		err = cmdRouterLog(ctx, os.Args[2:])
+	case "tripwire":
+		err = cmdTripwire(ctx, os.Args[2:])
 	case "ack":
 		err = cmdAck(os.Args[2:])
 	case "alerts":
