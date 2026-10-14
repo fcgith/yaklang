@@ -624,15 +624,10 @@ that include passwords are high alerts, with which password to change.
 
 ## Windows
 
-The release has `yaklite-windows.exe`. It is new and has had less testing
-than the Mac and Linux builds.
-
-```powershell
-Invoke-WebRequest https://github.com/fcgith/yaklang/releases/download/yaklite-latest/yaklite-windows.exe -OutFile yaklite.exe
-.\yaklite.exe install
-```
-
-`install` copies it to `%LOCALAPPDATA%\yaklite\` and registers hidden
+Windows builds are paused for now, so the release has no Windows download.
+The Windows support stays in the code: building it needs MinGW and cgo
+(`GOOS=windows CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build ./cmd/yaklite`).
+On Windows, `install` copies it to `%LOCALAPPDATA%\yaklite\` and registers hidden
 Task Scheduler jobs for your user (no admin rights), shows problems as
 Windows notifications, and runs the Windows safety checks above. Windows
 Defender SmartScreen may warn on the first run because the build is
