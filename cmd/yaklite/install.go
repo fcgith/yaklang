@@ -269,6 +269,7 @@ func cmdInstall(ctx context.Context, args []string) error {
 	acceptReports := fs.Bool("accept-reports", false, "let other computers in the house send their results to this dashboard")
 	reportTo := fs.String("report-to", "", "send this computer's results to another computer's dashboard, e.g. http://192.168.1.10:9842")
 	reportTok := fs.String("report-token", "", "the token that dashboard printed (with --report-to)")
+	menubar := fs.Bool("menubar", false, "also add the menu bar app (macOS)")
 	fs.Parse(args)
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
 		return errors.New("install supports macOS, Linux and Windows; elsewhere run `yaklite auto` from a scheduled job")
@@ -447,6 +448,13 @@ func cmdInstall(ctx context.Context, args []string) error {
 	}
 	if *tripwire {
 		fmt.Println("Tripwire is on: anything on your network that tries its fake services raises an alert.")
+	}
+	if *menubar && runtime.GOOS == "darwin" {
+		if err := installMenubar(9842); err != nil {
+			fmt.Println("Menu bar app not added:", err)
+		} else {
+			fmt.Println("The menu bar app is on: look for the shield at the top of the screen.")
+		}
 	}
 	fmt.Println("\nUseful next steps:")
 	fmt.Println("  yaklite status                       what network you are on and when it was last checked")

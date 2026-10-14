@@ -52,6 +52,20 @@ jobs:
       - name: Test
         run: go test -count=1 ./cmd/yaklite
 
+      - name: Build the menu bar app (macOS)
+        if: runner.os == 'macOS'
+        # Builds YakliteBar.app into cmd/yaklite/macapp/YakliteBar.zip, which the
+        # Go build below embeds (the committed file is an empty placeholder).
+        # The app is ad-hoc signed: `yaklite menubar install` unpacks it without
+        # the download quarantine, so macOS opens it. The separate YakliteBar.zip
+        # download needs right-click > Open the first time. Signing it with the
+        # Developer ID would need the keychain from the sign step set up before
+        # this step (then run build.sh with SIGN_ID set).
+        run: |
+          bash cmd/yaklite/macapp/build.sh "$PWD/cmd/yaklite/macapp/YakliteBar.zip"
+          cp cmd/yaklite/macapp/YakliteBar.zip YakliteBar.zip
+          shasum -a 256 YakliteBar.zip > YakliteBar.zip.sha256
+
       - name: Build (macOS universal)
         if: runner.os == 'macOS'
         env:
@@ -115,10 +129,14 @@ jobs:
           path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+            YakliteBar.zip
+            YakliteBar.zip.sha256
 
   release:
     needs: build
     runs-on: ubuntu-22.04
+    env:
+      HAS_TAP: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -139,3 +157,27 @@ jobs:
             gh release edit "$TAG" --notes "$NOTES"
             gh release upload "$TAG" dist/* --clobber
           fi
+
+      - name: Update the Homebrew tap (when HOMEBREW_TAP_TOKEN is set)
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        if: env.HAS_TAP == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        run: |
+          set -euo pipefail
+          SHA=$(cut -d' ' -f1 dist/yaklite-macos.sha256)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"; VER="${TAG#yaklite-v}"
+          else
+            TAG=yaklite-latest; VER="0.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+          fi
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/yaklite-macos"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-yaklite.git" tap
+          mkdir -p tap/Formula
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/cmd/yaklite/contrib/homebrew/yaklite.rb.tmpl" \
+            | sed -e "s|\"VERSION\"|\"${VER}\"|" -e "s|\"URL\"|\"${URL}\"|" -e "s|\"SHA256\"|\"${SHA}\"|" > tap/Formula/yaklite.rb
+          cd tap
+          git config user.name "yaklite release"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/yaklite.rb
+          git diff --cached --quiet || { git commit -m "yaklite ${VER}"; git push; }
