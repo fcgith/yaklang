@@ -157,10 +157,12 @@ jobs:
         run: |
           ./yaklite-windows.exe --help
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          $srv = Start-Process python -ArgumentList '-m','http.server','18080','--bind','127.0.0.1' -PassThru
-          Start-Sleep 3
-          ./yaklite-windows.exe scan -t 127.0.0.1 -p 18080 --no-arp | Tee-Object scan.txt
-          Stop-Process $srv
+          # a listener in this shell: the connection completes from the backlog
+          $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 18080)
+          $l.Start()
+          $c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 18080); $c.Close()
+          ./yaklite-windows.exe scan -t 127.0.0.1 -p 18080 --no-arp --no-fp | Tee-Object scan.txt
+          $l.Stop()
           if (-not (Select-String -Path scan.txt -Pattern 'tcp/18080' -Quiet)) { exit 1 }
           ./yaklite-windows.exe check --only self
           ./yaklite-windows.exe conns
