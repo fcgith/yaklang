@@ -31,7 +31,7 @@ var scoreCost = map[string]int{sevHigh: 15, sevMedium: 6, sevLow: 2}
 // problems: a scan sees them as ports, not findings.
 func riskyOpenPorts(w *watchState, inv *Inventory) []scoreItem {
 	var out []scoreItem
-	if w.Snap.Method == "connections" || w.Snap.Method == "tripwire" || w.Snap.Method == "router-log" {
+	if w.Snap.Method == "connections" || w.Snap.Method == "tripwire" || w.Snap.Method == "router-log" || w.Snap.Method == "traffic" {
 		return nil
 	}
 	for host, svcs := range w.Snap.Hosts {

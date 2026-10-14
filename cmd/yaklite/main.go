@@ -31,6 +31,8 @@ const usage = `yaklite: home network monitoring and alerts (built from yaklang)
 
 Set and forget (laptops and desktops):
   yaklite install [--webhook URL]   check in the background, notify on problems
+          [--router-log] [--tripwire] [--tailscale] [--accept-reports]
+          [--report-to URL --report-token T]
   yaklite status                  current network, trust, last check
   yaklite trust [--name Home]     monitor every device on the current network
   yaklite untrust                 only check this computer on the current network
@@ -44,12 +46,29 @@ What it found:
   yaklite summary                 the weekly summary, now
   yaklite history                 when each device was first and last seen
   yaklite serve                   dashboard on http://127.0.0.1:9842 + Prometheus metrics
+  yaklite score                   a safety score out of 100 and what to fix first
+  yaklite quiet [22:00-07:00|off] [--group 10]   quiet hours and grouped alerts
+  yaklite outages                 when the internet was down
 
 Checks:
   yaklite check [--only upnp,dns] [--list]   router, DNS, Wi-Fi, this computer's settings, ...
   yaklite conns                   this computer's internet connections, with owner and country
   yaklite connwatch               alert on connections from the internet or with known attackers
   yaklite outside -d example.com [--ip 203.0.113.7]   your domains and public IP, seen from outside
+  yaklite check --accept          record this computer's startup programs, certificates, ... as normal
+
+More watches:
+  yaklite routerlog               read the log your router sends here (UDP 5514)
+  yaklite router setup|test|forget   log in to the router to read its devices, log, settings
+  yaklite tripwire                fake services that catch anything scanning your network
+  yaklite traffic --eve FILE      alerts from Suricata on a traffic box (contrib/trafficbox)
+
+Hardening and leaks:
+  yaklite firewall install|status|uninstall   block known attackers in the OS firewall (admin)
+  yaklite private-dns [--provider quad9]      encrypted DNS for this computer
+  yaklite password-check          is a password in a known data leak (only a hash prefix is sent)
+  yaklite breaches -d example.com is your domain or its addresses in a data leak
+  yaklite report --to URL --token T   send this computer's results to another dashboard
 
 By hand:
   yaklite scan  -t TARGETS [-p PORTS] [--udp] [-o snapshot.json]
@@ -141,6 +160,8 @@ func main() {
 		err = cmdPasswordCheck(ctx, os.Args[2:])
 	case "breaches":
 		err = cmdBreaches(ctx, os.Args[2:])
+	case "traffic":
+		err = cmdTraffic(ctx, os.Args[2:])
 	case "quiet":
 		err = cmdQuiet(os.Args[2:])
 	case "report":
