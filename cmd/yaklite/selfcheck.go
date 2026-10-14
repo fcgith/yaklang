@@ -91,6 +91,7 @@ func macSelfCheck(ctx context.Context, run runner) []*Finding {
 			Title: "The guest account is on",
 			Fix:   "Turn it off in System Settings > Users & Groups."})
 	}
+	out = append(out, macExtraSelfCheck(ctx, run, time.Now(), fileExists)...)
 	return out
 }
 

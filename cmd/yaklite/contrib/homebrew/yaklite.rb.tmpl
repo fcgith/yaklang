@@ -1,0 +1,28 @@
+# Homebrew formula for yaklite. The release workflow fills in VERSION, URL
+# and SHA256 and pushes the result to the fcgith/homebrew-yaklite tap.
+class Yaklite < Formula
+  desc "Watches your home network and Mac for intruders and risky changes"
+  homepage "https://github.com/fcgith/yaklang/tree/main/cmd/yaklite"
+  version "VERSION"
+  url "URL"
+  sha256 "SHA256"
+  license "AGPL-3.0-only"
+
+  depends_on :macos
+
+  def install
+    bin.install Dir["yaklite*"].first => "yaklite"
+  end
+
+  def caveats
+    <<~EOS
+      Set it up with:
+        yaklite install
+      Updates come through `brew upgrade yaklite`.
+    EOS
+  end
+
+  test do
+    assert_match "yaklite", shell_output("#{bin}/yaklite version")
+  end
+end

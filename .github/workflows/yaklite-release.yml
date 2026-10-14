@@ -1,7 +1,7 @@
 name: yaklite release
 
-# Builds yaklite for macOS (one universal binary for Apple Silicon and Intel),
-# Linux and Windows, smoke-tests each build, and publishes them on the rolling
+# Builds yaklite for macOS (one universal binary for Apple Silicon and Intel)
+# and Linux, smoke-tests each build, and publishes them on the rolling
 # "yaklite-latest" release so they can be downloaded with one command.
 #
 # The macOS build is signed with a Developer ID and notarized by Apple when
@@ -51,6 +51,20 @@ jobs:
 
       - name: Test
         run: go test -count=1 ./cmd/yaklite
+
+      - name: Build the menu bar app (macOS)
+        if: runner.os == 'macOS'
+        # Builds YakliteBar.app into cmd/yaklite/macapp/YakliteBar.zip, which the
+        # Go build below embeds (the committed file is an empty placeholder).
+        # The app is ad-hoc signed: `yaklite menubar install` unpacks it without
+        # the download quarantine, so macOS opens it. The separate YakliteBar.zip
+        # download needs right-click > Open the first time. Signing it with the
+        # Developer ID would need the keychain from the sign step set up before
+        # this step (then run build.sh with SIGN_ID set).
+        run: |
+          bash cmd/yaklite/macapp/build.sh "$PWD/cmd/yaklite/macapp/YakliteBar.zip"
+          cp cmd/yaklite/macapp/YakliteBar.zip YakliteBar.zip
+          shasum -a 256 YakliteBar.zip > YakliteBar.zip.sha256
 
       - name: Build (macOS universal)
         if: runner.os == 'macOS'
@@ -115,62 +129,14 @@ jobs:
           path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
-
-  # Windows: cross-compiled with MinGW (the regex library needs cgo), then
-  # started on a real Windows machine.
-  build-windows:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Install MinGW
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
-      - name: Vet and build
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: "1"
-          CC: x86_64-w64-mingw32-gcc
-        run: |
-          go vet ./cmd/yaklite
-          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o yaklite-windows.exe ./cmd/yaklite
-          sha256sum yaklite-windows.exe > yaklite-windows.exe.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: yaklite-windows.exe
-          path: |
-            yaklite-windows.exe
-            yaklite-windows.exe.sha256
-
-  smoke-windows:
-    needs: build-windows
-    runs-on: windows-2022
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: yaklite-windows.exe
-      - name: Smoke test
-        shell: pwsh
-        run: |
-          ./yaklite-windows.exe --help
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          # a listener in this shell: the connection completes from the backlog
-          $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 18080)
-          $l.Start()
-          $c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 18080); $c.Close()
-          ./yaklite-windows.exe scan -t 127.0.0.1 -p 18080 --no-arp --no-fp | Tee-Object scan.txt
-          $l.Stop()
-          if (-not (Select-String -Path scan.txt -Pattern 'tcp/18080' -Quiet)) { exit 1 }
-          ./yaklite-windows.exe check --only self
-          ./yaklite-windows.exe conns
-          exit 0
+            YakliteBar.zip
+            YakliteBar.zip.sha256
 
   release:
-    needs: [build, smoke-windows]
+    needs: build
     runs-on: ubuntu-22.04
+    env:
+      HAS_TAP: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -191,3 +157,27 @@ jobs:
             gh release edit "$TAG" --notes "$NOTES"
             gh release upload "$TAG" dist/* --clobber
           fi
+
+      - name: Update the Homebrew tap (when HOMEBREW_TAP_TOKEN is set)
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        if: env.HAS_TAP == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        run: |
+          set -euo pipefail
+          SHA=$(cut -d' ' -f1 dist/yaklite-macos.sha256)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"; VER="${TAG#yaklite-v}"
+          else
+            TAG=yaklite-latest; VER="0.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+          fi
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/yaklite-macos"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-yaklite.git" tap
+          mkdir -p tap/Formula
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/cmd/yaklite/contrib/homebrew/yaklite.rb.tmpl" \
+            | sed -e "s|\"VERSION\"|\"${VER}\"|" -e "s|\"URL\"|\"${URL}\"|" -e "s|\"SHA256\"|\"${SHA}\"|" > tap/Formula/yaklite.rb
+          cd tap
+          git config user.name "yaklite release"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/yaklite.rb
+          git diff --cached --quiet || { git commit -m "yaklite ${VER}"; git push; }

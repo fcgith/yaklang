@@ -55,14 +55,16 @@ func realHostOS() *hostOS {
 	return &hostOS{goos: runtime.GOOS, home: home, run: cmdOut, readFile: os.ReadFile, readDir: os.ReadDir}
 }
 
-var hostCats = map[string]struct {
+type hostCat struct {
 	sev         string
 	reviewAll   bool // worth a look even when already there on the first run
 	title       string
 	reviewTitle string
 	detail      string
 	fix         string
-}{
+}
+
+var hostCats = map[string]hostCat{
 	"startup": {sevMedium, false, "New program set to start automatically: %s", "",
 		"Setting itself to start at login or boot is the first thing most malware does.",
 		"If you did not just install something that explains it, remove it: on a Mac, System Settings > General > Login Items, or delete the file named above and log out and in. yaklite ack this alert if it is yours."},
@@ -95,6 +97,45 @@ type hostBaseline struct {
 	Created time.Time       `json:"created"`
 	Items   map[string]bool `json:"items"`  // ids present when it was recorded
 	Review  map[string]bool `json:"review"` // ids worth a look although already present
+	// Cats lists the kinds of item the baseline covers. A kind added in a
+	// later version is absorbed quietly the first time it is seen, so an
+	// update does not flood alerts about things that were always there.
+	Cats map[string]bool `json:"cats,omitempty"`
+}
+
+// firstHostCats are the kinds covered by baselines made before Cats existed.
+var firstHostCats = []string{"startup", "cert", "proxy", "dns", "profile", "mdm", "vpn", "user", "admin"}
+
+// absorbNewCats adds items of kinds the baseline does not cover yet; it
+// reports whether anything changed.
+func (b *hostBaseline) absorbNewCats(items []hostItem) bool {
+	changed := false
+	if b.Cats == nil {
+		b.Cats = map[string]bool{}
+		for _, c := range firstHostCats {
+			b.Cats[c] = true
+		}
+		changed = true
+	}
+	if b.Review == nil {
+		b.Review = map[string]bool{}
+	}
+	for _, it := range items {
+		if b.Cats[it.Cat] {
+			continue
+		}
+		b.Items[it.id()] = true
+		if hostCats[it.Cat].reviewAll || it.Sev == sevHigh {
+			b.Review[it.id()] = true
+		}
+	}
+	for c := range hostCats {
+		if !b.Cats[c] {
+			b.Cats[c] = true
+			changed = true
+		}
+	}
+	return changed
 }
 
 func hostBaselinePath(stateDir string) string { return filepath.Join(stateDir, "host-baseline.json") }
@@ -112,13 +153,20 @@ func loadHostBaseline(stateDir string) *hostBaseline {
 }
 
 func saveHostBaseline(stateDir string, items []hostItem, review bool) error {
-	b := &hostBaseline{Created: time.Now(), Items: map[string]bool{}, Review: map[string]bool{}}
+	b := &hostBaseline{Created: time.Now(), Items: map[string]bool{}, Review: map[string]bool{}, Cats: map[string]bool{}}
+	for c := range hostCats {
+		b.Cats[c] = true
+	}
 	for _, it := range items {
 		b.Items[it.id()] = true
 		if review && (hostCats[it.Cat].reviewAll || it.Sev == sevHigh) {
 			b.Review[it.id()] = true
 		}
 	}
+	return writeHostBaseline(stateDir, b)
+}
+
+func writeHostBaseline(stateDir string, b *hostBaseline) error {
 	data, err := json.MarshalIndent(b, "", "  ")
 	if err != nil {
 		return err
@@ -130,14 +178,25 @@ func saveHostBaseline(stateDir string, items []hostItem, review bool) error {
 func hostCheck(ctx context.Context, env *checkEnv) ([]*Finding, error) {
 	h := realHostOS()
 	items := collectHostItems(ctx, h)
+	var tccOK bool
+	if h.goos == "darwin" {
+		var tcc []hostItem
+		tcc, tccOK = tccItems(ctx, h)
+		items = append(items, tcc...)
+	}
 	base := loadHostBaseline(env.stateDir)
 	if base == nil {
 		if err := saveHostBaseline(env.stateDir, items, true); err != nil {
 			return nil, err
 		}
 		base = loadHostBaseline(env.stateDir)
+	} else if base.absorbNewCats(items) {
+		writeHostBaseline(env.stateDir, base)
 	}
 	out := hostFindings(items, base)
+	if h.goos == "darwin" && !tccOK {
+		out = append(out, tccUnreadableFinding())
+	}
 	var socks []sock
 	if s, err := listSockets(ctx); err == nil {
 		socks = s
@@ -206,6 +265,7 @@ func collectHostItems(ctx context.Context, h *hostOS) []hostItem {
 		items = append(items, windowsHostItems(ctx, h)...)
 	}
 	items = append(items, cronItems(ctx, h)...)
+	items = append(items, extensionItems(ctx, h)...)
 	sort.Slice(items, func(i, j int) bool { return items[i].id() < items[j].id() })
 	return items
 }

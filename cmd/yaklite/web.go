@@ -649,6 +649,11 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 			handleReport(r.dir, r.reportToken, w, req)
 			return
 		}
+		if strings.HasPrefix(req.URL.Path, "/api/app/") {
+			// the menu bar app authenticates with its own secret (menubar.go)
+			handleAppAPI(r, w, req)
+			return
+		}
 		switch req.Method {
 		case http.MethodGet, http.MethodHead:
 		case http.MethodPost:

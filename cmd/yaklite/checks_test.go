@@ -266,7 +266,12 @@ func TestSelfChecks(t *testing.T) {
 	run := func(_ context.Context, name string, args ...string) string {
 		return fake[strings.Join(append([]string{name}, args...), " ")]
 	}
-	fs := macSelfCheck(context.Background(), run)
+	var fs []*Finding
+	for _, f := range macSelfCheck(context.Background(), run) {
+		if f.ID != "self:no-backup" && f.ID != "self:no-outgoing-firewall" {
+			fs = append(fs, f)
+		}
+	}
 	if len(fs) != 1 || fs[0].ID != "self:firewall-off" {
 		t.Errorf("%+v", fs)
 	}

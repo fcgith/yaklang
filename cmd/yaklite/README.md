@@ -473,8 +473,8 @@ up. `--only` picks some, `--list` shows them all.
 
 | Check | Looks for |
 | --- | --- |
-| `self` | This computer: firewall off, stealth mode, FileVault or disk encryption, SIP, Gatekeeper, automatic updates, guest account, SSH password logins, file or screen sharing listening on the network (Windows: firewall, Defender, drive encryption, UAC, Remote Desktop) |
-| `host` | Changes inside this computer since the first check: new startup programs (launch agents, login items, system extensions, cron, systemd, Run keys), newly trusted root certificates, a proxy or DNS server set behind your back, new configuration profiles or device management, new user or admin accounts, and many failed logins from one address. The first check asks you to look over what is already there; `yaklite check --accept` records the current state as normal |
+| `self` | This computer: firewall off, stealth mode, FileVault or disk encryption, SIP, Gatekeeper, automatic updates, guest account, SSH password logins, file or screen sharing listening on the network, Find My Mac, AirDrop open to everyone, Bluetooth sharing, automatic login, screen lock delay, Apple's malware protection (XProtect) and macOS updates out of date, Time Machine missing, old or unencrypted, and a tip about an outgoing firewall such as LuLu (Windows: firewall, Defender, drive encryption, UAC, Remote Desktop) |
+| `host` | Changes inside this computer since the first check: new startup programs (launch agents, login items, system extensions, cron, systemd, Run keys), newly trusted root certificates, a proxy or DNS server set behind your back, new configuration profiles or device management, new user or admin accounts, new browser extensions (Safari, Chrome, Brave, Edge, Firefox; extra warning for ones from outside the store), apps given screen recording, accessibility, full disk, input monitoring, camera or microphone permission, and many failed logins from one address. A kind of item added by an update is learned quietly the first time, so updating does not flood you with alerts. The first check asks you to look over what is already there; `yaklite check --accept` records the current state as normal |
 | `routeradmin` | Whether the router's admin page can be reached from the internet, and whether it only offers it unencrypted (trusted networks) |
 | `router` | With the router's admin login (`yaklite router setup`): its device list, log and settings. See [Router login](#router-login) |
 | `upnp` | Ports the router forwards from the internet through UPnP, and whether UPnP is on at all (trusted networks) |
@@ -487,7 +487,28 @@ up. `--only` picks some, `--list` shows them all.
 | `ipv6` | Devices with public IPv6 addresses and risky ports open on them (trusted networks) |
 | `iot` | Cameras, TVs and smart plugs on the same network as your computers (trusted networks) |
 | `ids` | Alerts from Suricata, if it runs on this machine (`/var/log/suricata/eve.json` or `$YAKLITE_SURICATA_EVE`) |
-| `conns` | As `connwatch` above, when run by hand, plus programs talking to the internet that are unsigned or run from odd places (Downloads, temporary folders) |
+| `apps` | Apps in Applications and files in Downloads: new ones Apple has not checked (not notarized), apps changed after install so their signature no longer matches, and files whose fingerprint is on MalwareBazaar's recent malware list (macOS) |
+| `sites` | Sites opened in Safari, Chrome-family browsers or Firefox since the last check that are on the URLhaus malware or OpenPhish phishing lists. The history is read on this computer and never sent anywhere |
+| `vpnreminder` | On a network that is not yours, a reminder to turn on your VPN; with your VPN's start command in `~/.config/yaklite/vpn-command` it starts it for you once per network |
+| `conns` | As `connwatch` above, when run by hand, plus programs talking to the internet that are unsigned or run from odd places (Downloads, temporary folders), and each program's first ever internet connection (after 3 quiet days of learning) |
+
+**Full Disk Access (Mac).** macOS hides the app permission list and Safari's
+history unless yaklite has Full Disk Access. Without it you get one low
+alert saying so. To allow it: System Settings > Privacy & Security > Full Disk
+Access > +, press Cmd+Shift+G and paste
+`~/Library/Application Support/yaklite/yaklite`. yaklite only reads; it changes
+nothing there.
+
+## When something seems wrong
+
+    yaklite incident
+
+prints what to do, in order (disconnect, change passwords from another
+device, two-step login, check Apple ID devices, call the bank, scan, restore
+or reinstall), and writes a full report to the Desktop: open problems, alerts
+of the last 7 days, current internet connections, startup programs,
+extensions, permissions and accounts, with anything new since yaklite started
+watching marked. The report stays on the computer unless you share it.
 
 `yaklite outside` also checks each domain's email protection (SPF, DMARC),
 when it expires, subdomains pointing at deleted cloud services (takeover
@@ -624,15 +645,10 @@ that include passwords are high alerts, with which password to change.
 
 ## Windows
 
-The release has `yaklite-windows.exe`. It is new and has had less testing
-than the Mac and Linux builds.
-
-```powershell
-Invoke-WebRequest https://github.com/fcgith/yaklang/releases/download/yaklite-latest/yaklite-windows.exe -OutFile yaklite.exe
-.\yaklite.exe install
-```
-
-`install` copies it to `%LOCALAPPDATA%\yaklite\` and registers hidden
+Windows builds are paused for now, so the release has no Windows download.
+The Windows support stays in the code: building it needs MinGW and cgo
+(`GOOS=windows CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build ./cmd/yaklite`).
+On Windows, `install` copies it to `%LOCALAPPDATA%\yaklite\` and registers hidden
 Task Scheduler jobs for your user (no admin rights), shows problems as
 Windows notifications, and runs the Windows safety checks above. Windows
 Defender SmartScreen may warn on the first run because the build is
@@ -669,6 +685,45 @@ or acknowledge anything.
 claude mcp add yaklite -- ~/Library/Application\ Support/yaklite/yaklite mcp
 ```
 
+## Homebrew
+
+Once the tap is set up (see `contrib/homebrew/README.md`):
+
+    brew install fcgith/yaklite/yaklite
+
+## Menu bar app (macOS)
+
+YakliteBar puts a shield at the top of the screen:
+
+- a check mark when all is well, an exclamation mark when something needs a
+  look, and a red cross when something needs attention now;
+- your safety score and the top five problems. Each has "What to do",
+  "Done" (stop telling me) and "Snooze 1 day";
+- "Check now", "Open dashboard" and "Setup…", where you pick what runs in
+  the background, give yaklite Full Disk Access and start the app at login;
+- its own notifications for new alerts, with the same buttons.
+
+It also tells you when the camera or microphone turns on, and which app was
+in front at the time. Click "Always allow" on the notification for apps you
+trust, such as your video call app. Turn this off in the menu if you do not
+want it. These events are saved in yaklite's history.
+
+```sh
+yaklite install --menubar      # or later: yaklite menubar install
+yaklite menubar status
+yaklite menubar uninstall
+```
+
+The app needs the dashboard (on by default with `yaklite install`). It only
+talks to yaklite on this Mac, with a secret kept in `~/.config/yaklite/app-token`.
+While it runs, yaklite's alerts show up through the app instead of as plain
+notifications.
+
+The app is not signed by a known developer unless the signed build is set
+up. `yaklite menubar install` opens it without trouble. If you download
+`YakliteBar.zip` from the release page instead, right-click the app and
+choose Open the first time.
+
 ## Menu bar, Docker and Raspberry Pi
 
 - `contrib/swiftbar/yaklite.1m.sh` is a menu bar shield for SwiftBar or xbar.
@@ -695,6 +750,8 @@ outside services it talks to, and each can be turned off:
 | Your router | Its device list, log and settings, only after `yaklite router setup` | `yaklite router forget` |
 | Your other computers' dashboard | This computer's check results, only with `--report-to` | `install` without it |
 | Your alert destinations, and `<topic>-actions` on ntfy | Alerts and phone buttons | leave `--webhook` out |
+| MalwareBazaar (`bazaar.abuse.ch`) | Fingerprints of recent malware, every 6 h, for the `apps` check | `--no-threat-lists` |
+| URLhaus, OpenPhish (`openphish.com`) | Malware and phishing site lists, every 6 h, for the `sites` check | `--no-threat-lists` |
 | GitHub | `yaklite update`, only when you run it | do not run it |
 
 ## systemd timer (Linux LAN box)

@@ -31,7 +31,7 @@ const usage = `yaklite: home network monitoring and alerts (built from yaklang)
 
 Set and forget (laptops and desktops):
   yaklite install [--webhook URL]   check in the background, notify on problems
-          [--router-log] [--tripwire] [--tailscale] [--accept-reports]
+          [--router-log] [--tripwire] [--tailscale] [--accept-reports] [--menubar]
           [--report-to URL --report-token T]
   yaklite status                  current network, trust, last check
   yaklite trust [--name Home]     monitor every device on the current network
@@ -39,6 +39,8 @@ Set and forget (laptops and desktops):
   yaklite name IP|MAC "Name" [--expect 22,443]   name a device
   yaklite uninstall [--purge]
   yaklite update [--check]        install the latest build (checksum verified)
+  yaklite menubar install|uninstall|status   the menu bar app (macOS)
+  yaklite incident                           something seems wrong: steps to follow and a full report on the Desktop
 
 What it found:
   yaklite alerts [--since 7d]     recent alerts, with the key to acknowledge each
@@ -170,6 +172,10 @@ func main() {
 		err = cmdAck(os.Args[2:])
 	case "alerts":
 		err = cmdAlerts(os.Args[2:])
+	case "menubar":
+		err = cmdMenubar(os.Args[2:])
+	case "incident":
+		err = cmdIncident(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

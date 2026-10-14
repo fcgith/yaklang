@@ -146,7 +146,7 @@ func notifyDesktop(title, body string) {
 }
 
 func notifyChanges(network string, changes []Change) {
-	if len(changes) == 0 {
+	if len(changes) == 0 || menubarActive() { // the menu bar app shows them itself
 		return
 	}
 	title := fmt.Sprintf("yaklite: %d alert(s) on %s", len(changes), network)
