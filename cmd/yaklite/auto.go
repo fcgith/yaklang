@@ -140,6 +140,8 @@ func notifyDesktop(title, body string) {
 		if p, err := exec.LookPath("notify-send"); err == nil {
 			exec.Command(p, "--app-name=yaklite", title, body).Run()
 		}
+	case "windows":
+		notifyWindows(title, body)
 	}
 }
 

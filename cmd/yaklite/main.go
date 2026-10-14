@@ -135,6 +135,8 @@ func main() {
 		err = cmdScore(os.Args[2:])
 	case "outages":
 		err = cmdOutages(os.Args[2:])
+	case "report":
+		err = cmdReport(ctx, os.Args[2:])
 	case "ack":
 		err = cmdAck(os.Args[2:])
 	case "alerts":

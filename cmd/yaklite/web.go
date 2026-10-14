@@ -331,7 +331,7 @@ type pageService struct {
 
 type pageChange struct {
 	When, Severity, Text, Key, Fix string
-	Acked                     bool
+	Acked                          bool
 }
 
 type pageFinding struct {

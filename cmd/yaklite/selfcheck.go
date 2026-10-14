@@ -35,6 +35,8 @@ func selfCheck(ctx context.Context, env *checkEnv) ([]*Finding, error) {
 		out = macSelfCheck(ctx, cmdOut)
 	case "linux":
 		out = linuxSelfCheck(ctx, cmdOut, os.ReadFile)
+	case "windows":
+		out = windowsSelfCheck(ctx, cmdOut)
 	}
 	if socks, err := listSockets(ctx); err == nil {
 		out = append(out, sharingFindings(socks)...)

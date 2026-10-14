@@ -147,7 +147,7 @@ func analyzeRouterEvents(events []routerEvent, now time.Time, threats *threatSet
 			if bad != "" && age < time.Hour {
 				// blocked, which is good, but worth knowing who is trying
 				out = append(out, &Finding{ID: "routerlog:bad-ip:" + ipKey, Severity: sevLow, Host: ipKey, Until: ev.Time.Add(24 * time.Hour),
-					Title: "Your router blocked a known attacker, " + ipWho(ev.IP),
+					Title:  "Your router blocked a known attacker, " + ipWho(ev.IP),
 					Detail: strings.TrimSpace(bad)})
 			}
 		}
@@ -249,8 +249,8 @@ func appendRouterLog(dir string, t time.Time, from net.IP, line string) {
 // network you trust, bound to its address there. open is called with the
 // address to listen on and returns a closer.
 type lanListener struct {
-	always bool   // listen whatever the network (an always-on box): bind to all addresses
-	port   int    // for messages
+	always bool // listen whatever the network (an always-on box): bind to all addresses
+	port   int  // for messages
 	open   func(ip string) (func(), error)
 	prog   func(string, ...any)
 	cur    string // the address currently bound
