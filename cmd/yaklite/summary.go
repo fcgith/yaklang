@@ -121,6 +121,11 @@ func buildSummary(states []*watchState, nf *networksFile, acks *acksFile, now ti
 		title += fmt.Sprintf(" (%d serious)", counts[sevHigh])
 	}
 	var out strings.Builder
+	sc := computeScore(states, nil, acks, now)
+	fmt.Fprintf(&out, "Security score: %d/100 (%s).\n", sc.Score, sc.Grade)
+	if n := outagesSince(defaultStateDir(), from); n != "" {
+		out.WriteString(n + "\n")
+	}
 	if total == 0 && len(open) == 0 {
 		out.WriteString("All quiet: nothing new needed your attention.\n\n")
 	} else {

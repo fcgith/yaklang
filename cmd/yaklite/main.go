@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -130,6 +131,10 @@ func main() {
 		err = cmdFirewall(ctx, os.Args[2:])
 	case "private-dns":
 		err = cmdPrivateDNS(os.Args[2:])
+	case "score":
+		err = cmdScore(os.Args[2:])
+	case "outages":
+		err = cmdOutages(os.Args[2:])
 	case "ack":
 		err = cmdAck(os.Args[2:])
 	case "alerts":
@@ -542,8 +547,18 @@ func cmdServe(ctx context.Context, args []string) error {
 	stateDir := fs.String("state", defaultStateDir(), "state directory written by yaklite watch")
 	listen := fs.String("listen", "127.0.0.1:9842", "address to listen on; anything but loopback needs YAKLITE_WEB_PASSWORD")
 	inventory := fs.String("inventory", "", "inventory YAML, to show device names")
+	tailscale := fs.Bool("tailscale", false, "also serve on this computer's Tailscale address, to open the dashboard from your phone (a password is created if none is set)")
+	accept := fs.Bool("accept-reports", false, "let other computers send their results here (yaklite report / install --report-to); prints the token they need")
 	fs.Parse(args)
 	r := &stateReader{dir: *stateDir}
+	if *accept {
+		tok, err := reportToken()
+		if err != nil {
+			return err
+		}
+		r.reportToken = tok
+		fmt.Fprintf(os.Stderr, "[yaklite] other computers can report here with: yaklite install --report-to http://THIS-COMPUTER:%s --report-token %s\n", portOf(*listen), tok)
+	}
 	if *inventory != "" {
 		inv, err := LoadInventory(*inventory)
 		if err != nil {
@@ -557,8 +572,36 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer srv.Close()
+	if *tailscale {
+		pw, created, err := ensureWebPassword()
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Fprintf(os.Stderr, "[yaklite] dashboard password (saved in %s): %s\n", webPasswordPath(), pw)
+		}
+		go func() {
+			// Tailscale may come up after login: keep looking
+			for ctx.Err() == nil {
+				if ts := tailscaleAddr(); ts != "" {
+					tsrv, err := startWeb(net.JoinHostPort(ts, portOf(*listen)), r)
+					if err == nil {
+						<-ctx.Done()
+						tsrv.Close()
+						return
+					}
+					fmt.Fprintln(os.Stderr, "[yaklite] tailscale:", err)
+				}
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Minute):
+				}
+			}
+		}()
+	}
 	<-ctx.Done()
-	return srv.Close()
+	return nil
 }
 
 type alertFlagValues struct {
@@ -597,6 +640,13 @@ func (f *alertFlagValues) load() (*alertConfig, error) {
 		}
 	}
 	return ac, nil
+}
+
+func portOf(addr string) string {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		return p
+	}
+	return "9842"
 }
 
 func contains(list []string, s string) bool {

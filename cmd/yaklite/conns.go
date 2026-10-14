@@ -275,6 +275,10 @@ func cmdConnWatch(ctx context.Context, args []string) error {
 		snap.Started = time.Now()
 		env := &checkEnv{snap: snap, stateDir: stateDir, prog: func(string, ...any) {}, opts: opts}
 		runChecks(ctx, env, map[string]bool{"conns": true})
+		if f := trackOutage(stateDir, internetUp(ctx), defaultGateway() != "", time.Now()); f != nil {
+			f.Check = "outage"
+			snap.addFinding(f)
+		}
 		snap.Finished = time.Now()
 		if len(snap.SourceErrors) > 0 && len(snap.Findings) == 0 && strings.Contains(strings.Join(snap.SourceErrors, ""), "conns:") {
 			return nil, errors.New(strings.Join(snap.SourceErrors, "; "))

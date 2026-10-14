@@ -32,6 +32,7 @@ type watchState struct {
 
 type stateReader struct {
 	dir           string
+	reportToken   string // when set, other computers may POST /api/report with it
 	inv           *Inventory
 	invFromConfig bool // inv comes from ~/.config/yaklite/inventory.yaml and is reloaded when it changes
 	invMod        time.Time
@@ -170,6 +171,9 @@ func (p *promWriter) sample(name string, value float64, labels ...string) {
 func (r *stateReader) metrics(states []*watchState) string {
 	var p promWriter
 	// Each metric's samples must be contiguous, so loop per metric.
+	sc := computeScore(states, r.inv, loadAcks(), time.Now())
+	p.metric("yaklite_security_score", "gauge", "Security score out of 100 from the open problems (acknowledged ones excluded).")
+	p.sample("yaklite_security_score", float64(sc.Score))
 	p.metric("yaklite_last_scan_timestamp_seconds", "gauge", "Unix time the last scan finished.")
 	for _, w := range states {
 		p.sample("yaklite_last_scan_timestamp_seconds", float64(w.Snap.Finished.Unix()), "watch", w.Name)
@@ -326,7 +330,7 @@ type pageService struct {
 }
 
 type pageChange struct {
-	When, Severity, Text, Key string
+	When, Severity, Text, Key, Fix string
 	Acked                     bool
 }
 
@@ -350,8 +354,11 @@ type pageWatch struct {
 }
 
 type pageData struct {
-	Watches []pageWatch
-	Token   string // for the acknowledge and name forms
+	Watches   []pageWatch
+	Token     string // for the acknowledge and name forms
+	Score     securityScore
+	Computers []pageComputer // reports from other computers
+	Outages   []string
 }
 
 func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
@@ -424,7 +431,7 @@ func (r *stateReader) page(states []*watchState, now time.Time) []pageWatch {
 			if c.Severity != "" {
 				text = strings.TrimSpace(text[len(c.Severity):])
 			}
-			pw.Changes = append(pw.Changes, pageChange{When: c.Time.Local().Format("Jan 02 15:04"), Severity: c.Severity, Text: text, Key: c.Key(), Acked: acks.matches(c.Key(), now)})
+			pw.Changes = append(pw.Changes, pageChange{When: c.Time.Local().Format("Jan 02 15:04"), Severity: c.Severity, Text: text, Fix: c.Fix, Key: c.Key(), Acked: acks.matches(c.Key(), now)})
 		}
 		for _, f := range w.Snap.Findings {
 			pw.Findings = append(pw.Findings, pageFinding{Severity: f.Severity, Title: f.Title, Detail: f.Detail, Fix: f.Fix, ID: f.ID, Acked: acks.matches(f.ID, now)})
@@ -469,6 +476,10 @@ form.name input{font:13px system-ui,sans-serif;padding:2px 6px;border:1px solid 
 <h1>yaklite</h1>
 <p class="sub">What yaklite has found. Refreshes every minute. Buttons only change yaklite's own settings on this computer. <a href="metrics">Prometheus metrics</a></p>
 {{$tok := .Token}}
+{{if .Watches}}<div class="tiles"><div class="tile"><b class="{{if lt .Score.Score 50}}high{{else if lt .Score.Score 70}}medium{{end}}">{{.Score.Score}}/100</b><span>security score: {{.Score.Grade}} · {{.Score.High}} high, {{.Score.Medium}} medium, {{.Score.Low}} low open problems</span></div></div>
+{{if .Score.Top}}<h2>Fix these first</h2><div class="wrap"><table>{{range .Score.Top}}<tr><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Title}}{{if .Fix}}<br><span class="fix">What to do: {{.Fix}}</span>{{end}}</td><td class="nw"><form class="act" method="post" action="ack"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="key" value="{{.ID}}"><button name="for" value="forever">Done / expected</button></form></td></tr>{{end}}</table></div>{{end}}{{end}}
+{{if .Outages}}<h2>Internet outages</h2><div class="wrap"><table>{{range .Outages}}<tr><td>{{.}}</td></tr>{{end}}</table></div>{{end}}
+{{if .Computers}}<h2>Other computers</h2><div class="wrap"><table><tr><th>Computer</th><th>Problems</th></tr>{{range .Computers}}<tr><td><b>{{.Name}}</b><br><span class="muted">{{.OS}} · last report {{.Last}}</span>{{if .Stale}}<br><span class="medium">no report for over 2 days</span>{{end}}</td><td>{{if not .Findings}}<span class="muted">none</span>{{end}}{{range .Findings}}<div><span class="sev {{.Severity}}">{{.Severity}}</span> {{.Title}}{{if .Fix}}<br><span class="fix">Fix: {{.Fix}}</span>{{end}}</div>{{end}}</td></tr>{{end}}</table></div>{{end}}
 {{if not .Watches}}<p>No snapshots yet. Run <code>yaklite watch</code> first.</p>{{end}}
 {{range .Watches}}
 <h2>{{.Name}}</h2>
@@ -495,7 +506,7 @@ form.name input{font:13px system-ui,sans-serif;padding:2px 6px;border:1px solid 
 {{end}}</table></div>{{end}}
 <h2>Recent changes</h2>
 {{if .Changes}}<div class="wrap"><table><tr><th>When</th><th>Severity</th><th>Change</th><th></th></tr>
-{{range .Changes}}<tr class="{{if .Acked}}acked{{end}}"><td class="muted nw">{{.When}}</td><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Text}}</td><td class="nw">{{if or (eq .Severity "high") (eq .Severity "medium")}}{{if .Acked}}<span class="muted">acknowledged</span>{{else}}<form class="act" method="post" action="ack"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="key" value="{{.Key}}"><button name="for" value="forever">I know</button><button name="for" value="1w">Snooze</button></form>{{end}}{{end}}</td></tr>
+{{range .Changes}}<tr class="{{if .Acked}}acked{{end}}"><td class="muted nw">{{.When}}</td><td><span class="sev {{.Severity}}">{{.Severity}}</span></td><td>{{.Text}}{{if and .Fix (not .Acked) (or (eq .Severity "high") (eq .Severity "medium"))}}<br><span class="fix">What to do: {{.Fix}}</span>{{end}}</td><td class="nw">{{if or (eq .Severity "high") (eq .Severity "medium")}}{{if .Acked}}<span class="muted">acknowledged</span>{{else}}<form class="act" method="post" action="ack"><input type="hidden" name="token" value="{{$tok}}"><input type="hidden" name="key" value="{{.Key}}"><button name="for" value="forever">I know</button><button name="for" value="1w">Snooze</button></form>{{end}}{{end}}</td></tr>
 {{end}}</table></div>{{else}}<p class="muted">No changes recorded yet.</p>{{end}}
 {{end}}
 </main></body></html>`))
@@ -572,7 +583,9 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		pageTmpl.Execute(w, pageData{Watches: r.page(states, time.Now()), Token: token})
+		now := time.Now()
+		pageTmpl.Execute(w, pageData{Watches: r.page(states, now), Token: token, Score: computeScore(states, r.inv, loadAcks(), now),
+			Computers: r.computers(now), Outages: recentOutages(r.dir, now, 5)})
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 		states, err := r.load()
@@ -624,6 +637,16 @@ func newWebHandler(r *stateReader, password string) http.Handler {
 		if !hostAllowed(req.Host, password != "") {
 			// a page on another site that rebinds its name to 127.0.0.1
 			http.Error(w, "unexpected Host header", http.StatusForbidden)
+			return
+		}
+		if req.URL.Path == "/api/report" {
+			// other computers authenticate with the report token, not the
+			// dashboard password or the page's form token
+			if req.Method != http.MethodPost {
+				http.Error(w, "not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			handleReport(r.dir, r.reportToken, w, req)
 			return
 		}
 		switch req.Method {
@@ -681,7 +704,10 @@ func hostAllowed(host string, hasPassword bool) bool {
 func startWeb(addr string, r *stateReader) (*http.Server, error) {
 	password := os.Getenv("YAKLITE_WEB_PASSWORD")
 	if !isLoopback(addr) && password == "" {
-		return nil, errors.New("--listen on a non-loopback address needs YAKLITE_WEB_PASSWORD set (the page is a map of your network)")
+		password = webPassword() // the saved one is for reaching it from elsewhere
+	}
+	if !isLoopback(addr) && password == "" {
+		return nil, errors.New("--listen on a non-loopback address needs a password: set YAKLITE_WEB_PASSWORD or put one in ~/.config/yaklite/web-password (the page is a map of your network)")
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -755,4 +781,46 @@ func apiSummary(states []*watchState, acks *acksFile, now time.Time) summaryJSON
 		s.Status = "ok"
 	}
 	return s
+}
+
+func webPasswordPath() string { return filepath.Join(configDir(), "web-password") }
+
+// webPassword is YAKLITE_WEB_PASSWORD, or the password saved in the config
+// directory (created by serve --tailscale).
+func webPassword() string {
+	if p := os.Getenv("YAKLITE_WEB_PASSWORD"); p != "" {
+		return p
+	}
+	if data, err := os.ReadFile(webPasswordPath()); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	return ""
+}
+
+// ensureWebPassword creates a random dashboard password if none is set.
+func ensureWebPassword() (string, bool, error) {
+	if p := webPassword(); p != "" {
+		return p, false, nil
+	}
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "", false, err
+	}
+	p := hex.EncodeToString(b)
+	os.MkdirAll(configDir(), 0o700)
+	return p, true, writeFilePrivate(webPasswordPath(), []byte(p+"\n"))
+}
+
+// tailscaleAddr finds this computer's Tailscale address (100.64.0.0/10).
+func tailscaleAddr() string {
+	ifaces, _ := net.Interfaces()
+	for _, ifc := range ifaces {
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && isCGNAT(ipn.IP) {
+				return ipn.IP.String()
+			}
+		}
+	}
+	return ""
 }

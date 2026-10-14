@@ -278,6 +278,11 @@ func cmdAuto(ctx context.Context, args []string) error {
 			}
 			prog("running checks")
 			runChecks(ctx, &checkEnv{net: n, trusted: known.Trusted, snap: snap, stateDir: o.stateDir, prog: prog, opts: o.checks, inAuto: true, inv: ac.inv}, nil)
+			if t := loadReportTarget(); t != nil {
+				if err := sendReport(ctx, t.To, t.Token, snap); err != nil {
+					prog("could not report to %s: %v", t.To, err)
+				}
+			}
 			return snap, nil
 		}
 	}
