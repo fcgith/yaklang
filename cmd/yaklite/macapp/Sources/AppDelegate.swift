@@ -280,8 +280,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.problem = "Could not start a check."
             }
             // a check takes a little while; look again after it
-            Timer.scheduledTimer(timeInterval: 45, target: self, selector: #selector(self.checkDone),
-                                 userInfo: nil, repeats: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+                self?.checkDone()
+            }
         }
     }
 
