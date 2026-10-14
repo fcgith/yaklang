@@ -92,6 +92,7 @@ func macSelfCheck(ctx context.Context, run runner) []*Finding {
 			Fix:   "Turn it off in System Settings > Users & Groups."})
 	}
 	out = append(out, macExtraSelfCheck(ctx, run, time.Now(), fileExists)...)
+	out = append(out, browserSafetyFindings(ctx, run, realHostOS())...)
 	return out
 }
 

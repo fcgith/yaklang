@@ -266,6 +266,7 @@ func collectHostItems(ctx context.Context, h *hostOS) []hostItem {
 	}
 	items = append(items, cronItems(ctx, h)...)
 	items = append(items, extensionItems(ctx, h)...)
+	items = append(items, round5HostItems(ctx, h)...)
 	sort.Slice(items, func(i, j int) bool { return items[i].id() < items[j].id() })
 	return items
 }
