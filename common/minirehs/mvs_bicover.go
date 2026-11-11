@@ -30,7 +30,7 @@ func computeLitBiCover(expr string, lits []string) map[string]litBiCover {
 	if len(lits) == 0 {
 		return out
 	}
-	re, err := syntax.Parse(expr, syntax.Perl)
+	re, err := parseRegexSyntax(expr, syntax.Perl)
 	if err != nil {
 		return out
 	}
@@ -81,15 +81,15 @@ func (a *biCoverAcc) record(lit string, litLen, pre int, preB bool, suf int, suf
 func (a *biCoverAcc) walk(re *syntax.Regexp, pre int, preB bool, suf int, sufB bool) {
 	switch re.Op {
 	case syntax.OpLiteral:
-		s := asciiLowerString(string(re.Rune))
-		if _, ok := a.set[s]; ok {
-			a.record(s, len(string(re.Rune)), pre, preB, suf, sufB)
-		}
+		literalTriggerBounds(re, a.set, func(lit string, head, tail int) { a.record(lit, head, pre, preB, addSat(suf, tail), sufB) })
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
 			a.walk(re.Sub[0], pre, preB, suf, sufB)
 		}
 	case syntax.OpConcat:
+		if compileWidthFactsEnabled && len(re.Sub) >= 8 && a.walkConcatFacts(re, pre, preB, suf, sufB) {
+			return
+		}
 		k := len(re.Sub)
 		for i, sub := range re.Sub {
 			lw, lb := sumWidthRange(re.Sub, 0, i)

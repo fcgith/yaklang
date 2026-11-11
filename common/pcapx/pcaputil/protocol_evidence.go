@@ -2,6 +2,7 @@ package pcaputil
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"github.com/gopacket/gopacket"
@@ -28,10 +29,29 @@ type ByteSource struct {
 	ParentPDU  uint64
 	ParentPDUs []uint64
 	PacketRefs []PacketReference
+	// CompletedIn is the latest numbered byte contributor of a complete
+	// decoded observation, not necessarily the frame where another dissector
+	// chooses to display it or the later time when context became available.
+	CompletedIn *PacketReference `json:",omitempty"`
 }
 type captureEvidence struct {
-	Ref  PacketReference
-	refs []PacketReference
+	byteSourceKind string
+	carrierLayers  []string
+	parents        []uint64
+	carrierOwned   bool // refs retain physical domains after pseudowire normalization
+	// Header layers removed by validated tunnel normalization / IP reassembly.
+	// Names carry no synthetic byte offsets or application identity.
+	networkPrefix        []gopacket.LayerType
+	networkPrefixLimited bool
+	tcpMissingTail       uint32 // validated captured TCP payload suffix; no invented bytes
+	tcpACK               uint32 // ACK on this byte contributor, never a later packet's ACK
+	tcpACKKnown          bool
+	Ref                  PacketReference
+	refs                 []PacketReference
+	// Applies to the current IP packet, not an outer tunnel carrier.
+	ipv6Fragment bool
+	// Count normalization across reconstructed outer/inner fragment layers.
+	normalizedTunnels int
 }
 
 func evidenceFrom(ci gopacket.CaptureInfo) captureEvidence {
@@ -54,26 +74,95 @@ func withEvidence(ci gopacket.CaptureInfo, e captureEvidence) gopacket.CaptureIn
 }
 func packetEvidence(p gopacket.Packet) captureEvidence {
 	e := evidenceFrom(p.Metadata().CaptureInfo)
-	outer := ""
+	outer, directionalOuter := "", ""
+	ethernetPeers := ""
 	for _, l := range p.Layers() {
+		// A generic decoder can expose apparent children behind a parent
+		// whose native profile is unselected. Their VLAN/SID bytes cannot
+		// become part of the capture-session identity.
+		if unselectedEtherIPLayer(l) {
+			break
+		}
 		if n, ok := l.(gopacket.NetworkLayer); ok {
 			a, b := n.NetworkFlow().Src().String(), n.NetworkFlow().Dst().String()
+			directionalOuter = a + ">" + b
 			if a > b {
 				a, b = b, a
 			}
 			outer = a + "~" + b
 		}
 		switch v := l.(type) {
+		case *layers.Ethernet:
+			// RFC 2516 scopes Session ID to the Ethernet source/destination
+			// pair. Keep the nearest Ethernet after any tunnel normalization.
+			ethernetPeers = ""
+			if len(v.SrcMAC) == 6 && len(v.DstMAC) == 6 {
+				src, dst := v.SrcMAC.String(), v.DstMAC.String()
+				if src > dst {
+					src, dst = dst, src
+				}
+				ethernetPeers = src + "~" + dst
+			}
+		case *layers.LinuxSLL, *layers.LinuxSLL2:
+			ethernetPeers = "" // One cooked link address is not a peer pair.
+		case *capturePIM:
+			if v.Type == 1 && !v.NullRegister && v.ChecksumVerified && v.MessageExtentComplete {
+				e.Ref.Domain.Encapsulation += "/pim-register:" + outer
+			}
+		case *captureERSPAN3:
+			e.Ref.Domain.Encapsulation += fmt.Sprintf("/erspan3:%d:%d:%t:%d:%d", v.SessionID, v.HardwareID, v.OptionalPlatform, v.PlatformID, v.SourceIndex)
+			if v.PlatformID == 1 && v.OptionalPlatform {
+				e.Ref.Domain.Encapsulation += fmt.Sprintf(":vsm%d", binary.BigEndian.Uint32(v.contents[12:])&0xfff)
+			}
+		case *captureMPacket:
+			e.Ref.Domain.Encapsulation += "/mpacket:express"
+		case *layers.PPPoE:
+			if ethernetPeers != "" {
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/pppoe:%s:%d", ethernetPeers, v.SessionId)
+			} else {
+				// Header observations retain the literal SID. Native ingress
+				// refuses capture-session ownership without the peer pair.
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/pppoe:%d", v.SessionId)
+			}
+		case *layers.IPv6:
+			if v.NextHeader == layers.IPProtocolIPv4 || v.NextHeader == layers.IPProtocolIPv6 {
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/ip6-tunnel:%s:%d", outer, v.NextHeader)
+			}
+		case *capturePPILayer:
+			e.Ref.Domain.Encapsulation += "/ppi:ethernet"
+			if v.aggregation {
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/aggregation:%d", v.interfaceID)
+			}
 		case *layers.Dot1Q:
 			e.Ref.Domain.Encapsulation += fmt.Sprintf("/vlan:%d", v.VLANIdentifier)
 		case *layers.VXLAN:
-			e.Ref.Domain.Encapsulation += fmt.Sprintf("/vxlan:%s:%d", outer, v.VNI)
+			if len(v.LayerContents()) >= 7 {
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/vxlan:%s:%d", outer, v.VNI)
+			}
+		case *captureVXLANGPE:
+			h := v.LayerContents()
+			vni := uint32(h[4])<<16 | uint32(h[5])<<8 | uint32(h[6])
+			e.Ref.Domain.Encapsulation += fmt.Sprintf("/vxlan-gpe:%s:%d", outer, vni)
 		case *layers.GRE:
-			e.Ref.Domain.Encapsulation += fmt.Sprintf("/gre:%s:%d", outer, v.Key)
+			if directionalOuter != "" && selectedPPTPGRE(v) {
+				// RFC 2637 divides Key into changing Payload Length and the
+				// receiver's Call ID. Missing call-control traffic does not
+				// authorize pairing the peers' independently assigned IDs.
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/pptp:%s:%d", directionalOuter, uint16(v.Key))
+			} else {
+				e.Ref.Domain.Encapsulation += fmt.Sprintf("/gre:%s:%d", outer, v.Key)
+			}
 		case *layers.Geneve:
 			e.Ref.Domain.Encapsulation += fmt.Sprintf("/geneve:%s:%d", outer, v.VNI)
+			if !selectedGeneve(v) {
+				return e // Keep its literal outer VNI, never unselected child IDs.
+			}
 		case *layers.IPv4:
-			e.Ref.Domain.Encapsulation += ipEncapsulation(v.Protocol, outer)
+			// A fragmented outer packet has no decoded inner carrier yet. Defer
+			// that domain suffix until reassembly instead of applying it twice.
+			if v.FragOffset == 0 && v.Flags&layers.IPv4MoreFragments == 0 {
+				e.Ref.Domain.Encapsulation += ipEncapsulation(v.Protocol, outer)
+			}
 		}
 	}
 	return e
@@ -90,6 +179,16 @@ func ipEncapsulation(protocol layers.IPProtocol, outer string) string {
 	}
 }
 func (e *ProtocolEvent) finalizeEvidence() {
+	e.normalizeKerberosContext()
+	e.SourceBytes.CompletedIn = nil
+	if (e.Status == "decoded" || e.Status == "deferred") && len(e.Raw) > 0 {
+		for _, ref := range e.SourceBytes.PacketRefs {
+			if ref.Number != 0 && (e.SourceBytes.CompletedIn == nil || ref.Number > e.SourceBytes.CompletedIn.Number) {
+				owned := ref
+				e.SourceBytes.CompletedIn = &owned
+			}
+		}
+	}
 	if e.Profile == "" {
 		e.Profile = e.Protocol
 	}
@@ -128,22 +227,38 @@ func (e *ProtocolEvent) finalizeEvidence() {
 	}
 }
 func cloneEvidence(e *ProtocolEvent) {
+	if e.SourceBytes.CompletedIn != nil {
+		owned := *e.SourceBytes.CompletedIn
+		e.SourceBytes.CompletedIn = &owned
+	}
+	e.CarrierLayers = append([]string(nil), e.CarrierLayers...)
 	e.SourceBytes.ParentPDUs = append([]uint64(nil), e.SourceBytes.ParentPDUs...)
 	e.SourceBytes.PacketRefs = append([]PacketReference(nil), e.SourceBytes.PacketRefs...)
 }
 
 type contribution struct {
-	start, end uint64
-	ref        PacketReference
-	parent     uint64
+	start, end  uint64
+	ref         PacketReference
+	parent      uint64
+	tcpACK      uint32
+	tcpACKKnown bool
 }
 
-func (f *binFlow) contribute(dir int, n int, ref PacketReference) {
+func (f *binFlow) contributeCaptured(dir, n int, ref PacketReference, evidence captureEvidence, parent ...uint64) {
+	d := &f.directions[dir]
+	before := len(d.contributions)
+	f.contribute(dir, n, ref, parent...)
+	if len(d.contributions) > before {
+		d.contributions[before].tcpACK, d.contributions[before].tcpACKKnown = evidence.tcpACK, evidence.tcpACKKnown
+	}
+}
+
+func (f *binFlow) contribute(dir int, n int, ref PacketReference, parent ...uint64) {
 	if n == 0 {
 		return
 	}
 	d := &f.directions[dir]
-	if ref.Number == 0 {
+	if ref.Number == 0 && (len(parent) == 0 || parent[0] == 0) {
 		d.evidenceLimited = true
 		return
 	}
@@ -158,9 +273,16 @@ func (f *binFlow) contribute(dir int, n int, ref PacketReference) {
 		f.a.buffered.Add(-80)
 		return
 	}
-	d.contributions = append(d.contributions, contribution{start: start, end: end, ref: ref})
+	item := contribution{start: start, end: end, ref: ref}
+	if len(parent) > 0 {
+		item.parent = parent[0]
+	}
+	d.contributions = append(d.contributions, item)
 }
 func (f *binFlow) eventEvidence(dir int, e *ProtocolEvent) {
+	if len(f.captureCarriers) > 0 {
+		e.CarrierLayers = append(append([]string(nil), f.captureCarriers...), e.CarrierLayers...)
+	}
 	e.Domain = f.domain
 	e.SourceBytes.Kind = f.byteSource
 	e.SourceBytes.ParentPDU = f.parentID
@@ -177,6 +299,12 @@ func (f *binFlow) eventEvidence(dir int, e *ProtocolEvent) {
 				e.SourceBytes.PacketRefs = append(e.SourceBytes.PacketRefs, s.ref)
 			}
 		}
+	}
+	// Context discovery can release bytes queued in the opposite direction.
+	// The latest connection-wide parent is not necessarily this message's
+	// contributor. Keep the scalar link consistent with its byte provenance.
+	if len(e.SourceBytes.ParentPDUs) != 0 {
+		e.SourceBytes.ParentPDU = e.SourceBytes.ParentPDUs[len(e.SourceBytes.ParentPDUs)-1]
 	}
 	if d.evidenceLimited {
 		e.ExpertCode = "PacketReferencesLimited"
@@ -227,26 +355,142 @@ func CapturePacketReference(ci gopacket.CaptureInfo) PacketReference { return ev
 // PacketEventIDs finds retained PDUs contributed by this packet, including
 // PDUs completed by later packets. Evicted history is deliberately unavailable.
 func (v *ProtocolInspector) PacketEventIDs(ref PacketReference, limit int) []uint64 {
+	return v.packetEventIDs(ref, limit, false)
+}
+
+// PhysicalPacketEventIDs finds all retained PDUs contributing to a capture
+// record, including an encapsulation discovered after outer reassembly. It
+// ignores Encapsulation but preserves section/interface. Use only when record
+// numbers are globally unique in that capture, as assigned by CaptureReader.
+// PacketEventIDs retains exact domain matching for caller-supplied references.
+func (v *ProtocolInspector) PhysicalPacketEventIDs(ref PacketReference, limit int) []uint64 {
+	return v.packetEventIDs(ref, limit, true)
+}
+func (v *ProtocolInspector) packetEventIDs(ref PacketReference, limit int, physical bool) []uint64 {
+	ids, _ := v.packetEventWindow(ref, limit, physical)
+	return ids
+}
+
+// PacketEventWindow returns up to 128 retained arrival IDs and whether the
+// window covers the known contributor arrivals and their Details binding.
+// Detail eviction, identity-index loss and duplicate-ID ambiguity are partial,
+// even on a packet's first query. Consumers must not infer absent fields.
+// physical has the same globally unique record contract as PhysicalPacketEventIDs.
+func (v *ProtocolInspector) PacketEventWindow(ref PacketReference, physical bool) (ids []uint64, complete bool) {
+	return v.packetEventWindow(ref, 128, physical)
+}
+
+func (v *ProtocolInspector) packetEventWindow(ref PacketReference, limit int, physical bool) ([]uint64, bool) {
 	if limit <= 0 || limit > 128 {
 		limit = 128
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	var ids []uint64
+	if physical {
+		ref = physicalReference(ref)
+	}
+	if v.unindexed == 0 {
+		entries := v.byPacket[ref]
+		if physical {
+			entries = v.byPhysical[ref]
+		}
+		for _, row := range entries {
+			ids = append(ids, row.ID)
+			if len(ids) >= limit {
+				break
+			}
+		}
+		return ids, len(entries) <= limit && v.packetDetailCoverageLocked(ref, physical)
+	}
 	for i := 0; i < v.count; i++ {
 		row := v.rows[(v.head+i)%len(v.rows)]
 		if row == nil {
 			continue
 		}
 		for _, r := range row.SourceBytes.PacketRefs {
+			if physical {
+				r = physicalReference(r)
+			}
 			if r == ref {
+				if len(ids) == limit {
+					return ids, false
+				}
 				ids = append(ids, row.ID)
 				break
 			}
 		}
-		if len(ids) >= limit {
+	}
+	return ids, v.packetDetailCoverageLocked(ref, physical)
+}
+
+// CapturePacketEvidence includes the packet's observed encapsulation domain.
+// It preserves the original capture-record number through decoding.
+func CapturePacketEvidence(packet gopacket.Packet) PacketReference { return packetEvidence(packet).Ref }
+
+// CapturePacketReferences also includes contributors to network reassembly.
+func CapturePacketReferences(packet gopacket.Packet) []PacketReference {
+	e := packetEvidence(packet)
+	if len(e.refs) > 0 {
+		return append([]PacketReference(nil), e.refs...)
+	}
+	if e.Ref.Number == 0 {
+		return nil
+	}
+	return []PacketReference{e.Ref}
+}
+
+const maxCaptureTransportLayers = 128
+
+func (e *captureEvidence) preserveNetworkPrefix(packet gopacket.Packet, until gopacket.Layer) {
+	if e.networkPrefixLimited {
+		return
+	}
+	prefix := append([]gopacket.LayerType(nil), e.networkPrefix...)
+	for _, layer := range packet.Layers() {
+		if layer == until {
+			break
+		}
+		if layer.LayerType() == gopacket.LayerTypePayload || layer.LayerType() == gopacket.LayerTypeDecodeFailure {
+			continue
+		}
+		if len(prefix) >= maxCaptureTransportLayers {
+			e.networkPrefix = nil
+			e.networkPrefixLimited = true
+			return
+		}
+		prefix = append(prefix, layer.LayerType())
+	}
+	e.networkPrefix = prefix
+}
+
+// CaptureTransportLayers returns owned names of actual header layers through
+// the selected transport, including envelopes removed by network reassembly.
+// False completeness exposes the bounded name projection's limit; it neither
+// prevents native processing nor implies transport payload acceptance.
+func CaptureTransportLayers(packet gopacket.Packet) ([]string, bool) {
+	if packet == nil {
+		return nil, false
+	}
+	e := packetEvidence(packet)
+	_, transport := CaptureTransport(packet)
+	if transport == nil {
+		return nil, false
+	}
+	out := make([]string, 0, len(e.networkPrefix)+8)
+	for _, typ := range e.networkPrefix {
+		out = append(out, typ.String())
+	}
+	for _, layer := range packet.Layers() {
+		if layer.LayerType() != gopacket.LayerTypePayload && layer.LayerType() != gopacket.LayerTypeDecodeFailure {
+			if len(out) >= maxCaptureTransportLayers {
+				return out, false
+			}
+			out = append(out, layer.LayerType().String())
+		}
+		if layer == transport {
 			break
 		}
 	}
-	return ids
+	return out, !e.networkPrefixLimited
 }

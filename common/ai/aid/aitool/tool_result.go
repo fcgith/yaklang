@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"sync"
+
+	"github.com/yaklang/yaklang/common/schema"
 )
 
 // combinedBuffer is a thread-safe buffer that captures stdout and stderr
@@ -92,6 +94,9 @@ func (r *ToolExecutionResult) GetJSONSchemaString() string {
 }
 
 func (t *Tool) ExecuteToolWithCapture(ctx context.Context, params map[string]any, config *ToolInvokeConfig) (*ToolExecutionResult, error) {
+	if err := schema.AIToolDeprecationError(t.Name); err != nil {
+		return nil, err
+	}
 	runtimeConfig := config.GetRuntimeConfig()
 	stdout, stderr := config.GetStdout(), config.GetStderr()
 	cancelCallback := config.GetCancelCallback()
@@ -153,6 +158,12 @@ func (t *Tool) ExecuteToolWithCapture(ctx context.Context, params map[string]any
 	var err error
 	select {
 	case <-ctx.Done():
+		if config != nil && config.waitForCallbackOnCancel {
+			// Preserve writer ownership until callback work and cleanup really end.
+			// The cancelled result remains a cancellation, even if the callback
+			// returned a value while unwinding.
+			<-finished
+		}
 		// Do not read callback-owned buffers or result variables while a
 		// non-cooperative callback may still be unwinding. Context-aware tools
 		// return promptly; the buffered channel lets that goroutine exit even if

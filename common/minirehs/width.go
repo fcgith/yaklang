@@ -1,6 +1,11 @@
 package minirehs
 
-import "regexp/syntax"
+import (
+	"regexp/syntax"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // maxByteWidth 估算一条 RE2 正则单次命中可能跨越的最大字节数, 并报告是否"有界".
 // 用于邻域验证: 有界宽度的 pattern 在字面量命中点附近的小窗口内验证即可, 无需全量扫描.
@@ -12,7 +17,10 @@ import "regexp/syntax"
 func maxByteWidth(re *syntax.Regexp) (w int, bounded bool) {
 	switch re.Op {
 	case syntax.OpLiteral:
-		return len(string(re.Rune)), true
+		for _, r := range re.Rune {
+			w += maxRuneByteWidth(r, re.Flags)
+		}
+		return w, true
 
 	case syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
 		return 4, true // 单个字符 UTF-8 最长 4 字节
@@ -73,6 +81,61 @@ func maxByteWidth(re *syntax.Regexp) (w int, bounded bool) {
 
 	default:
 		return 0, false
+	}
+}
+
+func maxRuneByteWidth(r rune, flags syntax.Flags) int {
+	n := utf8.RuneLen(r)
+	if flags&syntax.FoldCase != 0 {
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if size := utf8.RuneLen(f); size > n {
+				n = size
+			}
+		}
+	}
+	return n
+}
+
+// A safe trigger can be a fragment of a folded AST literal. Visit every
+// occurrence, retaining the greatest byte widths on either side. Source-byte
+// offsets index the prefix table; values include the entire Unicode fold orbit.
+func literalTriggerBounds(re *syntax.Regexp, set map[string]struct{}, record func(string, int, int)) {
+	s := asciiLowerString(string(re.Rune))
+	if len(set) == 1 {
+		if _, ok := set[s]; ok {
+			width, _ := maxByteWidth(re)
+			record(s, width, 0)
+			return
+		}
+	}
+	prefix := make([]int, len(s)+1)
+	for i, r := range s {
+		prefix[i+utf8.RuneLen(r)] = prefix[i] + maxRuneByteWidth(r, re.Flags)
+	}
+	for lit := range set {
+		if lit == "" {
+			continue
+		}
+		head, tail, found := 0, 0, false
+		for off := 0; off <= len(s)-len(lit); {
+			i := strings.Index(s[off:], lit)
+			if i < 0 {
+				break
+			}
+			i += off
+			end := i + len(lit)
+			if prefix[end] > head {
+				head = prefix[end]
+			}
+			if remaining := prefix[len(s)] - prefix[end]; remaining > tail {
+				tail = remaining
+			}
+			found = true
+			off = i + 1
+		}
+		if found {
+			record(lit, head, tail)
+		}
 	}
 }
 

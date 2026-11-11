@@ -1,23 +1,31 @@
 package pcaputil
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strings"
 	"unicode/utf16"
+
+	"github.com/yaklang/yaklang/common/bin-parser/parser/stream_parser"
+	"github.com/yaklang/yaklang/common/log"
 )
 
 // binSMB2 is the M0 session state for SMB2/SMB3 over Direct TCP. Dialect
 // comes from NEGOTIATE. Encrypted transform headers are a boundary, not
 // decryption. Ports including 445 are never consulted.
 type binSMB2 struct {
-	flow    *binFlow
-	client  int
-	dialect uint16
-	pending map[smb2PendingKey]smb2Pending
-	async   map[smb2AsyncKey]smb2PendingKey
-	files   map[smb2FileKey]string
+	flow       *binFlow
+	client     int
+	dialect    uint16
+	pending    map[smb2PendingKey]smb2Pending
+	async      map[smb2AsyncKey]smb2PendingKey
+	files      map[smb2FileKey]string
+	smb1       *smb1NegotiateState
+	smb1Setup  *smb1SetupState
+	smb1Legacy *smb1LegacyState
+	smb1Modern bool
 }
 
 type smb2PendingKey struct {
@@ -38,24 +46,59 @@ type smb2FileKey struct {
 }
 
 type smb2Pending struct {
-	key          smb2PendingKey
-	name         string
-	path         string
-	fileID       string
-	related      bool
-	direction    int
-	hasDirection bool
-	asyncID      uint64
-	async        bool
+	key               smb2PendingKey
+	name              string
+	path              string
+	target            string
+	fileID            string
+	related           bool
+	direction         int
+	hasDirection      bool
+	asyncID           uint64
+	async             bool
+	chain             *smb2RequestChain
+	ordinal           int
+	queryInfo         smb2QueryInfoSelector
+	directoryClass    uint8
+	hasDirectoryClass bool
+}
+
+type smb2QueryInfoSelector struct {
+	infoType, fileInfoClass uint8
+	outputLength            uint32
+	additionalInformation   uint32
+	flags                   uint32
+}
+
+// A chain belongs to one observed request PDU and is retained only by that
+// PDU's outstanding requests. Pointer identity cannot collide with another
+// PDU, flow, TCP generation, interface or VLAN. Results are bounded by size.
+type smb2RequestChain struct {
+	size    int
+	results map[int]smb2CompoundResult
+}
+
+type smb2CompoundResult struct {
+	fileID, path string
+	messageID    uint64
+	fileSourceID uint64
+	status       uint32
+}
+
+type smb2CompoundLink struct {
+	chain   *smb2RequestChain
+	ordinal int
 }
 
 const (
-	smb2Magic       = 0x424d53fe
-	smb3Transform   = 0x424d53fd
-	smb2HeaderSize  = 64
-	smb2FlagResp    = 0x00000001
-	smb2FlagAsync   = 0x00000002
-	smb2FlagRelated = 0x00000004
+	smb2Magic                 = 0x424d53fe
+	smb3Transform             = 0x424d53fd
+	smb2CompressionTransform  = 0x424d53fc // on-wire FC 53 4D 42 (0xFC534D42 in byte order)
+	smb2CompressionHeaderSize = 16
+	smb2HeaderSize            = 64
+	smb2FlagResp              = 0x00000001
+	smb2FlagAsync             = 0x00000002
+	smb2FlagRelated           = 0x00000004
 )
 
 func probeSMB2(w []byte, limit int) ProbeResult {
@@ -66,7 +109,7 @@ func probeSMB2(w []byte, limit int) ProbeResult {
 		return probeNeed("smb2", "2/3", len(w), 8)
 	}
 	n := smb2DirectLength(w)
-	if n < 52 || n > 1<<20 {
+	if n < smb2CompressionHeaderSize || n > 1<<20 {
 		return ProbeResult{Verdict: ProbeReject}
 	}
 	magic := binary.LittleEndian.Uint32(w[4:8])
@@ -75,13 +118,37 @@ func probeSMB2(w []byte, limit int) ProbeResult {
 		if n < smb2HeaderSize {
 			return ProbeResult{Verdict: ProbeReject}
 		}
+		if len(w) < 4+smb2HeaderSize {
+			return probeNeed("smb2", "2/3", len(w), 4+smb2HeaderSize)
+		}
+		if binary.LittleEndian.Uint16(w[8:10]) != smb2HeaderSize {
+			return ProbeResult{Verdict: ProbeReject}
+		}
+		next := uint64(binary.LittleEndian.Uint32(w[24:28]))
+		if next != 0 && (next < smb2HeaderSize || next%8 != 0 || next+64 > uint64(n)) {
+			return ProbeResult{Verdict: ProbeReject}
+		}
 		_ = limit
 		return probeAccept("smb2", "2/3", 94)
 	case smb3Transform:
 		if n <= 52 {
 			return ProbeResult{Verdict: ProbeReject}
 		}
+		if len(w) < 56 {
+			return probeNeed("smb2", "3-transform", len(w), 56)
+		}
+		if binary.LittleEndian.Uint16(w[44:46]) != 0 || binary.LittleEndian.Uint16(w[46:48]) != 1 || binary.LittleEndian.Uint32(w[40:44]) != uint32(n-52) {
+			return ProbeResult{Verdict: ProbeReject}
+		}
 		return probeAccept("smb2", "3-transform", 90)
+	case smb2CompressionTransform:
+		if n < smb2CompressionHeaderSize {
+			return ProbeResult{Verdict: ProbeReject}
+		}
+		if len(w) < 4+smb2CompressionHeaderSize {
+			return probeNeed("smb2", "3.1.1-compression", len(w), 4+smb2CompressionHeaderSize)
+		}
+		return probeAccept("smb2", "3.1.1-compression", 88)
 	default:
 		return ProbeResult{Verdict: ProbeReject}
 	}
@@ -95,12 +162,18 @@ func smb2DirectLength(w []byte) int {
 }
 
 func (f *binFlow) frameSMB2(w []byte) (int, *binSpec, error) {
+	if f.nbss && len(w) > 0 && w[0] != 0 {
+		return f.frameNBSS(0, w)
+	}
 	s := f.smb2
 	if s == nil {
 		return 0, nil, sessionContext("SMB2 session was not observed")
 	}
 	s.flow = f
 	if err := s.reserveState(0); err != nil {
+		if f.protocol == "smb" {
+			return 0, nil, smb1ResourceRefusal(err)
+		}
 		return 0, nil, err
 	}
 	if len(w) < 4 {
@@ -110,8 +183,8 @@ func (f *binFlow) frameSMB2(w []byte) (int, *binSpec, error) {
 		return 0, nil, fmt.Errorf("smb2: Direct TCP zero byte required")
 	}
 	n := smb2DirectLength(w)
-	if n < 52 {
-		return 0, nil, fmt.Errorf("smb2: Direct TCP length smaller than transform header")
+	if n < 4 {
+		return 0, nil, fmt.Errorf("smb: Direct TCP length smaller than signature")
 	}
 	total := 4 + n
 	if total > f.a.config.MaxMessageBytes {
@@ -122,6 +195,61 @@ func (f *binFlow) frameSMB2(w []byte) (int, *binSpec, error) {
 	}
 	magic := binary.LittleEndian.Uint32(w[4:8])
 	switch magic {
+	case 0x424d53ff:
+		if n >= 35 && smb1SelectedFileCommand(w[8]) {
+			if !boundedSMB1FileEnvelope(w[:total]) {
+				return 0, nil, fmt.Errorf("CIFS file command: WordCount/ByteCount exceed exact DirectTCP boundary")
+			}
+			entry, _, _, _ := smb1FileEntry(w[8], w[13]&0x80 != 0)
+			f.protocol = "smb"
+			return total, f.spec("cifs", entry), nil
+		}
+		if probeSMB1SessionSetupExtended(w[:total], 65598).Verdict == ProbeAccept {
+			f.protocol = "smb"
+			entry := "CIFSDirectTCPSessionSetupExtendedRequest"
+			if w[13]&0x80 != 0 {
+				entry = "CIFSDirectTCPSessionSetupExtendedResponse"
+			}
+			return total, f.spec("cifs", entry), nil
+		}
+		if len(w) >= 39 && total == 39 && w[13]&0x80 != 0 && w[36] == 0 && binary.LittleEndian.Uint16(w[37:39]) == 0 && (w[8] == 0x72 || w[8] == 0x73) {
+			// MS-CIFS 2.2.3.2 failed NEGOTIATE/SESSION_SETUP replies are a
+			// complete WC0/BC0 error layout, not an unsupported handshake.
+			f.protocol = "smb"
+			if w[8] == 0x73 {
+				return total, f.spec("cifs", "CIFSDirectTCPSessionSetupExtendedResponse"), nil
+			}
+			return total, f.spec("cifs", "CIFSDirectTCPNegotiateExtendedResponse"), nil
+		}
+		if n >= 32 && w[8] == 0x73 {
+			return 0, nil, smb1SetupUnsupported(w[:total])
+		}
+		if probeSMB1Negotiate(w[:total], f.a.budget.MaxFrameBytes).Verdict == ProbeAccept {
+			f.protocol = "smb"
+			return total, f.spec("cifs", "CIFSDirectTCP"), nil
+		}
+		if probeSMB1NegotiateExtendedResponse(w[:total], 65608).Verdict == ProbeAccept {
+			f.protocol = "smb"
+			return total, f.spec("cifs", "CIFSDirectTCPNegotiateExtendedResponse"), nil
+		}
+		if n >= 35 && w[8] == 0x72 {
+			fixed := 39 + 2*int(w[36])
+			if total < fixed || int(binary.LittleEndian.Uint16(w[fixed-2:fixed])) != total-fixed {
+				return 0, nil, fmt.Errorf("smb: negotiate WordCount/ByteCount exceed the complete record boundary")
+			}
+		}
+		// Availability of a bounded native profile is separate from wire
+		// validity. Other complete SMB1 commands/response forms stay observable
+		// unsupported records: Direct TCP Length still frames them, so the flow
+		// can continue with the next command instead of stopping.
+		if n >= 32 && w[8] != 0x72 {
+			f.protocol = "smb"
+			return total, &binSpec{rule: "application-layer.cifs", entry: "SMB1UnselectedCommand"}, nil
+		}
+		if n >= 35 && w[13]&0x80 != 0 && (w[36] != 17 || binary.LittleEndian.Uint32(w[9:13]) != 0 || binary.LittleEndian.Uint16(w[14:16])&0x800 == 0 || n >= 56 && binary.LittleEndian.Uint32(w[56:60])&0x80000000 == 0) {
+			return 0, nil, protocolError(ErrUnsupportedFeature, "SMB1 negotiate response form is outside the WC17 extended-security profile")
+		}
+		return 0, nil, fmt.Errorf("smb: unsupported or invalid SMB1 negotiate profile")
 	case smb3Transform:
 		if n < 52 {
 			return 0, nil, fmt.Errorf("smb2: truncated transform header")
@@ -137,7 +265,14 @@ func (f *binFlow) frameSMB2(w []byte) (int, *binSpec, error) {
 		if uint64(ciphertextLen) > uint64(orig) {
 			return 0, nil, fmt.Errorf("smb2: transform ciphertext length disagrees with original size")
 		}
+		f.protocol = "smb2"
 		return total, f.spec("smb3", "SMB3Transform"), nil
+	case smb2CompressionTransform:
+		if n < smb2CompressionHeaderSize {
+			return 0, nil, fmt.Errorf("smb2: truncated compression transform header")
+		}
+		f.protocol = "smb2"
+		return total, f.spec("smb2", "SMB2"), nil
 	case smb2Magic:
 		if n < smb2HeaderSize {
 			return 0, nil, fmt.Errorf("smb2: Direct TCP length smaller than header")
@@ -145,10 +280,42 @@ func (f *binFlow) frameSMB2(w []byte) (int, *binSpec, error) {
 		if binary.LittleEndian.Uint16(w[8:10]) != 64 {
 			return 0, nil, fmt.Errorf("smb2: header StructureSize must be 64")
 		}
+		f.protocol = "smb2"
 		return total, f.spec("smb2", "SMB2"), nil
 	default:
-		return 0, nil, fmt.Errorf("smb2: ProtocolId is not SMB2 or SMB3 transform")
+		return 0, nil, fmt.Errorf("smb2: ProtocolId is not SMB2, SMB3 transform, or SMB2 compression transform")
 	}
+}
+
+// MS-SMB2 2.2.42 fixed compression transform header. The bytes after the
+// 16-byte header stay opaque; this decoder does not decompress them.
+func smb2CompressionTransformFields(payload []byte) (map[string]any, error) {
+	if len(payload) < smb2CompressionHeaderSize {
+		return nil, fmt.Errorf("smb2: truncated compression transform header")
+	}
+	info := map[string]any{}
+	algorithm := binary.LittleEndian.Uint16(payload[8:10])
+	flags := binary.LittleEndian.Uint16(payload[10:12])
+	smb2Literal(info, "Protocol ID", 0, 4, binary.LittleEndian.Uint32(payload[0:4]))
+	smb2Literal(info, "Original Compressed Segment Size", 4, 8, binary.LittleEndian.Uint32(payload[4:8]))
+	smb2Literal(info, "Compression Algorithm", 8, 10, algorithm)
+	smb2Literal(info, "Flags", 10, 12, flags)
+	smb2Literal(info, "Offset", 12, 16, binary.LittleEndian.Uint32(payload[12:16]))
+	reason := "compressed payload is not decompressed"
+	if flags&0x0001 != 0 {
+		reason = "chained compression payload is not decoded"
+	}
+	if len(payload) > smb2CompressionHeaderSize {
+		smb2Literal(info, "Compressed Payload", smb2CompressionHeaderSize, len(payload), bytes.Clone(payload[smb2CompressionHeaderSize:]))
+	}
+	info["Compressed Payload Status"] = "opaque: " + reason
+	info["Packet Name"] = "COMPRESSION_TRANSFORM"
+	info["Content Visibility"] = "opaque"
+	info["Decompression Performed"] = false
+	info["Context Level"] = "opaque"
+	log.Debugf("smb2: compression transform algorithm 0x%04x left opaque; %s", algorithm, reason)
+	smb2OffsetRanges(info, 4)
+	return info, nil
 }
 
 func (s *binSMB2) reserveState(additionalPathBytes int64) error {
@@ -156,14 +323,26 @@ func (s *binSMB2) reserveState(additionalPathBytes int64) error {
 		return nil
 	}
 	var pathBytes int64
+	var chainBytes int64
+	seen := make(map[*smb2RequestChain]bool)
 	for _, pending := range s.pending {
-		pathBytes += int64(len(pending.path))
+		pathBytes += int64(len(pending.path) + len(pending.target))
+		if chain := pending.chain; chain != nil && !seen[chain] {
+			seen[chain] = true
+			chainBytes += int64(chain.size)*128 + 64
+			for _, result := range chain.results {
+				pathBytes += int64(len(result.path))
+			}
+		}
 	}
 	for _, path := range s.files {
 		pathBytes += int64(len(path))
 	}
-	target := int64(256) + int64(len(s.pending)+1)*96 + int64(len(s.async)+1)*32 + int64(len(s.files)+1)*64
-	target += pathBytes + additionalPathBytes
+	// Includes the private chain identity, the retained QUERY_INFO selector,
+	// the observed CREATE target and the QUERY_DIRECTORY class. The per-pending
+	// figure is the merged struct's 168-byte layout rounded up to alignment.
+	target := int64(256) + int64(len(s.pending)+1)*176 + int64(len(s.async)+1)*32 + int64(len(s.files)+1)*64
+	target += pathBytes + chainBytes + additionalPathBytes + s.smb1.ownedBytes() + s.smb1Setup.ownedBytes() + s.smb1Legacy.ownedBytes()
 	return s.flow.reserveSession(target)
 }
 
@@ -192,6 +371,9 @@ func (s *binSMB2) consumeFrom(dir int, raw []byte, max int) (map[string]any, err
 	}
 	payload := raw[4:]
 	magic := binary.LittleEndian.Uint32(payload[:4])
+	if magic == smb2CompressionTransform {
+		return smb2CompressionTransformFields(payload)
+	}
 	if magic == smb3Transform {
 		if len(payload) < 52 {
 			return nil, fmt.Errorf("smb2: truncated transform header")
@@ -228,21 +410,43 @@ func (s *binSMB2) consumeFrom(dir int, raw []byte, max int) (map[string]any, err
 	}
 	info := cmds[0]
 	info["Context Level"] = "observed"
-	if s.dialect != 0 {
-		info["Dialect"] = s.dialect
-		info["Version Name"] = smb2DialectName(s.dialect)
-	}
 	names := make([]string, 0, len(cmds))
-	for _, c := range cmds {
-		names = append(names, fmt.Sprint(c["Packet Name"]))
-		if err := s.associateFrom(c, max, dir); err != nil {
+	links := smb2RequestLinks(cmds)
+	for index, c := range cmds {
+		name, _ := c["Packet Name"].(string)
+		names = append(names, name)
+		if s.dialect != 0 {
+			// Connection observations are not a field in this command. In
+			// particular, never overwrite the current NEGOTIATE's wire value.
+			c["Connection Dialect"] = s.dialect
+			c["Connection Version Name"] = smb2DialectName(s.dialect)
+			if name != "NEGOTIATE" {
+				c["Version Name"] = smb2DialectName(s.dialect)
+			}
+		}
+		if err := s.associateCommand(c, max, dir, links[index]); err != nil {
 			return nil, err
 		}
-		if name, _ := c["Packet Name"].(string); name == "NEGOTIATE" {
+		if name == "NEGOTIATE" && c["Response"] == true && c["Status"] == uint32(0) {
 			if d, ok := c["Dialect"].(uint16); ok && d != 0 {
-				s.dialect = d
-				info["Dialect"] = d
-				info["Version Name"] = smb2DialectName(d)
+				// 0x02ff is the multi-protocol wildcard response. It asks for a
+				// new SMB2 NEGOTIATE and is not a selected session dialect.
+				if d == 0x02ff {
+					c["Dialect Negotiated"], c["SMB2 Negotiate Required"] = false, true
+					// An SMB1 offer has no SMB2 pending entry. Its response can
+					// clear a selection, but a same-direction observation cannot.
+					if c["Association Status"] == "matched" || dir < 0 || dir != s.client {
+						s.dialect = 0
+						c["Dialect Context Updated"] = true
+					} else {
+						c["Dialect Context Updated"] = false
+					}
+				} else if c["Association Status"] == "matched" {
+					s.dialect = d
+					c["Dialect Context Updated"] = true
+				} else {
+					c["Dialect Context Updated"] = false
+				}
 			}
 		}
 	}
@@ -255,6 +459,7 @@ func (s *binSMB2) consumeFrom(dir int, raw []byte, max int) (map[string]any, err
 		info["Compound Count"] = len(cmds)
 		info["Command Names"] = names
 		info["Commands"] = cmds
+		smb2AttachCompoundContext(info)
 	}
 	return info, nil
 }
@@ -264,26 +469,47 @@ func (s *binSMB2) associate(c map[string]any, max int) error {
 }
 
 func (s *binSMB2) associateFrom(c map[string]any, max, dir int) error {
+	return s.associateCommand(c, max, dir, smb2CompoundLink{})
+}
+
+func (s *binSMB2) associateCommand(c map[string]any, max, dir int, link smb2CompoundLink) error {
 	mid, _ := c["Message ID"].(uint64)
 	name, _ := c["Packet Name"].(string)
-	sid, _ := c["Session ID"].(uint64)
-	tid, _ := c["Tree ID"].(uint32)
+	sid, tid := smb2EffectiveIDs(c)
 	asyncID, _ := c["Async ID"].(uint64)
 	resp, _ := c["Response"].(bool)
 	key := smb2PendingKey{sessionID: sid, treeID: tid, messageID: mid}
 	if !resp {
+		if name == "CANCEL" {
+			c["Response Expected"] = false
+			c["Cancellation Target Message ID"] = mid
+			return nil
+		}
 		if len(s.pending) >= max {
 			return protocolError(ErrResourceExceeded, "SMB2 outstanding requests exceed budget")
 		}
 		if _, exists := s.pending[key]; exists {
 			return protocolError(ErrMalformedMessage, "SMB2 MessageId reused within the same session/tree before response")
 		}
-		pending := smb2Pending{key: key, name: name, direction: dir, hasDirection: dir >= 0}
+		pending := smb2Pending{key: key, name: name, direction: dir, hasDirection: dir >= 0, chain: link.chain, ordinal: link.ordinal}
 		pending.path, _ = c["File Name"].(string)
-		pending.related, _ = c["Related File ID Placeholder"].(bool)
+		pending.target, _ = c["Path"].(string)
+		pending.related, _ = c["Related File ID Ignored"].(bool)
+		if name == "QUERY_DIRECTORY" {
+			body := c["Body"].(map[string]any)
+			pending.directoryClass = body["File Information Class"].(uint8)
+			pending.hasDirectoryClass = true
+		}
+		if name == "QUERY_INFO" {
+			body := c["Body"].(map[string]any)
+			pending.queryInfo = smb2QueryInfoSelector{
+				infoType: body["Info Type"].(uint8), fileInfoClass: body["File Info Class"].(uint8),
+				outputLength: body["Output Buffer Length"].(uint32), additionalInformation: body["Additional Information"].(uint32), flags: body["Flags"].(uint32),
+			}
+		}
 		clonePath := false
 		if fileID, ok := c["FileId"].(string); ok && fileID != "" {
-			if related, _ := c["Related File ID Placeholder"].(bool); related {
+			if pending.related {
 				c["File Context Status"] = "related-compound-file-context-is-server-substituted"
 			} else {
 				pending.fileID = fileID
@@ -297,7 +523,11 @@ func (s *binSMB2) associateFrom(c map[string]any, max, dir int) error {
 				}
 			}
 		}
-		if err := s.reserveState(int64(len(pending.path))); err != nil {
+		additional := int64(len(pending.path) + len(pending.target))
+		if link.chain != nil && link.ordinal == 0 {
+			additional += int64(link.chain.size)*128 + 64
+		}
+		if err := s.reserveState(additional); err != nil {
 			return err
 		}
 		if clonePath {
@@ -325,6 +555,28 @@ func (s *binSMB2) associateFrom(c map[string]any, max, dir int) error {
 	c["Association Status"] = "matched"
 	c["Request Session ID"] = pending.key.sessionID
 	c["Request Tree ID"] = pending.key.treeID
+	if name == "QUERY_DIRECTORY" && pending.hasDirectoryClass {
+		// The class is request context. It has no range in this response.
+		c["Request File Information Class"] = pending.directoryClass
+		if c["Error Response"] != true {
+			smb2DecodeMatchedDirectory(c, pending.directoryClass, max)
+		}
+	}
+	if name == "QUERY_INFO" {
+		// These observations belong to the matched request, not this response's
+		// StructureSize bytes. The owning flow already fixes interface/VLAN and
+		// TCP generation; direction and MessageId/session/tree were checked above.
+		c["Request Message ID"] = pending.key.messageID
+		c["Request Info Type"] = pending.queryInfo.infoType
+		c["Request File Info Class"] = pending.queryInfo.fileInfoClass
+		c["Request Additional Information"] = pending.queryInfo.additionalInformation
+		c["Request Query Flags"] = pending.queryInfo.flags
+		c["Request Output Buffer Length"] = pending.queryInfo.outputLength
+		if c["Error Response"] != true {
+			c["Output Content Status"] = "opaque: selector from matched request; typed content not decoded"
+			smb2DecodeMatchedQueryOutput(c, pending.queryInfo)
+		}
+	}
 	if pending.fileID != "" {
 		c["Request File ID"] = pending.fileID
 		if pending.path != "" {
@@ -332,9 +584,19 @@ func (s *binSMB2) associateFrom(c map[string]any, max, dir int) error {
 			c["File Context Status"] = "observed-open"
 		}
 	}
+	if pending.target != "" {
+		c["Request Path"] = pending.target
+	}
+	if pending.path != "" {
+		c["Request File Name"] = pending.path
+	}
+	smb2AttachContext(c)
 	status, _ := c["Status"].(uint32)
 	if status == 0x00000103 { // STATUS_PENDING: preserve until the async final response.
 		if gotID, ok := c["Async ID"].(uint64); ok {
+			if pending.async && pending.asyncID != gotID {
+				return protocolError(ErrMalformedMessage, "SMB2 outstanding request changed its AsyncId")
+			}
 			asyncKey := smb2AsyncKey{sessionID: sid, asyncID: gotID}
 			if oldKey, exists := s.async[asyncKey]; exists && oldKey != pendingKey {
 				return protocolError(ErrMalformedMessage, "SMB2 AsyncId collision within a session")
@@ -354,17 +616,52 @@ func (s *binSMB2) associateFrom(c map[string]any, max, dir int) error {
 		delete(s.async, smb2AsyncKey{sessionID: sid, asyncID: pending.asyncID})
 	}
 
-	if name == "CLOSE" && pending.related {
-		if relatedFileID, _ := c["Related Previous File ID"].(string); relatedFileID != "" {
-			pending.fileID = relatedFileID
-			c["FileId"] = relatedFileID
-			c["Inherited File ID"] = true
+	var fileSourceID = pending.key.messageID
+	if pending.related {
+		c["File Context Status"] = "missing-matched-compound-predecessor"
+		if pending.chain != nil && pending.ordinal > 0 {
+			previous, observed := pending.chain.results[pending.ordinal-1]
+			// A failed READ/WRITE still used its known request FileId. A
+			// failed CREATE never generated one. Keep identity provenance
+			// separate from the predecessor's operation status.
+			if observed && previous.fileID != "" {
+				pending.fileID, pending.path = previous.fileID, previous.path
+				fileSourceID = previous.fileSourceID
+				c["Request File ID"] = pending.fileID
+				c["Inherited File ID"] = true
+				c["File Context Source Message ID"] = fileSourceID
+				c["Related Predecessor Message ID"] = previous.messageID
+				c["Related Predecessor Status"] = previous.status
+				if pending.path != "" {
+					c["File Context"] = pending.path
+				}
+				c["File Context Status"] = "matched-related-request-chain"
+			}
 		}
 	}
-	if name == "CREATE" {
+	retainResult := false
+	if pending.chain != nil {
+		for _, remaining := range s.pending {
+			if remaining.chain == pending.chain {
+				retainResult = true
+				break
+			}
+		}
+		if retainResult {
+			if len(pending.chain.results) >= pending.chain.size {
+				return protocolError(ErrResourceExceeded, "SMB2 compound results exceed observed request chain")
+			}
+			if err := s.reserveState(int64(len(pending.path))); err != nil {
+				return err
+			}
+		}
+	}
+	if name == "CREATE" && status == 0 {
 		fileID, _ := c["FileId"].(string)
 		if fileID != "" {
-			fileKey := smb2FileKey{sessionID: sid, treeID: tid, fileID: fileID}
+			// Async responses have AsyncId instead of TreeId. The matched
+			// request owns the association domain; never invent a header TID.
+			fileKey := smb2FileKey{sessionID: pending.key.sessionID, treeID: pending.key.treeID, fileID: fileID}
 			if len(s.files) >= max && s.files[fileKey] == "" {
 				return protocolError(ErrResourceExceeded, "SMB2 open file contexts exceed budget")
 			}
@@ -372,38 +669,75 @@ func (s *binSMB2) associateFrom(c map[string]any, max, dir int) error {
 			if s.files[fileKey] == "" {
 				pathDelta = int64(len(pending.path))
 			}
+			if retainResult {
+				pathDelta += int64(len(pending.path))
+			}
 			if err := s.reserveState(pathDelta); err != nil {
 				return err
 			}
 			s.files[fileKey] = pending.path
 			c["File Context Status"] = "opened"
+			pending.fileID = fileID
 		}
 	}
 	if name == "CLOSE" && status == 0 {
-		delete(s.files, smb2FileKey{sessionID: sid, treeID: tid, fileID: pending.fileID})
-		c["File Context Status"] = "closed"
+		if pending.fileID != "" {
+			delete(s.files, smb2FileKey{sessionID: pending.key.sessionID, treeID: pending.key.treeID, fileID: pending.fileID})
+			c["File Context Status"] = "closed"
+		} else {
+			c["File Context Status"] = "missing-request-file-context"
+		}
 	}
 	if name == "TREE_DISCONNECT" && status == 0 {
-		s.removeTree(sid, tid)
+		s.removeTree(pending.key.sessionID, pending.key.treeID)
 		c["Tree Context Status"] = "disconnected"
 	}
 	if name == "LOGOFF" && status == 0 {
-		s.removeSession(sid)
+		s.removeSession(pending.key.sessionID)
 		c["Session Context Status"] = "logged-off"
+	}
+	if retainResult {
+		result := smb2CompoundResult{fileID: pending.fileID, path: pending.path, messageID: pending.key.messageID, fileSourceID: fileSourceID, status: status}
+		pending.chain.results[pending.ordinal] = result
 	}
 	return nil
 }
 
+func smb2RequestLinks(commands []map[string]any) []smb2CompoundLink {
+	links := make([]smb2CompoundLink, len(commands))
+	for start := 0; start < len(commands); {
+		if commands[start]["Response"] == true {
+			start++
+			continue
+		}
+		end := start + 1
+		for end < len(commands) && commands[end]["Response"] == false && commands[end]["Related"] == true {
+			end++
+		}
+		if end-start > 1 {
+			chain := &smb2RequestChain{size: end - start, results: make(map[int]smb2CompoundResult)}
+			for i := start; i < end; i++ {
+				links[i] = smb2CompoundLink{chain: chain, ordinal: i - start}
+			}
+		}
+		start = end
+	}
+	return links
+}
+
 func (s *binSMB2) findResponse(key smb2PendingKey, asyncID uint64, name string, c map[string]any) (smb2PendingKey, smb2Pending, bool) {
 	if asyncID != 0 {
-		if pendingKey, ok := s.async[smb2AsyncKey{sessionID: key.sessionID, asyncID: asyncID}]; ok {
-			pending, exists := s.pending[pendingKey]
-			return pendingKey, pending, exists && pending.name == name
-		}
 		status, _ := c["Status"].(uint32)
-		if status != 0x00000103 { // STATUS_PENDING still carries the request MessageId.
+		if status != 0x00000103 {
+			if pendingKey, ok := s.async[smb2AsyncKey{sessionID: key.sessionID, asyncID: asyncID}]; ok {
+				pending, exists := s.pending[pendingKey]
+				return pendingKey, pending, exists && pending.name == name
+			}
 			return smb2PendingKey{}, smb2Pending{}, false
 		}
+		// STATUS_PENDING establishes an AsyncId for this literal MessageId.
+		// An existing AsyncId mapping cannot select a different pending request
+		// and thereby hide the collision checked by associateCommand.
 	}
 	if pending, ok := s.pending[key]; ok {
 		return key, pending, pending.name == name
@@ -412,6 +746,14 @@ func (s *binSMB2) findResponse(key smb2PendingKey, asyncID uint64, name string, 
 	// assigns the TreeId. Only allow their exact command-specific fallback.
 	allowSessionSetup := name == "SESSION_SETUP"
 	allowTreeConnect := name == "TREE_CONNECT"
+	status, _ := c["Status"].(uint32)
+	allowSessionError := key.sessionID == 0 && key.treeID == 0 && status>>30 >= 2 && status != 0x00000103
+	if name == "QUERY_INFO" && c["Error Response"] != true {
+		// BUFFER_OVERFLOW is a partial QUERY_INFO output, not a lost-session
+		// ERROR. It must retain the actual session/tree or observed AsyncId.
+		allowSessionError = false
+	}
+	allowLogoffClear := name == "LOGOFF" && key.sessionID == 0 && key.treeID == 0 && asyncID == 0
 	async, _ := c["Async ID"].(uint64)
 	if async != 0 {
 		allowSessionSetup = false
@@ -422,6 +764,14 @@ func (s *binSMB2) findResponse(key smb2PendingKey, asyncID uint64, name string, 
 	count := 0
 	for candidateKey, candidate := range s.pending {
 		if candidateKey.messageID != key.messageID {
+			continue
+		}
+		if (allowSessionError || allowLogoffClear) && candidate.name == name {
+			// A server that no longer has this session can return a zero SID
+			// error (e.g. a repeated LOGOFF). Correlate only a unique MID/command
+			// on this capture flow, with the opposite direction checked below.
+			foundKey, found = candidateKey, candidate
+			count++
 			continue
 		}
 		if allowSessionSetup && candidate.name == "SESSION_SETUP" && candidateKey.sessionID == 0 && candidateKey.treeID == 0 {
@@ -492,6 +842,9 @@ func smb2Walk(payload []byte, max int) ([]map[string]any, error) {
 		if binary.LittleEndian.Uint16(h[4:6]) != 64 {
 			return nil, fmt.Errorf("smb2: header StructureSize must be 64")
 		}
+		if binary.LittleEndian.Uint32(h[16:20])&smb2FlagAsync != 0 && binary.LittleEndian.Uint64(h[32:40]) == 0 {
+			return nil, fmt.Errorf("smb2: ASYNC header requires a nonzero AsyncId")
+		}
 		next := int(binary.LittleEndian.Uint32(h[20:24]))
 		end := len(payload)
 		if next != 0 {
@@ -500,31 +853,55 @@ func smb2Walk(payload []byte, max int) ([]map[string]any, error) {
 			}
 			end = at + next
 		}
-		cmd, err := smb2ParseCommand(h[:end-at])
+		cmd, err := smb2ParseCommand(h[:end-at], max, next != 0)
 		if err != nil {
-			return nil, err
+			// No association has run yet. A caller may isolate this body-only
+			// failure after independently validating every enclosing header.
+			return nil, &smb2BodyDecodeError{command: len(cmds), cause: err}
 		}
-		if related, _ := cmd["Related"].(bool); related {
+		if len(cmds) > 0 && cmd["Response"] != cmds[0]["Response"] {
+			return nil, protocolError(ErrMalformedMessage, "SMB2 compound mixes requests and responses")
+		}
+		related, _ := cmd["Related"].(bool)
+		if cmd["Response"] == false && len(cmds) > 1 {
+			firstRelated, _ := cmds[1]["Related"].(bool)
+			if related != firstRelated {
+				// MS-SMB2 3.2.4.1.4: mixing related and unrelated commands is a
+				// request-level failure (STATUS_INVALID_PARAMETER), not a
+				// transport framing error. Keep the captured commands and start
+				// a new chain instead of stopping the whole flow.
+				cmd["Compound Style Transition"] = "related/unrelated mixed; new chain"
+				previous = nil
+			}
+		}
+		smb2OffsetRanges(cmd, 4+at)
+		if related {
 			if previous == nil {
-				return nil, protocolError(ErrMalformedMessage, "SMB2 related compound operation has no predecessor")
-			}
-			if sid, _ := cmd["Session ID"].(uint64); sid == ^uint64(0) {
-				cmd["Session ID"] = previous["Session ID"]
-				cmd["Inherited Session Context"] = true
-			}
-			if tid, _ := cmd["Tree ID"].(uint32); tid == ^uint32(0) {
-				cmd["Tree ID"] = previous["Tree ID"]
-				cmd["Inherited Tree Context"] = true
-			}
-			if fileID, _ := cmd["FileId"].(string); fileID == "ffffffffffffffffffffffffffffffff" {
-				cmd["Related File ID Placeholder"] = true
-				cmd["File Context Status"] = "related-compound-file-context-is-server-substituted"
-			}
-			if fileID, _ := previous["FileId"].(string); fileID != "" && fileID != "ffffffffffffffffffffffffffffffff" {
-				cmd["Related Previous File ID"] = fileID
-			}
-			if previousName, ok := previous["Packet Name"].(string); ok {
-				cmd["Related Previous Command"] = previousName
+				// A related command can start a new chain after a style
+				// transition. There is no predecessor to inherit from; keep the
+				// literal IDs and record the missing context.
+				cmd["Related Context Status"] = "no predecessor in captured compound"
+			} else {
+				// MS-SMB2 3.3.5.2.7.2: related requests use the preceding
+				// operation's context even when the ignored literal IDs happen
+				// to be concrete. Responses carry their own returned IDs.
+				if cmd["Response"] == false {
+					effectiveSID, effectiveTID := smb2EffectiveIDs(previous)
+					cmd["Effective Session ID"] = effectiveSID
+					cmd["Inherited Session Context"] = true
+					cmd["Effective Tree ID"] = effectiveTID
+					cmd["Inherited Tree Context"] = true
+				}
+				if fileID, _ := cmd["FileId"].(string); cmd["Response"] == false && fileID != "" {
+					cmd["Related File ID Ignored"] = true
+					if fileID == "ffffffffffffffffffffffffffffffff" {
+						cmd["Related File ID Placeholder"] = true
+					}
+					cmd["File Context Status"] = "related-compound-file-context-is-server-substituted"
+				}
+				if previousName, ok := previous["Packet Name"].(string); ok {
+					cmd["Related Previous Command"] = previousName
+				}
 			}
 		}
 		if len(cmds) >= max {
@@ -539,84 +916,99 @@ func smb2Walk(payload []byte, max int) ([]map[string]any, error) {
 	}
 }
 
-func smb2ParseCommand(pdu []byte) (map[string]any, error) {
-	cmd := binary.LittleEndian.Uint16(pdu[12:14])
-	flags := binary.LittleEndian.Uint32(pdu[16:20])
-	mid := binary.LittleEndian.Uint64(pdu[24:32])
-	resp := flags&smb2FlagResp != 0
-	info := map[string]any{
-		"Command":     cmd,
-		"Packet Name": smb2CommandName(cmd),
-		"Flags":       flags,
-		"Response":    resp,
-		"Message ID":  mid,
-		"Credit":      binary.LittleEndian.Uint16(pdu[14:16]),
-		"Status":      binary.LittleEndian.Uint32(pdu[8:12]),
+func smb2ParseCommand(pdu []byte, max int, padded bool) (map[string]any, error) {
+	if len(pdu) < smb2HeaderSize {
+		return nil, fmt.Errorf("smb2: truncated command header")
 	}
-	if flags&smb2FlagAsync == 0 {
-		info["Tree ID"] = binary.LittleEndian.Uint32(pdu[36:40])
-		info["Session ID"] = binary.LittleEndian.Uint64(pdu[40:48])
-	} else {
-		info["Async ID"] = binary.LittleEndian.Uint64(pdu[32:40])
-		info["Session ID"] = binary.LittleEndian.Uint64(pdu[40:48])
+	info := smb2CommandHeader(pdu)
+	resp := info["Response"].(bool)
+	status, _ := info["Status"].(uint32)
+	err := smb2CommandFields(info, pdu, resp, max, padded)
+	if err == nil {
+		if resp && status == 0x00000103 {
+			info["Pending Body Layout"] = "command"
+		}
+		smb2AttachContext(info)
+		return info, nil
 	}
-	if flags&smb2FlagRelated != 0 {
-		info["Related"] = true
+	// MS-SMB2 3.3.4.2 requires an interim async response to carry the ERROR
+	// body, while captured Windows READ interims use the command layout. Accept
+	// both: retry the ERROR layout on a fresh header so the association below
+	// still learns the AsyncId.
+	if resp && status == 0x00000103 {
+		fresh := smb2CommandHeader(pdu)
+		if fallback := smb2ErrorFields(fresh, pdu); fallback == nil {
+			fresh["Pending Body Layout"] = "error"
+			smb2AttachContext(fresh)
+			return fresh, nil
+		}
 	}
+	return nil, err
+}
+
+func smb2CommandFields(info map[string]any, pdu []byte, resp bool, max int, padded bool) error {
+	cmd := info["Command"].(uint16)
 	body := pdu[smb2HeaderSize:]
 	switch cmd {
 	case 0:
-		if !resp {
-			if len(body) >= 4 {
-				count := int(binary.LittleEndian.Uint16(body[2:4]))
-				var dialects []uint16
-				for i := 0; i < count && 36+2*(i+1) <= len(body); i++ {
-					dialects = append(dialects, binary.LittleEndian.Uint16(body[36+2*i:]))
-				}
-				info["Dialects"] = dialects
-			}
-		} else if len(body) >= 6 {
-			d := binary.LittleEndian.Uint16(body[4:6])
-			info["Dialect"] = d
-			info["Version Name"] = smb2DialectName(d)
-		}
+		return smb2NegotiateFields(info, pdu, resp, max)
+	case 1:
+		return smb2SessionSetupFields(info, pdu, resp)
+	case 2, 4:
+		return smb2SmallCommandFields(info, pdu, resp)
 	case 3:
-		if !resp && len(body) >= 8 {
-			off := int(binary.LittleEndian.Uint16(body[4:6]))
-			n := int(binary.LittleEndian.Uint16(body[6:8]))
-			at := off - smb2HeaderSize
-			if at >= 0 && at+n <= len(body) {
-				info["Path"] = smb2UTF16LE(body[at : at+n])
-			}
-		}
+		return smb2TreeConnectFields(info, pdu, resp)
 	case 5:
-		if !resp && len(body) >= 48 {
-			off := int(binary.LittleEndian.Uint16(body[44:46]))
-			n := int(binary.LittleEndian.Uint16(body[46:48]))
-			at := off - smb2HeaderSize
-			if at >= 0 && at+n <= len(body) {
-				info["File Name"] = smb2UTF16LE(body[at : at+n])
-			}
-		} else if resp && len(body) >= 80 {
-			info["FileId"] = hex.EncodeToString(body[64:80])
-		}
+		return smb2CreateFields(info, pdu, resp, max)
 	case 6:
-		if len(body) >= 24 {
-			info["FileId"] = hex.EncodeToString(body[8:24])
+		return smb2CloseFields(info, pdu, resp)
+	case 7:
+		return smb2FlushFields(info, pdu, resp)
+	case 8:
+		return smb2ReadFields(info, pdu, resp)
+	case 9:
+		return smb2WriteFields(info, pdu, resp)
+	case 10:
+		return smb2LockFields(info, pdu, resp, max)
+	case 11:
+		return smb2IOCTLFields(info, pdu, resp, max)
+	case 12:
+		return smb2CancelFields(info, pdu, resp, padded)
+	case 13:
+		return smb2EchoFields(info, pdu, resp)
+	case 14:
+		return smb2QueryDirectoryFields(info, pdu, resp, max)
+	case 15:
+		return smb2ChangeNotifyFields(info, pdu, resp)
+	case 16:
+		if len(body) > stream_parser.SMB2QueryInfoMaxBodyBytes {
+			return protocolError(ErrResourceExceeded, "SMB2 QUERY_INFO body exceeds bounded profile")
 		}
-	case 8, 9:
-		if !resp && len(body) >= 32 {
-			info["FileId"] = hex.EncodeToString(body[16:32])
-			if cmd == 8 {
-				info["Length"] = binary.LittleEndian.Uint32(body[4:8])
-			} else {
-				info["Length"] = binary.LittleEndian.Uint32(body[4:8])
-			}
-		} else if resp && cmd == 9 && len(body) >= 8 {
-			info["Count"] = binary.LittleEndian.Uint32(body[4:8])
+		status, _ := info["Status"].(uint32)
+		fields, err := stream_parser.DecodeSMB2QueryInfoBody(body, resp, status)
+		if err != nil {
+			return err
 		}
+		if fields["Error Response"] == true {
+			info["Error Response"] = true
+			delete(fields, "Error Response")
+		} else if resp {
+			info["Output Content Status"] = "opaque: request context unavailable"
+		} else {
+			// Keep the historical flat representation distinct from the owned
+			// raw body leaf; both spans refer to this request's actual FileId.
+			fid := fields["File ID"].([]byte)
+			smb2Literal(info, "FileId", 88, 104, hex.EncodeToString(fid))
+		}
+		smb2OffsetRanges(fields, 64)
+		info["Body"] = fields
+		return nil
+	case 17:
+		return smb2SetInfoFields(info, pdu, resp)
+	case 18:
+		return smb2OplockBreakFields(info, pdu, resp)
 	}
-	return info, nil
+	return nil
 }
 
 func smb2CommandName(cmd uint16) string {
@@ -635,20 +1027,38 @@ func smb2CommandName(cmd uint16) string {
 		return "CREATE"
 	case 6:
 		return "CLOSE"
+	case 7:
+		return "FLUSH"
 	case 8:
 		return "READ"
 	case 9:
 		return "WRITE"
+	case 10:
+		return "LOCK"
 	case 11:
 		return "IOCTL"
+	case 12:
+		return "CANCEL"
 	case 13:
 		return "ECHO"
+	case 14:
+		return "QUERY_DIRECTORY"
+	case 15:
+		return "CHANGE_NOTIFY"
+	case 16:
+		return "QUERY_INFO"
+	case 17:
+		return "SET_INFO"
+	case 18:
+		return "OPLOCK_BREAK"
 	}
 	return fmt.Sprintf("CMD_%d", cmd)
 }
 
 func smb2DialectName(d uint16) string {
 	switch d {
+	case 0x02ff:
+		return "wildcard (SMB2 negotiate required)"
 	case 0x0202:
 		return "2.0.2"
 	case 0x0210:

@@ -116,6 +116,23 @@ func (t *TrafficConnection) RemotePort() int {
 	return t.remotePort
 }
 
+// TCPSequenceObservation is a detached view of the passive reassembler's
+// cursor. It describes captured evidence, not the peer's TCP acceptance.
+type TCPSequenceObservation struct {
+	Initialized  bool
+	SYNObserved  bool
+	NextSequence uint32
+	Pending      bool
+}
+
+// SequenceObservation must be called in a capture callback for this flow,
+// before the pooled connection is released. Packet callbacks run before that
+// packet is fed; arrived-frame callbacks run after its ordered bytes advance
+// the cursor. The returned value retains no flow or packet storage.
+func (t *TrafficConnection) SequenceObservation() TCPSequenceObservation {
+	return TCPSequenceObservation{Initialized: t.initialed, SYNObserved: t.synSeen, NextSequence: t.nextSeq, Pending: len(t.waitGroup) > 0 || t.resetPending}
+}
+
 func (t *TrafficConnection) Hash() string {
 	return t.hash
 }
@@ -164,7 +181,7 @@ func (t *TrafficConnection) Release() {
 }
 
 func (t *TrafficConnection) Write(b []byte, seq int64, ts time.Time) (int, error) {
-	if ts.IsZero() {
+	if ts.IsZero() && !t.Flow.pool.options.captureReplay {
 		ts = time.Now()
 	}
 	frame := &TrafficFrame{evidence: t.evidence, ConnHash: t.hash, Seq: uint32(seq), Payload: b, Timestamp: ts, Connection: t}
@@ -190,6 +207,7 @@ func seqBefore(a, b uint32) bool { return seqnum.Value(a).LessThan(seqnum.Value(
 func (t *TrafficConnection) queueFuture(seq uint32, payload []byte, fin bool, ts time.Time) {
 	if old := t.pendingBySeq[seq]; old != nil {
 		if !bytes.Equal(old.Payload[:min(len(old.Payload), len(payload))], payload[:min(len(old.Payload), len(payload))]) {
+			t.Flow.reassemblyIncomplete = true
 			t.Flow.pool.invalidSegment("conflicting TCP retransmission at the same sequence")
 		}
 		// First-seen bytes win; a longer retransmission may supply a missing suffix.
@@ -211,7 +229,7 @@ func (t *TrafficConnection) queueFuture(seq uint32, payload []byte, fin bool, ts
 		return
 	}
 	opts := &t.Flow.pool.options
-	if len(t.waitGroup) >= opts.MaxPendingSegments || len(payload) > opts.MaxPendingBytes-t.pendingBytes || !t.Flow.pool.reservePending(len(payload), 1) {
+	if len(t.waitGroup)+t.Flow.pendingOpeningSegments(t) >= opts.MaxPendingSegments || len(payload) > opts.MaxPendingBytes-t.pendingBytes || !t.Flow.pool.reservePending(len(payload), 1) {
 		t.Flow.closeWithReason(TrafficFlowCloseReason_RESOURCE_LIMIT)
 		return
 	}
@@ -285,6 +303,7 @@ func (t *TrafficConnection) consume(seq uint32, payload []byte, fin bool, ts tim
 	}
 	if len(payload) > 0 {
 		if len(t.waitGroup) > 0 && t.pendingConflict(0, seq, payload) {
+			t.Flow.reassemblyIncomplete = true
 			t.Flow.pool.invalidSegment("conflicting TCP overlap with buffered data")
 		}
 		t.currentSeq = seq
@@ -312,6 +331,7 @@ func (t *TrafficConnection) resolvePendingReset() bool {
 		t.Flow.Close()
 		return true
 	}
+	t.Flow.reassemblyIncomplete = true
 	t.Flow.pool.invalidSegment("TCP RST sequence falls inside subsequently captured data")
 	return false
 }
@@ -345,6 +365,9 @@ func (t *TrafficConnection) pendingConflict(i int, seq uint32, payload []byte) b
 // FeedClient and FeedServer share the passive receive algorithm. Each direction
 // can start midstream; SYN retransmits never reset an established cursor.
 func (t *TrafficConnection) FeedClient(tcp *layers.TCP, ts time.Time) {
+	// Queued segments retain their own ACK with their byte provenance. A later
+	// callback packet must not establish completeness for an earlier response.
+	t.evidence.tcpACK, t.evidence.tcpACKKnown = tcp.Ack, tcp.ACK
 	// Before a new connection has a reverse cursor, a late ACK from the previous
 	// use of this tuple must not close it or supply that cursor. RFC 9293 3.10.7.3
 	// rejects ACK <= ISS and non-SYN segments without ACK in SYN-SENT.
@@ -366,10 +389,12 @@ func (t *TrafficConnection) FeedClient(tcp *layers.TCP, ts time.Time) {
 		return
 	}
 	if uint64(len(tcp.Payload)) > uint64(t.Flow.pool.options.MaxSequenceGap) {
+		t.Flow.reassemblyIncomplete = true
 		t.Flow.pool.invalidSegment("TCP payload exceeds the sequence window")
 		return
 	}
 	if tcp.SYN && (tcp.FIN || tcp.RST) {
+		t.Flow.reassemblyIncomplete = true
 		t.Flow.pool.invalidSegment("TCP SYN combined with FIN or RST")
 		return
 	}
@@ -384,6 +409,7 @@ func (t *TrafficConnection) FeedClient(tcp *layers.TCP, ts time.Time) {
 				t.resetPending, t.resetSeq = true, tcp.Seq
 				return
 			}
+			t.Flow.reassemblyIncomplete = true
 			t.Flow.pool.invalidSegment(fmt.Sprintf("TCP RST does not match the receive cursor: %s seq=%d expected=%d ack=%d pending=%d", t, tcp.Seq, t.nextSeq, tcp.Ack, len(t.waitGroup)))
 			return
 		}
@@ -392,7 +418,11 @@ func (t *TrafficConnection) FeedClient(tcp *layers.TCP, ts time.Time) {
 	}
 	seq := tcp.Seq
 	if tcp.SYN {
+		if t.initialed && !t.synSeen && tcp.Seq+1 == t.isn {
+			t.isn = tcp.Seq
+		}
 		if t.initialed && tcp.Seq != t.isn {
+			t.Flow.reassemblyIncomplete = true
 			t.Flow.pool.invalidSegment("TCP SYN changes an established initial sequence number")
 			return
 		}
@@ -414,25 +444,47 @@ func (t *TrafficConnection) FeedClient(tcp *layers.TCP, ts time.Time) {
 	distance := uint32(seq - t.nextSeq)
 	if distance == 1<<31 ||
 		(distance < 1<<31 && uint64(distance)+uint64(len(tcp.Payload)) > uint64(t.Flow.pool.options.MaxSequenceGap)) {
+		t.Flow.reassemblyIncomplete = true
 		t.Flow.pool.invalidSegment("TCP segment exceeds the unambiguous sequence window")
 		return
 	}
 	end := seq + uint32(len(tcp.Payload))
-	if tcp.FIN && !seqBefore(end, t.nextSeq) {
-		if t.finSeen && end != t.finSeq {
+	finEnd := end
+	finForBytes := tcp.FIN
+	if tcp.FIN && t.evidence.tcpMissingTail > 0 {
+		finEnd += t.evidence.tcpMissingTail
+		finForBytes = false
+		distance := uint32(finEnd - t.nextSeq)
+		if distance == 1<<31 || distance < 1<<31 && uint64(distance) > uint64(t.Flow.pool.options.MaxSequenceGap) {
+			t.Flow.reassemblyIncomplete = true
+			t.Flow.pool.invalidSegment("captured TCP FIN exceeds the sequence window")
+			return
+		}
+	}
+	if tcp.FIN && !seqBefore(finEnd, t.nextSeq) {
+		if t.finSeen && finEnd != t.finSeq {
+			t.Flow.reassemblyIncomplete = true
 			t.Flow.pool.invalidSegment("TCP FIN changes an established stream end")
 			return
 		}
-		t.finSeen, t.finSeq = true, end
+		t.finSeen, t.finSeq = true, finEnd
+	}
+	if tcp.FIN && !finForBytes && seqBefore(t.nextSeq, finEnd) {
+		// One bounded zero-payload control entry retains the observed FIN at
+		// its declared end, while only captured bytes enter the data stream.
+		t.queueFuture(finEnd, nil, true, ts)
+		if t.IsClosed() {
+			return
+		}
 	}
 	if t.finSeen && seqBefore(t.finSeq, seq) {
 		return
 	}
 	if seqBefore(t.nextSeq, seq) {
-		t.queueFuture(seq, tcp.Payload, tcp.FIN, ts)
+		t.queueFuture(seq, tcp.Payload, finForBytes, ts)
 		return
 	}
-	t.consume(seq, tcp.Payload, tcp.FIN, ts)
+	t.consume(seq, tcp.Payload, finForBytes, ts)
 	for !t.IsClosed() && len(t.waitGroup) > 0 && !seqBefore(t.nextSeq, t.waitGroup[0].Seq) {
 		f := t.popFuture()
 		t.evidence = f.evidence
@@ -481,6 +533,14 @@ func (p *TrafficPool) newFlow(netType string, srcAddr, dstAddr string) (*Traffic
 
 // Feed already has decoded endpoints. Resolve names only for public NewFlow.
 func (p *TrafficPool) newFlowWithAddrs(netType string, src, dst *net.TCPAddr, domains ...CaptureDomain) *TrafficFlow {
+	var domain CaptureDomain
+	if len(domains) > 0 {
+		domain = domains[0]
+	}
+	return p.newFlowWithAddrsAt(netType, src, dst, domain, time.Time{})
+}
+
+func (p *TrafficPool) newFlowWithAddrsAt(netType string, src, dst *net.TCPAddr, domain CaptureDomain, captured time.Time) *TrafficFlow {
 	srcAddr, dstAddr := src.String(), dst.String()
 	var clientReader, serverReader *tcpStreamBuffer
 	var clientWriter, serverWriter *tcpStreamBuffer
@@ -526,10 +586,8 @@ func (p *TrafficPool) newFlowWithAddrs(netType string, src, dst *net.TCPAddr, do
 	c2sConn.Flow = flow
 	s2cConn.Flow = flow
 	flow.key, _ = makeFlowKey(src.IP, dst.IP, uint16(src.Port), uint16(dst.Port), netType == "tcp6")
-	if len(domains) > 0 {
-		flow.key.domain = domains[0]
-	}
-	if !p.flowCache.Set(flow.key, flow) {
+	flow.key.domain = domain
+	if !p.flowCache.SetAt(flow.key, flow, captured) {
 		return nil
 	}
 	return flow
@@ -546,6 +604,7 @@ func (c *TrafficConnection) GetBuffer() io.Reader {
 func (t *TrafficConnection) discardPending() {
 	p := t.Flow.pool
 	if t.resetPending {
+		t.Flow.reassemblyIncomplete = true
 		p.invalidSegment(fmt.Sprintf("TCP RST does not match the receive cursor: %s seq=%d; preceding data/FIN was not captured", t, t.resetSeq))
 		t.resetPending = false
 	}
@@ -558,6 +617,7 @@ func (t *TrafficConnection) discardPending() {
 			p.singleUnreassembledSegments.Add(uint64(len(t.waitGroup)))
 		}
 		reason := fmt.Sprintf("TCP stream closed with an unfilled sequence gap (%d buffered bytes)", t.pendingBytes)
+		t.Flow.reassemblyIncomplete = true
 		p.reassemblyFailure(reason)
 		if p.captureConf != nil && p.captureConf.binParser != nil {
 			if t.Flow.binState == nil {

@@ -88,6 +88,8 @@ const (
 
 const AI_TIMELINE_ITEM_TYPE_SUB_REACT_AGENT_RESULT = "sub_react_agent_result"
 
+const AI_REACT_LOOP_ACTION_MANAGE_ASYNC_EXECUTION_RUNTIME = "manage_async_execution_runtime"
+
 const (
 	AI_REACT_LOOP_NAME_WRITE_PYTHON_SCRIPT = "write_python_script"
 	AI_REACT_LOOP_NAME_DEFAULT             = "default"
@@ -102,7 +104,6 @@ const (
 	AI_REACT_LOOP_NAME_CODE_SECURITY_AUDIT = "code_security_audit"
 	AI_REACT_LOOP_NAME_INTENT              = "intent"
 	AI_REACT_LOOP_NAME_INTERNET_RESEARCH   = "internet_research"
-	AI_REACT_LOOP_NAME_SMART_QA            = "smart_qa"
 	AI_REACT_LOOP_NAME_DIR_EXPLORE         = "dir_explore"
 	AI_REACT_LOOP_NAME_INFOSEC_RECON       = "infosec_recon"
 	AI_REACT_LOOP_NAME_AI_SKILL_AUDIT      = "ai_skill_audit"
@@ -293,11 +294,8 @@ const (
 	// 关键词: EVENT_TYPE_CURRENT_TASK_TODO_LIST_UPDATE, 当前任务 TODO 事件
 	EVENT_TYPE_CURRENT_TASK_TODO_LIST_UPDATE EventType = "current_task_todo_list_update"
 
-	// EVENT_TYPE_VALUE_FEEDBACK 价值评估结果事件: 由 aive 价值评估链路在拿到小模型
-	// 价值分后回吐给用户的唯一结果事件. 该事件只用于回吐前端展示, 不写本地数据库
-	// (见下方 eventTypeNotSaveBlackList). 携带 record_id / signature / value_score
-	// 等字段.
-	// 关键词: EVENT_TYPE_VALUE_FEEDBACK, 价值评估结果, aive value feedback, 不落本地
+	// Legacy value-feedback event, retained for stored-event/protocol compatibility.
+	// New trajectory evaluations are persisted on AITrajectory instead.
 	EVENT_TYPE_VALUE_FEEDBACK EventType = "value_feedback"
 )
 

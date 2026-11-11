@@ -38,6 +38,30 @@ func Total() int64 {
 	return constrainedTotal(total, string(groups), string(mounts), os.ReadFile)
 }
 
+// Usable is 80% of Total: leave 20% for the OS, cgroup neighbors, and non-Go
+// allocations. Compile soft limits and pressure warnings share this fraction.
+func Usable() int64 {
+	return UsableFrom(Total())
+}
+
+// Available reports the memory the OS can hand to this process without
+// swapping, as the kernel reports it. It returns 0 when the platform does not
+// expose the metric; callers must treat 0 as unknown, not as exhaustion.
+func Available() int64 {
+	vm, err := mem.VirtualMemory()
+	if err != nil || vm == nil || vm.Available == 0 {
+		return 0
+	}
+	return int64(vm.Available)
+}
+
+func UsableFrom(total int64) int64 {
+	if total <= 0 {
+		return 0
+	}
+	return total / 5 * 4
+}
+
 func constrainedTotal(total int64, groups, mounts string, read func(string) ([]byte, error)) int64 {
 	for _, group := range strings.Split(groups, "\n") {
 		parts := strings.SplitN(group, ":", 3)

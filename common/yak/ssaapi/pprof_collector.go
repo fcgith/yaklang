@@ -24,21 +24,28 @@ import (
 )
 
 // pprofCollector manages periodic pprof collection during a scan.
-// It starts an HTTP pprof server and collects CPU, memory, and goroutine
-// profiles at regular intervals.
+// It starts an HTTP pprof server and collects CPU, memory, goroutine, mutex,
+// and block profiles at regular intervals.
 //
 // Collection strategy:
-//   - Every 5 minutes, collect CPU + heap + goroutine profiles
-//   - CPU profile duration: 1 minute when memory < 10GB, 5 minutes when memory >= 10GB
-//   - An initial snapshot is collected at start, including short scans
-//   - Shutdown finishes active CPU sampling and collects final non-CPU snapshots
+//   - Every 5 minutes, collect a 10-second CPU profile without overlapping
+//     non-CPU snapshots
+//   - Every 5 minutes, collect heap, goroutine (including debug=2 stacks), mutex,
+//     block, DB stats, and runtime stats; early snapshots also capture these during
+//     the first 4 minutes to preserve evidence for memory-guarded scans
+//   - Collect allocs at startup and every 15 minutes
+//   - Shutdown flushes any active CPU sample and collects final non-CPU snapshots
 type pprofCollector struct {
 	dir             string
 	cpuDir          string
 	memDir          string
 	goroutineDir    string
+	mutexDir        string
+	blockDir        string
+	allocsDir       string
 	dbStatsDir      string
 	runtimeStatsDir string
+	skipDBStats     bool
 	httpAddr        string
 	wg              sync.WaitGroup
 	lastDBStats     ssadb.DBOpStats
@@ -50,47 +57,93 @@ type pprofCollector struct {
 const (
 	// pprof listens on a random free localhost port (not a fixed 18080) so
 	// concurrent debug compiles / leftover servers do not collide.
-	memoryThresholdHigh = 10 * 1024 * 1024 * 1024 // 10 GB
-	// pprofInterval is slightly longer than the high-memory CPU duration so a
-	// periodic profile never starts while the previous 5-minute profile is still
-	// finishing (observed as pprof HTTP 500 on Hadoop run4/run5).
-	pprofInterval          = 5*time.Minute + 2*time.Second
-	pprofCPUDurationNormal = 60 * time.Second
-	pprofCPUDurationHigh   = 5 * time.Minute
-	pprofHTTPTimeout       = 10 * time.Minute
-	pprofListenAttempts    = 8
+	// 10s every 5 minutes is about 3% duty cycle. The previous 30s sample
+	// every minute kept the process-wide profiler on for half the scan and
+	// showed up as ~17% of the Hue CPU profile.
+	pprofCPUInterval    = 5 * time.Minute
+	pprofCPUDuration    = 10 * time.Second
+	pprofInterval       = 5 * time.Minute
+	pprofHTTPTimeout    = 10 * time.Minute
+	pprofListenAttempts = 8
+	pprofAllocInterval  = 15 * time.Minute
+	// Fraction 10 records about 1/10 mutex events. Block rate is nanoseconds
+	// per sample; 1ms still shows stalls without recording every channel wait.
+	pprofMutexProfileFraction = 10
+	pprofBlockProfileRate     = 1_000_000
 
 	// OOM investigations need early evidence. Large source scans have been
 	// killed by the kernel around 3-5 minutes, before the first periodic
-	// snapshot at 5m30s; capture intermediate runtime/heap/goroutine state at
-	// one minute, then every minute while the task stays below the normal
-	// periodic cadence.
+	// snapshot at 5 minutes; capture intermediate runtime/heap/goroutine state
+	// each minute for the first four minutes.
 	pprofEarlyInterval = 1 * time.Minute
 )
+
+// PprofCollectorOptions tunes what the collector is allowed to touch.
+type PprofCollectorOptions struct {
+	// SkipDBStats keeps the collector from opening the SSA database. Memory-mode
+	// compiles own no database, and opening one just to read callbacks would
+	// create the very ssadb.db the caller asked us not to write.
+	SkipDBStats bool
+}
+
+// PprofCollectorOption mutates PprofCollectorOptions.
+type PprofCollectorOption func(*PprofCollectorOptions)
+
+// WithoutPprofDBStats disables every database touch inside the collector.
+func WithoutPprofDBStats() PprofCollectorOption {
+	return func(o *PprofCollectorOptions) { o.SkipDBStats = true }
+}
+
+func newPprofCollectorOptions(opts []PprofCollectorOption) *PprofCollectorOptions {
+	o := &PprofCollectorOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(o)
+		}
+	}
+	return o
+}
+
+// ensureDBOpCallbacksImpl is an indirection so tests can prove that a
+// memory-mode collector never touches the SSA database.
+var ensureDBOpCallbacksImpl = func() {
+	ssadb.EnsureDBOpCallbacks(ssadb.GetDB())
+}
 
 // StartPprofCollector creates the output directories, starts the pprof HTTP server,
 // and launches a background goroutine that periodically collects pprof snapshots.
 // The returned cleanup function stops the collector, waits for in-progress
 // collections to flush on cancellation, and collects a final non-CPU snapshot.
-func StartPprofCollector(debugDir string) (func(), error) {
+func StartPprofCollector(debugDir string, opts ...PprofCollectorOption) (func(), error) {
+	options := newPprofCollectorOptions(opts)
 	cpuDir := filepath.Join(debugDir, "cpu-pprof")
 	memDir := filepath.Join(debugDir, "memory-pprof")
 	goroutineDir := filepath.Join(debugDir, "goroutine-pprof")
+	mutexDir := filepath.Join(debugDir, "mutex-pprof")
+	blockDir := filepath.Join(debugDir, "block-pprof")
+	allocsDir := filepath.Join(debugDir, "allocs-pprof")
 	dbStatsDir := filepath.Join(debugDir, "db-stats")
 	runtimeStatsDir := filepath.Join(debugDir, "runtime-stats")
 
-	for _, dir := range []string{cpuDir, memDir, goroutineDir, dbStatsDir, runtimeStatsDir} {
+	for _, dir := range []string{cpuDir, memDir, goroutineDir, mutexDir, blockDir, allocsDir, dbStatsDir, runtimeStatsDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create pprof dir %s: %w", dir, err)
 		}
 	}
+
+	previousMutexFraction := runtime.SetMutexProfileFraction(pprofMutexProfileFraction)
+	runtime.SetBlockProfileRate(pprofBlockProfileRate)
+	log.Infof("[pprof] runtime profile rates active: MutexProfileFraction=%d BlockProfileRate=%d (previous mutex fraction=%d)",
+		pprofMutexProfileFraction, pprofBlockProfileRate, previousMutexFraction)
 
 	addr, err := startPprofHTTPServer()
 	if err != nil {
 		return nil, err
 	}
 
-	ssadb.EnsureDBOpCallbacks(ssadb.GetDB())
+	if !options.SkipDBStats {
+		ensureDBOpCallbacksImpl()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	collector := &pprofCollector{
@@ -98,9 +151,13 @@ func StartPprofCollector(debugDir string) (func(), error) {
 		cpuDir:          cpuDir,
 		memDir:          memDir,
 		goroutineDir:    goroutineDir,
+		mutexDir:        mutexDir,
+		blockDir:        blockDir,
+		allocsDir:       allocsDir,
 		dbStatsDir:      dbStatsDir,
 		runtimeStatsDir: runtimeStatsDir,
 		httpAddr:        addr,
+		skipDBStats:     options.SkipDBStats,
 		lastDBStats:     ssadb.SnapshotDBOpStats(),
 		lastDBStatsAt:   time.Now(),
 	}
@@ -150,7 +207,7 @@ func startPprofHTTPServer() (string, error) {
 		pprofServerStarted = true
 		go func(listener net.Listener, listenAddr string) {
 			log.Infof("[pprof] starting HTTP server on %s", listenAddr)
-			if err := http.Serve(listener, nil); err != nil {
+			if err := http.Serve(listener, sharedPprofHandler()); err != nil {
 				log.Errorf("[pprof] HTTP server error: %v", err)
 			}
 		}(ln, bound)
@@ -175,7 +232,12 @@ func (c *pprofCollector) collectLoop(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	c.collectSnapshot(ctx, "initial")
+	allocsTicker := time.NewTicker(pprofAllocInterval)
+	defer allocsTicker.Stop()
+	cpuTicker := time.NewTicker(pprofCPUInterval)
+	defer cpuTicker.Stop()
+	c.collectCPUSample(ctx, "initial")
+	c.collectSnapshot("initial")
 
 	earlyTicker := time.NewTicker(pprofEarlyInterval)
 	defer earlyTicker.Stop()
@@ -188,48 +250,47 @@ func (c *pprofCollector) collectLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-earlyTicker.C:
-			// Capture the first four one-minute samples, then fall back to
+			// Capture the first four one-minute non-CPU samples, then fall back to
 			// the normal 5-minute cadence.
 			if earlySamples >= 4 {
 				earlyTicker.Stop()
 				continue
 			}
 			earlySamples++
-			c.collectSnapshot(ctx, fmt.Sprintf("early%02d", earlySamples))
+			c.collectSnapshot(fmt.Sprintf("early%02d", earlySamples))
 		case <-ticker.C:
-			c.collectSnapshot(ctx, time.Now().Format("150405"))
+			c.collectSnapshot(time.Now().Format("150405"))
+		case <-cpuTicker.C:
+			c.collectCPUSample(ctx, time.Now().Format("150405"))
+		case <-allocsTicker.C:
+			c.fetchNamedProfile(time.Now().Format("20060102-150405-allocs"), "allocs", "")
 		}
 	}
 }
 
-// collectSnapshot captures state and starts cancellable CPU sampling in a
-// tracked goroutine so the ticker continues to capture memory during sampling.
-func (c *pprofCollector) collectSnapshot(ctx context.Context, tag string) {
+// collectSnapshot captures the non-CPU state at startup, early OOM-evidence
+// intervals, and the regular 5-minute cadence.
+func (c *pprofCollector) collectSnapshot(tag string) {
 	ts := time.Now().Format("20060102-150405")
 	label := fmt.Sprintf("%s-%s", ts, tag)
 
-	cpuDuration := pprofCPUDurationNormal
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	memGB := float64(m.Alloc) / (1024 * 1024 * 1024)
-	if m.Alloc >= memoryThresholdHigh {
-		cpuDuration = pprofCPUDurationHigh
-		log.Infof("[pprof] memory %.1fGB >= 10GB threshold, using %v CPU profile", memGB, cpuDuration)
-	} else {
-		log.Infof("[pprof] memory %.1fGB < 10GB threshold, using %v CPU profile", memGB, cpuDuration)
-	}
-
-	// Memory and goroutine snapshots are fast (non-blocking)
+	// Serialize snapshots on the collector loop, outside the CPU sample.
 	c.fetchHeap(label)
 	c.fetchGoroutine(label)
+	c.fetchGoroutineDebug2(label)
+	c.fetchNamedProfile(label, "allocs", "")
+	c.fetchNamedProfile(label, "mutex", "")
+	c.fetchNamedProfile(label, "block", "")
 	c.fetchDBStats(label)
 	c.fetchRuntimeStats(label)
+}
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		c.fetchCPU(ctx, label, cpuDuration)
-	}()
+// Collect on the same loop as snapshots: encoding their stacks and allocations
+// inside the CPU window would profile the collector rather than the workload.
+func (c *pprofCollector) collectCPUSample(ctx context.Context, tag string) {
+	ts := time.Now().Format("20060102-150405")
+	label := fmt.Sprintf("%s-%s", ts, tag)
+	c.fetchCPU(ctx, label, pprofCPUDuration)
 }
 
 // collectSnapshotFinal captures final retained state. CPU sampling has already
@@ -240,21 +301,25 @@ func (c *pprofCollector) collectSnapshotFinal(tag string) {
 
 	c.fetchHeap(label)
 	c.fetchGoroutine(label)
+	c.fetchGoroutineDebug2(label)
+	c.fetchNamedProfile(label, "allocs", "")
+	c.fetchNamedProfile(label, "mutex", "")
+	c.fetchNamedProfile(label, "block", "")
 	c.fetchDBStats(label)
 	c.fetchRuntimeStats(label)
 }
 
 func (c *pprofCollector) fetchDBStats(label string) {
-	if c == nil || c.dbStatsDir == "" {
+	if c == nil || c.dbStatsDir == "" || c.skipDBStats {
 		return
 	}
 	now := time.Now()
 	current := ssadb.SnapshotDBOpStats()
 	c.dbStatsMu.Lock()
 	delta := ssadb.DeltaDBOpStats(c.lastDBStats, current)
-	// DB counters accumulate across the full interval between snapshots
-	// (~5 minutes), unlike CPU profiles which only sample 1 minute in the
-	// normal-memory path. Record the actual wall window for UI share %.
+	// DB counters accumulate across the full interval between snapshots, unlike
+	// CPU profiles, which sample for 10 seconds every 5 minutes. Record the actual
+	// wall window for UI share %.
 	if !c.lastDBStatsAt.IsZero() {
 		windowMs := now.Sub(c.lastDBStatsAt).Milliseconds()
 		if windowMs < 0 {
@@ -290,18 +355,21 @@ func (c *pprofCollector) fetchDBStats(label string) {
 
 // RuntimeStatsSnapshot captures host vs scan-task CPU/memory at one sample.
 type RuntimeStatsSnapshot struct {
-	Timestamp             string  `json:"timestamp"`
-	NumCPU                int     `json:"num_cpu"`
-	Load1                 float64 `json:"load1,omitempty"`
-	HostCPUPercent        float64 `json:"host_cpu_percent"`
-	ProcessCPUPercent     float64 `json:"process_cpu_percent"`
-	HostMemTotalBytes     uint64  `json:"host_mem_total_bytes"`
-	HostMemUsedBytes      uint64  `json:"host_mem_used_bytes"`
-	HostMemAvailableBytes uint64  `json:"host_mem_available_bytes"`
-	ProcessRSSBytes       uint64  `json:"process_rss_bytes"`
-	ProcessHeapAllocBytes uint64  `json:"process_heap_alloc_bytes"`
-	ProcessHeapSysBytes   uint64  `json:"process_heap_sys_bytes"`
-	Goroutines            int     `json:"goroutines"`
+	Timestamp                string  `json:"timestamp"`
+	NumCPU                   int     `json:"num_cpu"`
+	Load1                    float64 `json:"load1,omitempty"`
+	HostCPUPercent           float64 `json:"host_cpu_percent"`
+	ProcessCPUPercent        float64 `json:"process_cpu_percent"`
+	HostMemTotalBytes        uint64  `json:"host_mem_total_bytes"`
+	HostMemUsedBytes         uint64  `json:"host_mem_used_bytes"`
+	HostMemAvailableBytes    uint64  `json:"host_mem_available_bytes"`
+	ProcessRSSBytes          uint64  `json:"process_rss_bytes"`
+	ProcessHeapAllocBytes    uint64  `json:"process_heap_alloc_bytes"`
+	ProcessHeapSysBytes      uint64  `json:"process_heap_sys_bytes"`
+	ProcessHeapIdleBytes     uint64  `json:"process_heap_idle_bytes"`
+	ProcessHeapInuseBytes    uint64  `json:"process_heap_inuse_bytes"`
+	ProcessHeapReleasedBytes uint64  `json:"process_heap_released_bytes"`
+	Goroutines               int     `json:"goroutines"`
 }
 
 const runtimeStatsSampleWindow = 200 * time.Millisecond
@@ -346,6 +414,9 @@ func captureRuntimeStats() (*RuntimeStatsSnapshot, error) {
 	runtime.ReadMemStats(&memStats)
 	snapshot.ProcessHeapAllocBytes = memStats.HeapAlloc
 	snapshot.ProcessHeapSysBytes = memStats.HeapSys
+	snapshot.ProcessHeapIdleBytes = memStats.HeapIdle
+	snapshot.ProcessHeapInuseBytes = memStats.HeapInuse
+	snapshot.ProcessHeapReleasedBytes = memStats.HeapReleased
 
 	if vm, err := mem.VirtualMemory(); err == nil && vm != nil {
 		snapshot.HostMemTotalBytes = vm.Total
@@ -383,6 +454,7 @@ func captureRuntimeStats() (*RuntimeStatsSnapshot, error) {
 
 func (c *pprofCollector) fetchCPU(ctx context.Context, label string, duration time.Duration) {
 	if !c.cpuMu.TryLock() {
+		log.Warnf("[pprof] CPU profile skipped for %s: previous sample is still active", label)
 		return // The active sample already covers this interval.
 	}
 	defer c.cpuMu.Unlock()
@@ -392,7 +464,9 @@ func (c *pprofCollector) fetchCPU(ctx context.Context, label string, duration ti
 		log.Errorf("[pprof] CPU profile failed: %v", err)
 		return
 	}
-	log.Infof("[pprof] CPU profile saved: %s (%v)", target, time.Since(started))
+	if info, err := os.Stat(target); err == nil {
+		log.Infof("[pprof] CPU profile saved: %s (%v, %d bytes)", target, time.Since(started), info.Size())
+	}
 }
 
 // Capture directly so cancellation stops sampling AND flushes the valid partial
@@ -436,6 +510,31 @@ func (c *pprofCollector) fetchGoroutine(label string) {
 	log.Infof("[pprof] goroutine profile saved: %s", target)
 }
 
+func (c *pprofCollector) fetchGoroutineDebug2(label string) {
+	url := fmt.Sprintf("http://%s/debug/pprof/goroutine?debug=2", c.httpAddr)
+	target := filepath.Join(c.goroutineDir, label+".goroutine.txt")
+	if err := fetchPprof(url, target); err != nil {
+		log.Errorf("[pprof] goroutine debug=2 failed: %v", err)
+		return
+	}
+	log.Infof("[pprof] goroutine debug=2 saved: %s", target)
+}
+
+func (c *pprofCollector) fetchNamedProfile(label, name, query string) {
+	dir := filepath.Join(c.dir, name+"-pprof")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Errorf("[pprof] create %s dir failed: %v", name, err)
+		return
+	}
+	url := fmt.Sprintf("http://%s/debug/pprof/%s%s", c.httpAddr, name, query)
+	target := filepath.Join(dir, label+"."+name+".prof")
+	if err := fetchPprof(url, target); err != nil {
+		log.Errorf("[pprof] %s profile failed: %v", name, err)
+		return
+	}
+	log.Infof("[pprof] %s profile saved: %s", name, target)
+}
+
 func fetchPprof(url, target string) error {
 	client := &http.Client{Timeout: pprofHTTPTimeout}
 	resp, err := client.Get(url)
@@ -452,8 +551,14 @@ func fetchPprof(url, target string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	_, err = io.Copy(f, resp.Body)
-	return err
+	written, copyErr := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	log.Infof("[pprof] profile downloaded: %s size=%d bytes", target, written)
+	return nil
 }

@@ -22,6 +22,9 @@ var inventoryPriorityToolNames = []string{
 	"list_yak_projects",
 	"query_http_packet_history",
 	"fetch_http_packet_by_id",
+	"manage_mcp_server",
+	"query_mcp_tools",
+	"call_mcp_tool",
 	"web_search",
 	"grep",
 	"read_file",
@@ -40,6 +43,8 @@ var inventoryPriorityToolNames = []string{
 	"simple_crawler",
 	"cybersecurity-risk",
 	"query_cybersecurity_risk",
+	"get_cybersecurity_risk_evidence",
+	"triage_cybersecurity_risks",
 	"brute",
 }
 

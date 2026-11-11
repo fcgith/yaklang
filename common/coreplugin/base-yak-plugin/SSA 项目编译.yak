@@ -2,6 +2,7 @@ yakit.AutoInitYakit()
 
 configJSON := cli.Text("config", cli.setRequired(true), cli.setVerboseName("SSA 配置"), cli.setHelp("SSA 项目的配置 JSON 字符串"))
 programNameFromParam := cli.Text("program_name", cli.setVerboseName("程序名称（可选）"), cli.setHelp("显式指定程序名称；不填则自动生成时间戳程序名"))
+baseProgramNameFromParam := cli.Text("base_program_name", cli.setVerboseName("基础程序名称（可选）"), cli.setHelp("显式指定增量编译的基础程序；不填则使用配置中的基础程序，配置也没有时自动以项目上一次编译的程序作为基础程序"))
 disableTimestampProgramName := cli.Bool("disable_timestamp_program_name", cli.setVerboseName("禁用程序名称时间戳（可选）"), cli.setHelp("默认 false；为 true 时不附加时间戳"))
 enableStructRule := cli.Bool("struct-rule", cli.setDefault(false), cli.setVerboseName("编译期语义检测"), cli.setHelp("默认关闭。仅编译；为 true 时才在编译单元上运行 struct 规则"))
 
@@ -27,7 +28,12 @@ projectID = config.GetProjectID()
 yakit.Info("项目名称: %s", projectName)
 yakit.Info("项目语言: %s", config.GetLanguage())
 
+// 重新编译（re_compile）与增量编译互相独立：re_compile 仅在全量编译时由后端清理同名旧程序数据（随 configJSON 透传生效）；
+// 增量编译是否启用、基础程序如何解析均与 re_compile 无关
 reCompile = config.GetCompileReCompile()
+if reCompile {
+    yakit.Info("已启用重新编译（re_compile）：全量编译时清理同名旧程序数据；不影响增量编译")
+}
 
 baseProgramName = programNameFromParam
 if baseProgramName == "" {
@@ -48,6 +54,16 @@ yakit.Info("程序名称: %s", programName)
 // 从配置中读取增量编译设置
 enableIncrementalCompile = config.GetEnableIncrementalCompile()
 baseProgramName = config.GetBaseProgramName()
+
+// 显式 CLI 参数的基础程序优先于配置；指定后自动启用增量编译
+// （与 ssa.withBaseProgramName 的语义一致：设置基础程序名即增量编译）
+if baseProgramNameFromParam != "" {
+    baseProgramName = baseProgramNameFromParam
+    if !enableIncrementalCompile {
+        enableIncrementalCompile = true
+        yakit.Info("显式指定了基础程序，自动启用增量编译")
+    }
+}
 
 // 通过 projectName 从数据库中获取最新的 program name
 lastProgramName = ""
@@ -76,19 +92,14 @@ if enableStructRule {
 
 if enableIncrementalCompile {
     opts = append(opts, ssa.withEnableIncrementalCompile(true))
-    
-    // 核心逻辑：如果开启了重新编译和增量编译，自动填充 baseProgramName
-    // 优先使用配置中显式设置的 baseProgramName，否则使用上一次编译的 program name
-    if reCompile && baseProgramName == "" {
-        // 使用配置中记录的上一次编译的 program name
-        if lastProgramName != "" {
-            baseProgramName = lastProgramName
-            yakit.Info("重新编译已启用增量编译，使用上一次编译的程序名称作为基础程序: %s", baseProgramName)
-        } else {
-            yakit.Info("重新编译已启用增量编译，但未找到上一次编译的程序名称，将作为首次增量编译（基础程序）")
-        }
+
+    // 基础程序自动解析：优先使用配置中显式指定的 baseProgramName，否则使用上一次编译的程序名称。
+    // 增量编译与重新编译（re_compile）无关：只要启用增量，就自动解析基础程序，不依赖 reCompile 开关。
+    if baseProgramName == "" && lastProgramName != "" {
+        baseProgramName = lastProgramName
+        yakit.Info("已启用增量编译，自动使用上一次编译的程序作为基础程序: %s", baseProgramName)
     }
-    
+
     if baseProgramName != "" {
         opts = append(opts, ssa.withBaseProgramName(baseProgramName))
         yakit.Info("已启用增量编译，基础程序: %s", baseProgramName)

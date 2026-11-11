@@ -30,7 +30,7 @@ func _open(conf *CaptureConfig, ctx context.Context, handler *PcapHandleWrapper)
 	if conf.onNetInterfaceCreated != nil {
 		conf.onNetInterfaceCreated(handler)
 	}
-	if conf.Filename != "" && len(conf.onEveryPacket) == 0 && conf.Output == nil && !conf.Debug {
+	if conf.Filename != "" && len(conf.onEveryPacket) == 0 && len(conf.beforeTransportPacket) == 0 && conf.Output == nil && !conf.Debug {
 		return openOfflineFast(conf, innerCtx, handler)
 	}
 	if conf.Filename == "" && conf.requiresExclusiveHandle() {
@@ -84,6 +84,12 @@ func Start(opt ...CaptureOption) (resultErr error) {
 	// actually needs a native handle (for example a BPF program).
 	if conf.Filename != "" && conf.BPFFilter == "" && conf.onNetInterfaceCreated == nil && !conf.EnableCache && conf.captureBuffer == 0 && len(conf.DeviceAdapter) == 0 && len(conf.Device) == 0 {
 		return replayFileWithConfig(conf.Filename, conf)
+	}
+	if conf.normalizePcapLength {
+		return errors.New("legacy PCAP length normalization requires offline replay")
+	}
+	if conf.ignoreEmbeddedSecrets {
+		return errors.New("ignoring embedded secrets requires offline replay")
 	}
 	if err := conf.prepareBinParser(); err != nil {
 		return err
@@ -205,7 +211,7 @@ func Start(opt ...CaptureOption) (resultErr error) {
 		conf.Context = context.Background()
 	}
 	ctx, cancel := context.WithCancel(conf.Context)
-	conf.trafficPool = newTrafficPool(ctx, conf.reassemblyOptions)
+	conf.trafficPool = newTrafficPool(ctx, conf.tcpPoolOptions())
 	conf.trafficPool.captureAccountingAvailable = !conf.EnableCache
 	defer func() {
 		conf.trafficPool.Close()

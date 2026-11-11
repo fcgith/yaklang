@@ -95,18 +95,43 @@ type Versioned[T versionedValue] struct {
 	// the version of variable in current scope
 	scope ScopedVersionedTableIF[T]
 
-	isAssigned *utils.AtomicBool
+	// Embedded to avoid one separate allocation per variable version.
+	isAssigned utils.AtomicBool
 	Value      T
+
+	// retainedID keeps the instruction id after the strong value is dropped.
+	// reload materializes it again on the next GetValue.
+	retainedID int64
+	reload     func(int64) (T, bool)
 
 	kind         VariableKind
 	pointHandler func(T, ScopedVersionedTableIF[T])
 }
 
 func (v *Versioned[T]) GetId() int64 {
-	if isZeroValue(v.Value) {
+	if v == nil {
 		return 0
 	}
-	return v.Value.GetId()
+	v.lock.RLock()
+	defer v.lock.RUnlock()
+	if !isZeroValue(v.Value) {
+		return v.Value.GetId()
+	}
+	return v.retainedID
+}
+
+// DetachRetained drops the strong value but keeps its id. GetValue reloads
+// that id on demand. The reload function must not call back into this version.
+func (v *Versioned[T]) DetachRetained(id int64, reload func(int64) (T, bool)) {
+	if v == nil || id == 0 {
+		return
+	}
+	v.lock.Lock()
+	defer v.lock.Unlock()
+	v.retainedID = id
+	v.reload = reload
+	var zero T
+	v.Value = zero
 }
 
 func (v *Versioned[T]) SetScope(s ScopedVersionedTableIF[T]) {
@@ -183,11 +208,7 @@ func (v *Versioned[T]) MarshalJSON() ([]byte, error) {
 	params["local"] = v.local
 	// params["scope"] = v.scope.GetPersistentId()
 	params["is_assigned"] = v.isAssigned.IsSet()
-	var valIdx int64 = 0
-	if !isZeroValue(v.Value) {
-		valIdx = v.Value.GetId()
-	}
-	params["value"] = valIdx
+	params["value"] = v.GetId()
 	return json.Marshal(params)
 }
 
@@ -199,7 +220,6 @@ func NewVersioned[T versionedValue](globalIndex int, name string, local bool, sc
 		lexicalName:     name,
 		local:           local,
 		scope:           scope,
-		isAssigned:      utils.NewAtomicBool(),
 	}
 	ret.captureVariable = ret
 	return ret
@@ -227,18 +247,77 @@ func (v *Versioned[T]) PointHandleOnce(value T, scope ScopedVersionedTableIF[T])
 }
 
 func (v *Versioned[T]) IsNil() bool {
-	var zero T
-	return v.Value == zero
+	if v == nil {
+		return true
+	}
+	v.lock.RLock()
+	defer v.lock.RUnlock()
+	if v.retainedID != 0 {
+		return false
+	}
+	return isZeroValue(v.Value)
 }
 
 func (v *Versioned[T]) GetValue() (ret T) {
-	return v.Value
+	if v == nil {
+		return ret
+	}
+	v.lock.Lock()
+	val := v.Value
+	reload := v.reload
+	id := v.retainedID
+	v.lock.Unlock()
+	if !isZeroValue(val) || reload == nil || id == 0 {
+		return val
+	}
+	loaded, ok := reload(id)
+	if !ok || isZeroValue(loaded) {
+		return val
+	}
+	v.lock.Lock()
+	if isZeroValue(v.Value) {
+		v.Value = loaded
+		v.reload = nil
+	}
+	val = v.Value
+	v.lock.Unlock()
+	return val
 }
 
+// Replace swaps val for to on this version. A released version replays its
+// value as a new object, so the caller's val no longer matches by pointer: the
+// retained instruction id identifies the same value and must be accepted too.
 func (v *Versioned[T]) Replace(val, to T) {
-	if v.Value == val {
-		v.Value = to
+	if v == nil {
+		return
 	}
+	v.lock.Lock()
+	defer v.lock.Unlock()
+	if !v.binds(val) {
+		return
+	}
+	v.retainedID = 0
+	v.reload = nil
+	v.Value = to
+}
+
+// binds reports whether val is the value this version currently holds. The
+// caller must hold v.lock.
+func (v *Versioned[T]) binds(val T) bool {
+	if v.Value == val {
+		return true
+	}
+	if isZeroValue(val) {
+		return false
+	}
+	id := val.GetId()
+	if id == 0 {
+		return false
+	}
+	if !isZeroValue(v.Value) {
+		return v.Value.GetId() == id
+	}
+	return v.retainedID == id
 }
 
 func (v *Versioned[T]) Assign(val T) error {
@@ -260,6 +339,10 @@ func (v *Versioned[T]) Assign(val T) error {
 			v.Value.SelfDelete()
 		}
 	}
+	v.lock.Lock()
+	v.retainedID = 0
+	v.reload = nil
+	v.lock.Unlock()
 	v.Value = val
 	return nil
 }

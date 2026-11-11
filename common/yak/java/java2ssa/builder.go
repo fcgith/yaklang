@@ -75,25 +75,37 @@ func (*SSABuilder) BuildFromAST(raw ssa.FrontAST, b *ssa.FunctionBuilder) error 
 	return nil
 }
 
-func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem, jarRecursiveParse bool) fi.FileSystem {
-	if fs == nil || !jarRecursiveParse {
+// WrapWithPreprocessedFS gives the compile a tree it can read as Java source:
+// archives become enterable directories and their class entries are presented
+// under .java names. expandArchive is the caller's decision to allow that
+// expansion at all; the incremental sequence turns it off so archive members
+// stay out of the walk.
+func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem, expandArchive bool) fi.FileSystem {
+	if fs == nil || !expandArchive {
 		return fs
 	}
-	if _, ok := fs.(*javaclassparser.ExpandedZipFS); ok {
+	if expanded, ok := fs.(*javaclassparser.ExpandedZipFS); ok {
+		// SSA parses the rendered text. Keep a unique original member when javac
+		// cannot recompile that spelling, instead of replacing the class with a
+		// failure comment.
+		expanded.SetRetainUnprovedSource(true)
 		return fs
 	}
 
-	wrapped := javaclassparser.MaybeWrapExpandedArchiveFS(fs, jarRecursiveParse)
+	wrapped := javaclassparser.MaybeWrapExpandedArchiveFS(fs, expandArchive)
+	if expanded, ok := wrapped.(*javaclassparser.ExpandedZipFS); ok {
+		expanded.SetRetainUnprovedSource(true)
+	}
 	if wrapped == fs {
 		return fs
 	}
-	// Jar/zip roots from parseFSFromInfo may already be UnifiedFS(.class -> .java).
-	if _, ok := fs.(*filesys.UnifiedFS); !ok {
-		wrapped = filesys.NewUnifiedFS(wrapped,
-			filesys.WithUnifiedFsExtMap(".class", ".java"),
-		)
+	// A caller that already presents class entries as source keeps its own view.
+	if _, ok := fs.(*filesys.UnifiedFS); ok {
+		return wrapped
 	}
-	return wrapped
+	return filesys.NewUnifiedFS(wrapped,
+		filesys.WithUnifiedFsExtMap(".class", ".java"),
+	)
 }
 
 func (*SSABuilder) FilterFile(path string) bool {
@@ -133,14 +145,52 @@ type singleFileBuilder struct {
 	stableAnonClassSeq   int
 }
 
+// forkForLazyBuild gives a deferred task its own mutable frontend state. A
+// file can contribute lazy functions to different libraries, which the unit
+// scheduler may drain concurrently. Sharing FunctionBuilder between those
+// tasks lets one task's SwitchFunctionBuilder/PopFunction clear another's
+// active builder. The file-level lookup maps are copied after declaration
+// pre-handling has finished, so lazy writes cannot race with sibling tasks.
+func (b *singleFileBuilder) forkForLazyBuild() *singleFileBuilder {
+	if b == nil {
+		return nil
+	}
+	fork := *b
+	fork.constMap = make(map[string]ssa.Value, len(b.constMap))
+	for key, value := range b.constMap {
+		fork.constMap[key] = value
+	}
+	fork.fullTypeNameMap = make(map[string][]string, len(b.fullTypeNameMap))
+	for key, values := range b.fullTypeNameMap {
+		fork.fullTypeNameMap[key] = append([]string(nil), values...)
+	}
+	fork.allImportPkgSlice = make([][]string, len(b.allImportPkgSlice))
+	for index, values := range b.allImportPkgSlice {
+		fork.allImportPkgSlice[index] = append([]string(nil), values...)
+	}
+	fork.selfPkgPath = append([]string(nil), b.selfPkgPath...)
+	return &fork
+}
+
 func Frontend(src string, caches ...*ssa.AntlrCache) (javaparser.ICompilationUnitContext, error) {
+	src = preprocessJavaUnicodeEscapes(src)
+	src = preprocessJavaRecordPatternSwitchCases(src)
+	src = normalizeDecompiledJava(src)
+	return parseFrontend(src, caches...)
+}
+
+// FrontendRaw checks generated Java without repairing decompiler output. Only
+// Java's Unicode-escape translation is applied. Preparation/verification must
+// not hide an upstream malformed signature or control-flow structure.
+func FrontendRaw(src string, caches ...*ssa.AntlrCache) (javaparser.ICompilationUnitContext, error) {
+	return parseFrontend(preprocessJavaUnicodeEscapes(src), caches...)
+}
+
+func parseFrontend(src string, caches ...*ssa.AntlrCache) (javaparser.ICompilationUnitContext, error) {
 	var cache *ssa.AntlrCache
 	if len(caches) > 0 {
 		cache = caches[0]
 	}
-	src = preprocessJavaUnicodeEscapes(src)
-	src = preprocessJavaRecordPatternSwitchCases(src)
-	src = normalizeDecompiledJava(src)
 	lexicalErrors := antlr4util.NewErrorListener()
 	ast, err := antlr4util.ParseASTWithSLLFirst(
 		src,
@@ -201,16 +251,17 @@ func (b *singleFileBuilder) ReadClassConst(className, key string) (ssa.Value, bo
 }
 
 func (b *singleFileBuilder) SwitchFunctionBuilder(s *ssa.StoredFunctionBuilder) func() {
-	t := b.StoreFunctionBuilder()
-	b.LoadBuilder(s)
+	previous := b.FunctionBuilder
+	execution, leave := s.EnterExecutionBuilder()
+	b.FunctionBuilder = execution
 	return func() {
-		b.LoadBuilder(t)
+		leave()
+		b.FunctionBuilder = previous
 	}
 }
 
 func (b *singleFileBuilder) LoadBuilder(s *ssa.StoredFunctionBuilder) {
-	b.FunctionBuilder = s.Current
-	b.LoadFunctionBuilder(s)
+	b.FunctionBuilder = s.NewExecutionBuilder()
 }
 
 func (b *singleFileBuilder) initImport() {

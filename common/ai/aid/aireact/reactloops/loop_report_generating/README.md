@@ -20,7 +20,7 @@
 │        ▼                   ▼                   ▼           │
 │  • read_reference    • write_section     • modify_section   │
 │  • grep_reference    • insert_section   • delete_section   │
-│  • search_knowledge  • modify_section                      │
+│  • query_knowledge_base（标准工具） • modify_section         │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -33,7 +33,7 @@
 |--------|------|----------|
 | `read_reference_file` | 读取参考文件内容 | 阅读文档、代码文件等 |
 | `grep_reference` | 正则搜索参考资料 | 在大文件中搜索关键信息 |
-| `search_knowledge` | 语义搜索知识库 | 从知识库获取相关知识 |
+| `query_knowledge_base`（标准工具） | 经 `yaklang-system` Skill / `require_tool` 加载后查询 | 指定完整库名或显式 `all=true`，并设置 token 预算 |
 
 ### 第二阶段：撰写报告
 
@@ -50,6 +50,8 @@
 ### 大报告分页功能
 
 当报告内容很大（超过约 30KB）时，系统会自动分页显示。使用 `change_view_offset` action 导航：
+
+文本协议示例（原生模式调用同名工具，参数为 `offset_line=51`）：
 
 ```json
 {"@action": "change_view_offset", "offset_line": 51, "human_readable_thought": "查看第51行之后的内容"}
@@ -68,11 +70,25 @@
 
 检查和完善报告内容，直到满足质量要求后调用 `finish`。
 
-## AITAG 输出规则
+## 调用协议与正文传递
 
-**关键规则：写作类 Action 必须使用 AITAG！**
+报告循环继承会话的 `FunctionCallMode`，持久提示词和每轮动态提示词按此配置渲染。原生模式使用 function call 模板；文本模式使用 `@action` 模板。
 
-当使用 `write_section`、`modify_section`、`insert_section` 时，必须在 JSON 后输出 AITAG 包裹的内容：
+### 原生 function call 模式
+
+`write_section`、`modify_section`、`insert_section` 的正文通过每次调用的 `arguments.content` 传递，不展示 AITAG 输出规则、标签示例或文本协议的输出示例。工具 schema 将 `content` 声明为必填参数，执行器直接读取该参数。
+
+例如调用 `write_section`，解码后的 arguments 为：
+
+```json
+{"identifier":"write_report","content":"# 报告标题\n\n## 第一章\n报告内容...\n"}
+```
+
+修改时在 `content` 中传递补丁，或配合 `old_snippet` / 行号定位替换；插入时另传 `insert_line`。同轮多个编辑调用各自携带自己的 `content`。文件保存并核对后调用 `finish`。
+
+### 文本 @action 模式
+
+当使用 `write_section`、`modify_section`、`insert_section` 时，必须在 action JSON 后输出 AITAG 包裹的内容：
 
 ```
 {"@action": "write_section", "human_readable_thought": "创建报告初稿"}
@@ -99,7 +115,6 @@ loop_report_generating/
 ├── code.go                      # 模式注册和初始化
 ├── action_read_reference.go     # 读取参考文件
 ├── action_grep_reference.go     # 搜索参考资料
-├── action_search_knowledge.go   # 知识库搜索
 ├── action_change_offset.go      # 切换视图偏移（分页导航）
 ├── init_task.go                 # 初始化任务（意图分析、文件准备）
 │   # write_section, modify_section, insert_section, delete_section
@@ -144,13 +159,13 @@ err = aim.InvokeReAct(
     aim.onEvent(func(react, event) {
         // 注意：event.Type 需要转换为字符串进行比较
         eventType = string(event.Type)
-        if eventType == "filesystem_pin_filename" {
+        if eventType == "report_finish" {
             // event.Content 是 []byte 类型
             contentStr = string(event.Content)
             try {
                 jsonData = json.loads(contentStr)
-                if jsonData != nil && jsonData["path"] != nil {
-                    reportFilename = jsonData["path"]
+                if jsonData != nil && jsonData["report_path"] != nil {
+                    reportFilename = jsonData["report_path"]
                     log.Info("Report file: %s", reportFilename)
                 }
             } catch e {

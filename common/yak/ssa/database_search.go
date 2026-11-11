@@ -52,6 +52,23 @@ func MatchInstructionByOpcodesResident(prog *Program, opcodes ...Opcode) []Instr
 	return insts
 }
 
+// IndexResidentInstructionsByOpcode snapshots live IR for one read-only scan.
+// The caller owns its lifetime and must discard it before building more IR.
+func IndexResidentInstructionsByOpcode(prog *Program, allow func(Instruction) bool) map[Opcode][]Instruction {
+	index := make(map[Opcode][]Instruction)
+	if prog == nil || prog.Cache == nil || prog.Cache.instructions == nil {
+		return index
+	}
+	for _, inst := range prog.Cache.instructions.snapshotResident() {
+		if inst == nil || (allow != nil && !allow(inst)) {
+			continue
+		}
+		opcode := inst.GetOpcode()
+		index[opcode] = append(index[opcode], inst)
+	}
+	return index
+}
+
 // InstructionFilePath is the exported form of getInstructionFilePath.
 func InstructionFilePath(inst Instruction) string {
 	return getInstructionFilePath(inst)
@@ -183,6 +200,18 @@ func matchInstructionsByVariableWithFileFilter(
 			check = func(s string) bool { return matcher.MatchString(s) }
 		default:
 			return
+		}
+
+		// Exact name and member lookup is a map read. Scanning every key
+		// repeats the whole index for each syntaxflow variable filter.
+		// Constant-type matches still compare instruction text.
+		if compareMode == ssadb.ExactCompare && matchMode&^ssadb.ConstType != 0 {
+			insts := prog.Cache.findByVariableName(matchMode&^ssadb.ConstType, name)
+			addRes(filterInstructionsByFiles(prog, insts, includeFiles, excludeFiles)...)
+			if matchMode&ssadb.ConstType == 0 {
+				return
+			}
+			matchMode = ssadb.ConstType
 		}
 
 		insts := prog.Cache.findByVariableEx(matchMode, check)

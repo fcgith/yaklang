@@ -84,7 +84,8 @@ func DeleteAllAttachedAIReActSchedules(projectDB *gorm.DB) (int64, error) {
 
 // DeleteAISession deletes all persistent-session scoped data from projectDB:
 // - AIAgentRuntime rows (by persistent_session)
-// - AiCheckpoint, AiOutputEvent rows and their process associations (by session_id/runtime)
+// - AISessionTaskInput, AiCheckpoint, AiOutputEvent rows and their process associations
+//   (by session_id/runtime)
 func DeleteAISession(projectDB *gorm.DB, sessionId string) (deletedRuntimes int64, deletedEvents int64, err error) {
 	if sessionId == "" {
 		return 0, 0, utils.Errorf("sessionId is empty")
@@ -98,6 +99,9 @@ func DeleteAISession(projectDB *gorm.DB, sessionId string) (deletedRuntimes int6
 
 	_, err = DeleteAISessionMetaBySessionID(projectDB, sessionId)
 	if err != nil {
+		return 0, 0, err
+	}
+	if err = DeleteAISessionTaskInputsBySessionID(projectDB, sessionId); err != nil {
 		return 0, 0, err
 	}
 
@@ -125,12 +129,16 @@ func DeleteAISession(projectDB *gorm.DB, sessionId string) (deletedRuntimes int6
 	if err = DeleteAISessionPlanAndExecBySessionID(projectDB, sessionId); err != nil {
 		return deletedRuntimes, deletedEvents, err
 	}
+	if err = DeleteAITrajectories(projectDB, sessionId); err != nil {
+		return deletedRuntimes, deletedEvents, err
+	}
 
 	return deletedRuntimes, deletedEvents, nil
 }
 
 // DeleteAllAISessionData deletes all session-scoped data from projectDB:
-// - AISession meta, AIAgentRuntime, AiCheckpoint, AiOutputEvent + associations, AISessionPlanAndExec
+// - AISession meta and task inputs, AIAgentRuntime, AiCheckpoint,
+//   AiOutputEvent + associations, AISessionPlanAndExec
 func DeleteAllAISessionData(projectDB *gorm.DB) (deletedSessions int64, deletedRuntimes int64, deletedEvents int64, deletedPlanExec int64, err error) {
 	if projectDB == nil {
 		return 0, 0, 0, 0, utils.Errorf("projectDB is nil")
@@ -142,6 +150,9 @@ func DeleteAllAISessionData(projectDB *gorm.DB) (deletedSessions int64, deletedR
 	deletedSessions, err = DeleteAllAISessionMeta(projectDB)
 	if err != nil {
 		return 0, 0, 0, 0, err
+	}
+	if err = DeleteAllAISessionTaskInputs(projectDB); err != nil {
+		return deletedSessions, 0, 0, 0, err
 	}
 
 	deletedRuntimes, err = DeleteAllAgentRuntime(projectDB)
@@ -161,6 +172,9 @@ func DeleteAllAISessionData(projectDB *gorm.DB) (deletedSessions int64, deletedR
 	deletedPlanExec, err = DeleteAllAISessionPlanAndExec(projectDB)
 	if err != nil {
 		return deletedSessions, deletedRuntimes, deletedEvents, 0, err
+	}
+	if err = DeleteAllAITrajectories(projectDB); err != nil {
+		return deletedSessions, deletedRuntimes, deletedEvents, deletedPlanExec, err
 	}
 
 	return deletedSessions, deletedRuntimes, deletedEvents, deletedPlanExec, nil

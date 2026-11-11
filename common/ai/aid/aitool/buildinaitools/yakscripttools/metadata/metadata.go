@@ -21,12 +21,13 @@ func GetYakScript(fs embed.FS, name string) (string, error) {
 }
 
 type YakScriptMetadata struct {
+	DefaultAsync  bool // __ASYNC__: submit the tool to its owner loop by default.
 	Name          string
 	VerboseName   string // English display (__VERBOSE_NAME__)
 	VerboseNameZh string // Chinese display (__VERBOSE_NAME_ZH__)
 	Description   string
 	Keywords      []string
-	// Usage 工具使用说明，在参数生成阶段(第2阶段)披露给 AI
+	// Usage 工具使用说明，包含使用原则、参数建议和调用示例，供 AI 结合工具定义使用。
 	Usage            string
 	EnableForAI      bool
 	InputConstraints string // __INPUT_CONSTRAINTS__: JSON Schema applied in addition to CLI properties
@@ -85,7 +86,14 @@ func ParseYakScriptMetadataProg(name string, prog *ssaapi.Program) (*YakScriptMe
 		}
 	})
 
+	defaultAsync := false
+	prog.Ref("__ASYNC__").ForEach(func(value *ssaapi.Value) {
+		if value.IsConstInst() && value.String() == "true" {
+			defaultAsync = true
+		}
+	})
 	return &YakScriptMetadata{
+		DefaultAsync:     defaultAsync,
 		InputConstraints: firstConstString(prog, "__INPUT_CONSTRAINTS__"),
 		Name:             name,
 		VerboseName:      verboseName,

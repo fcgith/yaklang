@@ -1,7 +1,10 @@
 package minirehs
 
 import (
+	"errors"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/yaklang/yaklang/common/utils"
 )
@@ -13,11 +16,8 @@ import (
 //
 // 完成"成百上千条正则统一编译, 一次扫描判定哪些命中"的 Hyperscan 式批量匹配。
 //
-// 后端策略 (默认 CGO 最强 + 按系统逐步退化, 见 selectBackend / mvs_cgo.go vs mvs_stub.go):
-//   - 默认走自托管 mvscan (BackendMVS): 启用 CGO 时自动编入纯 C99 位并行内核 (最强档);
-//     无 CGO (CGO_ENABLED=0) 时优雅退化为纯 Go 参考执行器, 全平台可移植、功能一致。
-//   - 全程零外部依赖、不加载任何动态库 (不依赖 libhs/vectorscan); 这是本引擎自托管、可移植、
-//     "分发不崩溃"的核心定位。
+// 后端默认走自托管 mvscan (BackendMVS)，自动编入自带纯 C99 位并行内核。
+// 构建需要 cgo；非 RE2 正则只通过现有 VillanCh/go-pcre2-lite 确认，不依赖 libhs/vectorscan。
 //
 // 关键词: rehs, BuildGroup, 多正则批量匹配, compile then scan, Exports, yak
 
@@ -25,8 +25,19 @@ import (
 type Group struct {
 	db    Database
 	exprs []string
-	pool  sync.Pool
+	// Idle scratches own permanent workers. A bounded, drainable cache keeps
+	// them reachable until explicit Close/eviction instead of losing them to
+	// sync.Pool's GC eviction. The high state bit closes admission; low bits
+	// count borrowers through their complete return/cleanup.
+	pool      chan Scratch
+	state     atomic.Uint64
+	drained   chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
+
+const groupClosingBit uint64 = 1 << 63
+const maxGroupIdleScratch = 4
 
 // GroupMatch 是一次命中, 字段对 yak 友好。
 type GroupMatch struct {
@@ -140,7 +151,7 @@ func backendFromName(name string) BackendKind {
 func BuildGroup(patterns interface{}, opts ...GroupOption) (*Group, error) {
 	exprs := utils.InterfaceToStringSlice(patterns)
 	if len(exprs) == 0 {
-		return nil, utils.Error("rehs.BuildGroup: empty pattern list")
+		return nil, errors.New("rehs.BuildGroup: empty pattern list")
 	}
 
 	gc := &groupConfig{backend: BackendMVS, minLiteralLen: 2}
@@ -175,25 +186,77 @@ func BuildGroup(patterns interface{}, opts ...GroupOption) (*Group, error) {
 		return nil, err
 	}
 
-	g := &Group{db: db, exprs: append([]string(nil), exprs...)}
-	g.pool.New = func() interface{} {
-		sc, _ := g.db.NewScratch()
-		return sc
+	idle := runtime.GOMAXPROCS(0)
+	if idle > maxGroupIdleScratch {
+		idle = maxGroupIdleScratch
 	}
+	g := &Group{db: db, exprs: append([]string(nil), exprs...), pool: make(chan Scratch, idle), drained: make(chan struct{})}
+	runtime.SetFinalizer(g, func(group *Group) { _ = group.Close() })
 	return g, nil
 }
 
-func (g *Group) getScratch() Scratch {
-	if s, ok := g.pool.Get().(Scratch); ok && s != nil {
-		return s
+func (g *Group) getScratchErr() (Scratch, error) {
+	if g == nil || g.db == nil {
+		return nil, &ScanError{Record: -1, Stage: "scratch", Category: "invalid_state", Incomplete: true, Err: errors.New("uninitialized group")}
 	}
-	s, _ := g.db.NewScratch()
-	return s
+	for {
+		state := g.state.Load()
+		if state&groupClosingBit != 0 {
+			return nil, closedScanError()
+		}
+		if state == groupClosingBit-1 {
+			return nil, &ScanError{Record: -1, Stage: "scratch", Category: "overflow", Incomplete: true, Err: errors.New("group borrower count overflow")}
+		}
+		if g.state.CompareAndSwap(state, state+1) {
+			break
+		}
+	}
+	select {
+	case s := <-g.pool:
+		return s, nil
+	default:
+	}
+	s, err := g.db.NewScratch()
+	if err != nil {
+		g.putScratch(nil) // release admission even when scratch allocation fails
+		var execution *ScanError
+		if errors.As(err, &execution) {
+			return nil, err
+		}
+		category := "execution"
+		if errors.Is(err, ErrClosed) {
+			category = "closed"
+		}
+		return nil, &ScanError{Record: -1, Stage: "scratch", Category: category, Incomplete: true, Err: err}
+	}
+	return s, nil
 }
 
 func (g *Group) putScratch(s Scratch) {
 	if s != nil {
-		g.pool.Put(s)
+		keep := false
+		if g.state.Load()&groupClosingBit == 0 {
+			oversized := false
+			if work, ok := s.(*scratch); ok {
+				oversized = work.groupPoolOversized()
+			}
+			if !oversized {
+				select {
+				case g.pool <- s:
+					keep = true
+				default:
+				}
+			}
+		}
+		if !keep {
+			_ = s.Close()
+		}
+	}
+	// Close waits until every return has either cached or closed its scratch.
+	// A return racing the closing bit may cache; Close drains it after this
+	// last decrement, so the scratch cannot be stranded in the idle channel.
+	if g.state.Add(^uint64(0)) == groupClosingBit {
+		close(g.drained)
 	}
 }
 
@@ -218,15 +281,28 @@ func (g *Group) toGroupMatch(m Match, data []byte) *GroupMatch {
 // 返回值:
 //   - 是否至少命中一条正则
 func (g *Group) Match(data interface{}) bool {
+	found, err := g.MatchErr(data)
+	if err != nil {
+		panic(err)
+	}
+	return found
+}
+
+// MatchErr reports execution failures instead of treating them as NoMatch.
+// Match retains its original signature and panics on those failures.
+func (g *Group) MatchErr(data interface{}) (bool, error) {
 	b := utils.InterfaceToBytes(data)
-	sc := g.getScratch()
+	sc, err := g.getScratchErr()
+	if err != nil {
+		return false, err
+	}
 	defer g.putScratch(sc)
 	found := false
-	_ = g.db.Scan(b, sc, func(m Match) bool {
+	err = g.db.Scan(b, sc, func(m Match) bool {
 		found = true
 		return false // 命中即停
 	})
-	return found
+	return found, err
 }
 
 // MatchString 是 Match 的字符串便捷封装（导出名为 group.MatchString）。
@@ -234,6 +310,9 @@ func (g *Group) MatchString(s string) bool { return g.Match(s) }
 
 // MatchBytes 是 Match 的字节切片便捷封装（导出名为 group.MatchBytes）。
 func (g *Group) MatchBytes(b []byte) bool { return g.Match(b) }
+
+func (g *Group) MatchStringErr(s string) (bool, error) { return g.MatchErr(s) }
+func (g *Group) MatchBytesErr(b []byte) (bool, error)  { return g.MatchErr(b) }
 
 // Find 返回 data 中所有命中（导出名为 group.Find）
 //
@@ -246,15 +325,27 @@ func (g *Group) MatchBytes(b []byte) bool { return g.Match(b) }
 // 返回值:
 //   - 命中列表，元素字段：Index / Pattern / From / To / Value
 func (g *Group) Find(data interface{}) []*GroupMatch {
+	out, err := g.FindErr(data)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// FindErr returns the observed prefix and an error if the scan is incomplete.
+func (g *Group) FindErr(data interface{}) ([]*GroupMatch, error) {
 	b := utils.InterfaceToBytes(data)
-	sc := g.getScratch()
+	sc, err := g.getScratchErr()
+	if err != nil {
+		return nil, err
+	}
 	defer g.putScratch(sc)
 	var out []*GroupMatch
-	_ = g.db.Scan(b, sc, func(m Match) bool {
+	err = g.db.Scan(b, sc, func(m Match) bool {
 		out = append(out, g.toGroupMatch(m, b))
 		return true
 	})
-	return out
+	return out, err
 }
 
 // MatchedIndexes 返回命中的正则下标集合（按首次命中序去重；导出名为 group.MatchedIndexes）
@@ -265,12 +356,24 @@ func (g *Group) Find(data interface{}) []*GroupMatch {
 // 返回值:
 //   - 命中的正则下标列表
 func (g *Group) MatchedIndexes(data interface{}) []int {
+	out, err := g.MatchedIndexesErr(data)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// MatchedIndexesErr preserves first-hit order and retains an incomplete prefix.
+func (g *Group) MatchedIndexesErr(data interface{}) ([]int, error) {
 	b := utils.InterfaceToBytes(data)
-	sc := g.getScratch()
+	sc, err := g.getScratchErr()
+	if err != nil {
+		return nil, err
+	}
 	defer g.putScratch(sc)
 	seen := make(map[int]struct{})
 	var out []int
-	_ = g.db.Scan(b, sc, func(m Match) bool {
+	err = g.db.Scan(b, sc, func(m Match) bool {
 		id := int(m.ID)
 		if _, ok := seen[id]; !ok {
 			seen[id] = struct{}{}
@@ -278,7 +381,7 @@ func (g *Group) MatchedIndexes(data interface{}) []int {
 		}
 		return true
 	})
-	return out
+	return out, err
 }
 
 // MatchedPatterns 返回命中的正则表达式集合（按首次命中序去重；导出名为 group.MatchedPatterns）
@@ -289,14 +392,22 @@ func (g *Group) MatchedIndexes(data interface{}) []int {
 // 返回值:
 //   - 命中的正则表达式列表
 func (g *Group) MatchedPatterns(data interface{}) []string {
-	idxs := g.MatchedIndexes(data)
+	out, err := g.MatchedPatternsErr(data)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+func (g *Group) MatchedPatternsErr(data interface{}) ([]string, error) {
+	idxs, err := g.MatchedIndexesErr(data)
 	out := make([]string, 0, len(idxs))
 	for _, i := range idxs {
 		if i >= 0 && i < len(g.exprs) {
 			out = append(out, g.exprs[i])
 		}
 	}
-	return out
+	return out, err
 }
 
 // Count 返回 data 中命中的总次数（含同一正则的多次命中；导出名为 group.Count）
@@ -307,15 +418,27 @@ func (g *Group) MatchedPatterns(data interface{}) []string {
 // 返回值:
 //   - 命中总次数
 func (g *Group) Count(data interface{}) int {
+	n, err := g.CountErr(data)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+// CountErr returns a partial count together with any execution failure.
+func (g *Group) CountErr(data interface{}) (int, error) {
 	b := utils.InterfaceToBytes(data)
-	sc := g.getScratch()
+	sc, err := g.getScratchErr()
+	if err != nil {
+		return 0, err
+	}
 	defer g.putScratch(sc)
 	n := 0
-	_ = g.db.Scan(b, sc, func(m Match) bool {
+	err = g.db.Scan(b, sc, func(m Match) bool {
 		n++
 		return true
 	})
-	return n
+	return n, err
 }
 
 // Scan 流式扫描 data，每命中一次回调 cb（导出名为 group.Scan）
@@ -326,10 +449,20 @@ func (g *Group) Count(data interface{}) int {
 //   - data: 待扫描数据
 //   - cb: 命中回调，参数为 *GroupMatch
 func (g *Group) Scan(data interface{}, cb func(*GroupMatch) bool) {
+	if err := g.ScanErr(data, cb); err != nil {
+		panic(err)
+	}
+}
+
+// ScanErr returns the execution error; callbacks before it are not rolled back.
+func (g *Group) ScanErr(data interface{}, cb func(*GroupMatch) bool) error {
 	b := utils.InterfaceToBytes(data)
-	sc := g.getScratch()
+	sc, err := g.getScratchErr()
+	if err != nil {
+		return err
+	}
 	defer g.putScratch(sc)
-	_ = g.db.Scan(b, sc, func(m Match) bool {
+	return g.db.Scan(b, sc, func(m Match) bool {
 		if cb == nil {
 			return true
 		}
@@ -351,11 +484,46 @@ func (g *Group) Len() int { return len(g.exprs) }
 //   - DatabaseInfo 结构体
 func (g *Group) Info() DatabaseInfo { return g.db.Info() }
 
-// Close 释放后端持有的本地资源（导出名为 group.Close；纯 Go 后端为 no-op）。
+// Close 结束扫描生命周期并释放本地资源（导出名为 group.Close）。
+// 停止接收新扫描并等待已借出的 scratch 归还，再关闭空闲 workers 和 DB。
+// 不得在同一 Group 的 handler 内调用 Close；关闭后旧无 error 签名的入口会 panic。
 //
 // 返回值:
 //   - 释放失败时的错误信息
-func (g *Group) Close() error { return g.db.Close() }
+func (g *Group) Close() error {
+	if g == nil {
+		return nil
+	}
+	g.closeOnce.Do(func() {
+		runtime.SetFinalizer(g, nil)
+		var state uint64
+		for {
+			state = g.state.Load()
+			if g.state.CompareAndSwap(state, state|groupClosingBit) {
+				break
+			}
+		}
+		if state&(groupClosingBit-1) != 0 {
+			<-g.drained
+		}
+		for {
+			select {
+			case s := <-g.pool:
+				if err := s.Close(); err != nil {
+					g.closeErr = errors.Join(g.closeErr, err)
+				}
+			default:
+				if g.db != nil {
+					if err := g.db.Close(); err != nil {
+						g.closeErr = errors.Join(g.closeErr, err)
+					}
+				}
+				return
+			}
+		}
+	})
+	return g.closeErr
+}
 
 // MatchAny 一次性判定 data 是否命中 patterns 中任意一条正则（导出名为 rehs.MatchAny）
 //
@@ -368,7 +536,7 @@ func (g *Group) Close() error { return g.db.Close() }
 //
 // 返回值:
 //   - ok: 是否至少命中一条正则
-//   - err: patterns 无效或编译失败时返回错误
+//   - err: patterns 无效、编译失败或执行失败时返回错误
 //
 // <|EXAMPLE_START|> 一次性存在性判定
 // ```
@@ -385,7 +553,7 @@ func MatchAny(patterns interface{}, data interface{}) (bool, error) {
 		return false, err
 	}
 	defer g.Close()
-	return g.Match(data), nil
+	return g.MatchErr(data)
 }
 
 // rehsCaseInsensitive 启用大小写不敏感匹配（导出名为 rehs.caseInsensitive）

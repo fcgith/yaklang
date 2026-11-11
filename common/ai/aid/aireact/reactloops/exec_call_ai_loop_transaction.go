@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
@@ -42,12 +43,13 @@ func failedLoopStopReason(descriptor *LoopResultDescriptor, err error) LoopStopR
 // LoopCall keeps the native call identity alongside the existing action pair.
 // The executor can use ToolCallID to return a matching tool result later.
 type LoopCall struct {
-	Action        *aicommon.Action
-	LoopAction    *LoopAction
-	ToolCallID    string
-	Index         int
-	Description   string
-	ArgumentsJSON string
+	Action             *aicommon.Action
+	LoopAction         *LoopAction
+	ToolCallID         string
+	Index              int
+	Description        string
+	ArgumentsJSON      string
+	trajectoryResponse aicommon.TrajectoryResponseReceipt
 }
 
 // Callbacks own their readers until EOF and must not return while another
@@ -71,15 +73,45 @@ type LoopResultSnapshot struct {
 }
 
 type LoopResultDescriptor struct {
-	mu            sync.RWMutex
-	snapshot      LoopResultSnapshot
-	contentReady  bool
-	providerReady bool
-	output        string
-	reason        string
-	calls         []*aispec.ToolCall
-	done          chan struct{}
-	once          sync.Once
+	mu                 sync.RWMutex
+	snapshot           LoopResultSnapshot
+	contentReady       bool
+	providerReady      bool
+	output             string
+	reason             string
+	calls              []*aispec.ToolCall
+	done               chan struct{}
+	once               sync.Once
+	trajectoryReceiver atomic.Pointer[trajectoryResponseReceiver]
+}
+
+type trajectoryResponseReceiver struct {
+	delivered atomic.Bool
+	receive   func(string)
+}
+
+func (r *trajectoryResponseReceiver) deliver(response string) {
+	defer aicommon.RecoverTrajectoryCollection()
+	if r != nil && r.delivered.CompareAndSwap(false, true) {
+		r.receive(response)
+	}
+}
+
+// A committed compression subscribes without waiting for either the descriptor
+// lock or provider completion. The receiver only submits a bounded write job.
+func (d *LoopResultDescriptor) onTrajectoryResponse(receive func(string)) {
+	if d == nil || receive == nil {
+		return
+	}
+	receiver := &trajectoryResponseReceiver{receive: receive}
+	d.trajectoryReceiver.Store(receiver)
+	select {
+	case <-d.done:
+		// ResponseJSON is immutable after done closes. Avoid acquiring the
+		// descriptor lock on the task's foreground collection path.
+		receiver.deliver(d.snapshot.ResponseJSON)
+	default:
+	}
 }
 
 func newLoopResultDescriptor(mode string) *LoopResultDescriptor {
@@ -202,6 +234,7 @@ func (d *LoopResultDescriptor) finalizeLocked() {
 	}
 	d.snapshot.Complete = true
 	d.once.Do(func() { close(d.done) })
+	d.trajectoryReceiver.Load().deliver(d.snapshot.ResponseJSON)
 }
 
 // callAILoopTransaction only decides and validates the model's proposed calls.
@@ -233,6 +266,11 @@ func (r *ReActLoop) emitLoopGeneralOutput(outputReader, reasonReader io.Reader) 
 		taskIndex = task.GetIndex()
 	}
 	emitter := r.GetEmitter()
+	if r.promptMode == aicommon.LoopPromptModeCompressContext {
+		// Compression is internal bookkeeping. Drain accidental content/reasoning
+		// without displaying it; the transaction still captures both for diagnostics.
+		emitter = nil
+	}
 	consume := func(reader io.Reader, node string, system bool) {
 		if emitter == nil {
 			_, _ = io.Copy(io.Discard, reader)
@@ -479,6 +517,7 @@ func (r *ReActLoop) callAIFunctionTransaction(
 	prompt, nonce string, generalOutputCallback LoopGeneralOutputCallback,
 	functionCallOutputCallback LoopFunctionCallOutputCallback,
 ) ([]LoopCall, LoopStopReason, *LoopResultDescriptor, error) {
+	callLabel := fmt.Sprintf(fmt.Sprintf("react-loop:%s", r.loopName))
 	descriptor := newLoopResultDescriptor("functioncall")
 	// Capture once for all retries. Registered handlers are not necessarily
 	// advertised tools (planning handoff, init constraints, disabled actions).
@@ -488,6 +527,12 @@ func (r *ReActLoop) callAIFunctionTransaction(
 	if advertisedActions == nil {
 		// Compatibility for callers using a supplied prompt without loop assembly.
 		availableActions = r.GetAllActionNames()
+	}
+	compressionMode := r.promptMode == aicommon.LoopPromptModeCompressContext
+	if compressionMode {
+		advertisedActions = []string{aicommon.ContextCompressionAction}
+		availableActions = advertisedActions
+		callLabel = aicommon.CallerLabelContextCompress
 	}
 	activeTaskCtx := r.config.GetContext()
 	if task := r.GetCurrentTask(); task != nil && !utils.IsNil(task.GetContext()) {
@@ -604,10 +649,13 @@ func (r *ReActLoop) callAIFunctionTransaction(
 		)(req)
 	})
 	requestOpts := []aicommon.AIRequestOption{
-		aicommon.WithAIRequest_CallerLabel(fmt.Sprintf("react-loop:%s", r.loopName)),
+		aicommon.WithAIRequest_CallerLabel(callLabel),
 		aicommon.WithAIRequest_Context(activeTaskCtx),
 		captureOption,
 	}
+	// Inherit the model's configured thinking level so compression can reuse
+	// the preceding main-model prefix without a forced mode switch.
+
 	postHandler := func(resp *aicommon.AIResponse) error {
 		r.clearCallsExecutionValues(acceptedCalls)
 		acceptedCalls = nil
@@ -655,20 +703,19 @@ func (r *ReActLoop) callAIFunctionTransaction(
 		rawCalls, err := collector.finish()
 		fieldStream.activity.close()
 		lastOutput, lastReason, lastRawCalls = output.String(), reason.String(), rawCalls
-		if callbackErr != nil {
-			return callbackErr
-		}
+		r.warnOptionalOutputFailure("general output callback", callbackErr)
 		if err != nil {
 			return err
 		}
-		if err := fieldStream.error(); err != nil {
-			return err
-		}
+		r.warnOptionalOutputFailure("field display", fieldStream.error())
 		if descriptor.Snapshot().ProviderFinishReason != "tool_calls" {
-			return utils.Errorf("function-call response ended with %q, expected tool_calls", descriptor.Snapshot().ProviderFinishReason)
+			return aicommon.NewRecoverableError(utils.Errorf(
+				"function-call response ended with %q, expected tool_calls",
+				descriptor.Snapshot().ProviderFinishReason,
+			))
 		}
 		if len(rawCalls) == 0 {
-			return utils.Error("function-call response contained no tool calls")
+			return aicommon.NewRecoverableError(utils.Error("function-call response contained no tool calls"))
 		}
 		r.Delete(loopVarNativeTodoBatchAdjusted)
 		defer r.Delete(loopVarNativeTodoBatchAdjusted)
@@ -681,7 +728,10 @@ func (r *ReActLoop) callAIFunctionTransaction(
 		}()
 		for _, rawCall := range rawCalls {
 			if !validActionToolName(rawCall.Function.Name) {
-				return utils.Errorf("invalid function-call action name %q", rawCall.Function.Name)
+				return aicommon.NewRecoverableError(utils.Errorf(
+					"invalid function-call action name %q",
+					rawCall.Function.Name,
+				))
 			}
 			if advertisedActions != nil && !slices.Contains(advertisedActions, rawCall.Function.Name) {
 				return actionTypeResolutionError(rawCall.Function.Name, availableActions,
@@ -694,20 +744,38 @@ func (r *ReActLoop) callAIFunctionTransaction(
 			params := make(map[string]any)
 			dec := json.NewDecoder(strings.NewReader(rawCall.Function.Arguments))
 			if err := dec.Decode(&params); err != nil {
-				return fmt.Errorf("invalid JSON arguments for tool call %q: %w", rawCall.ID, err)
+				return aicommon.NewRecoverableError(fmt.Errorf(
+					"invalid JSON arguments for tool call %q: %w",
+					rawCall.ID,
+					err,
+				))
 			}
 			if params == nil {
-				return utils.Errorf("invalid JSON arguments for tool call %q: expected a non-null object", rawCall.ID)
+				return aicommon.NewRecoverableError(utils.Errorf(
+					"invalid JSON arguments for tool call %q: expected a non-null object",
+					rawCall.ID,
+				))
 			}
 			var extra any
 			if err := dec.Decode(&extra); err != io.EOF {
 				if err != nil {
-					return fmt.Errorf("trailing JSON arguments for tool call %q: %w", rawCall.ID, err)
+					return aicommon.NewRecoverableError(fmt.Errorf(
+						"trailing JSON arguments for tool call %q: %w",
+						rawCall.ID,
+						err,
+					))
 				}
-				return utils.Errorf("trailing JSON arguments for tool call %q", rawCall.ID)
+				return aicommon.NewRecoverableError(utils.Errorf(
+					"trailing JSON arguments for tool call %q",
+					rawCall.ID,
+				))
 			}
 			if proposed, exists := params["@action"]; exists && proposed != rawCall.Function.Name {
-				return utils.Errorf("tool call %q has conflicting @action %v", rawCall.ID, proposed)
+				return aicommon.NewRecoverableError(utils.Errorf(
+					"tool call %q has conflicting @action %v",
+					rawCall.ID,
+					proposed,
+				))
 			}
 			params["@action"] = rawCall.Function.Name
 			action := aicommon.NewSimpleAction(rawCall.Function.Name, aitool.InvokeParams(params))
@@ -716,6 +784,13 @@ func (r *ReActLoop) callAIFunctionTransaction(
 				Index: rawCall.Index, Description: rawCall.Description,
 				ArgumentsJSON: rawCall.Function.Arguments,
 			})
+		}
+
+		if compressionMode && len(calls) != 1 {
+			return aicommon.NewRecoverableError(utils.Errorf(
+				"compress_context must be called exactly once in compression mode, got %d calls",
+				len(calls),
+			))
 		}
 
 		// Normalize all deltas before action-specific verification. An adjustment
@@ -737,13 +812,15 @@ func (r *ReActLoop) callAIFunctionTransaction(
 					aicommon.WithStatusCode("action.verifying"),
 					aicommon.WithStatusProgress(int64(index+1), int64(len(calls)), "action"))
 				if err := call.LoopAction.ActionVerifier(r, call.Action); err != nil {
-					return utils.Wrapf(err, "verify tool call %q", call.ToolCallID)
+					return aicommon.NewRecoverableError(utils.Wrapf(
+						err,
+						"verify tool call %q",
+						call.ToolCallID,
+					))
 				}
 			}
 		}
-		if err := r.emitNativeActionStreamFields(resp, calls, fieldStream); err != nil {
-			return err
-		}
+		r.warnOptionalOutputFailure("field emission", r.emitNativeActionStreamFields(resp, calls, fieldStream))
 		acceptedCalls = calls
 		verified = true
 		r.Set("last_ai_decision_nonce", nonce)
@@ -802,6 +879,12 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 		}
 	}()
 	var actionNames = r.GetAllActionNames()
+	var callLabel = fmt.Sprintf("react-loop:%s", r.loopName)
+	compressionMode := r.promptMode == aicommon.LoopPromptModeCompressContext
+	if compressionMode {
+		actionNames = []string{aicommon.ContextCompressionAction}
+		callLabel = aicommon.CallerLabelContextCompress
+	}
 	// Bind the provider request to the immutable task that owns this
 	// transaction. ReAct.currentTask may temporarily point at a nested loop,
 	// while Stop cancels the queue-owned task context. If the request only uses
@@ -811,10 +894,6 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 	activeTaskCtx := r.config.GetContext()
 	if activeTask != nil && !utils.IsNil(activeTask.GetContext()) {
 		activeTaskCtx = activeTask.GetContext()
-	}
-
-	getNextActionType := func(a *aicommon.Action) string { //legacy support
-		return inferActionTypeFromPayload(a, r.Get("tag_final_answer"))
 	}
 
 	ctxCanceled := utils.NewBool(false)
@@ -864,7 +943,7 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 		}
 	}()
 	requestOpts := []aicommon.AIRequestOption{
-		aicommon.WithAIRequest_CallerLabel(fmt.Sprintf("react-loop:%s", r.loopName)),
+		aicommon.WithAIRequest_CallerLabel(callLabel),
 		aicommon.WithAIRequest_Context(activeTaskCtx),
 		func(req *aicommon.AIRequest) {
 			resetActivity(false)
@@ -882,6 +961,8 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 				})(req)
 		},
 	}
+	// Inherit the model's configured thinking level so compression can reuse
+	// the preceding main-model prefix without a forced mode switch.
 	var acceptedResp *aicommon.AIResponse
 
 	postHandler := func(resp *aicommon.AIResponse) (err error) {
@@ -932,6 +1013,11 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 			}
 		}
 		var actionErr error
+		for _, field := range streamFields.Values() {
+			if field.RawJSON {
+				tagOptions = append(tagOptions, aicommon.WithActionCanonicalStreamFields(field.FieldName))
+			}
+		}
 		options := append(tagOptions, aicommon.WithActionAlias(actionNames...),
 			aicommon.WithActionFieldCallback(func(key string, value any, parents []string) {
 				activity.field("text", key, value, parents)
@@ -966,6 +1052,9 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 						log.Warnf("stream field [%s] not found in streamFields, skipping", key)
 						done()
 						return
+					}
+					if fieldIns.RawJSON {
+						jsonReader.Reader = utils.UTF8Reader(reader)
 					}
 
 					pr, pw := utils.NewPipe()
@@ -1055,7 +1144,7 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 			if currentCtxCanceled() {
 				actionErr = utils.Wrap(actionErr, "task context canceled while parsing action")
 			}
-			return utils.Wrap(actionErr, "failed to parse action")
+			return aicommon.NewRecoverableError(utils.Wrap(actionErr, "failed to parse action"))
 		}
 		observedActionType := ""
 		admittedActionType := ""
@@ -1066,7 +1155,7 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 			admittedActionType = strings.TrimSpace(action.ActionType())
 			observedActionType = strings.TrimSpace(action.ObservedActionType())
 		}
-		actionType := getNextActionType(action)
+		actionType := inferActionTypeFromPayload(action, r.Get("tag_final_answer"))
 		if observedActionType != "" && admittedActionType == "" {
 			r.UserStatus(
 				"当前思路还不够合适，正在重新整理",
@@ -1145,13 +1234,15 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 				aicommon.WithStatusCode("action.verifying"),
 			)
 			if err := verifier.ActionVerifier(r, action); err != nil {
-				return err
+				return aicommon.NewRecoverableError(err)
 			}
 		}
 		return nil
 	}
 	var transactionErr error
-	if r.useSpeedPriorityAI {
+	if compressionMode {
+		transactionErr = aicommon.CallAITransaction(r.config, prompt, r.config.CallQualityPriorityAI, postHandler, requestOpts...)
+	} else if r.useSpeedPriorityAI {
 		// Config owns execution, not just policy lookup. LiteForge runs each
 		// response through the existing streaming parser and verifier within its
 		// retry transaction; the loop never supplies an AI caller override.
@@ -1201,15 +1292,18 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 			aicommon.WithStatusCode("action.empty"),
 			aicommon.WithStatusState(aicommon.StatusStateError),
 		)
-		return nil, nil, utils.Error("action is nil in ReActLoop")
+		return nil, nil, aicommon.NewRecoverableError(utils.Error("action is nil in ReActLoop"))
 	}
 
-	handler, err := r.GetActionHandler(getNextActionType(action))
+	handler, err := r.GetActionHandler(inferActionTypeFromPayload(action, r.Get("tag_final_answer")))
 	if err != nil {
 		return nil, nil, utils.Wrap(err, "GetActionHandler failed")
 	}
 	if utils.IsNil(handler) {
-		return nil, nil, utils.Errorf("action[%s] 's handler is nil in ReActLoop.actions", action.Name())
+		return nil, nil, utils.Errorf(
+			"action[%s] 's handler is nil in ReActLoop.actions",
+			action.Name(),
+		)
 	}
 
 	// Wait for all streams to complete with timeout (max 3 seconds)

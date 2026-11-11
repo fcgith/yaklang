@@ -72,6 +72,7 @@ func (b *BasicBlock) GetBlockById(name string) *BasicBlock {
 
 func (b *FunctionBuilder) BuildSyntaxBlock(builder func()) {
 	Enter := b.CurrentBlock
+	Enter.restoreScopeIfMissing()
 	scope := Enter.ScopeTable
 
 	SubBlock := b.NewBasicBlock("")
@@ -81,6 +82,7 @@ func (b *FunctionBuilder) BuildSyntaxBlock(builder func()) {
 	endScope := ssautil.BuildSyntaxBlock[Value](ScopeIF(scope), func(svt ssautil.ScopedVersionedTableIF[Value]) ssautil.ScopedVersionedTableIF[Value] {
 		b.CurrentBlock.SetScope(svt)
 		builder()
+		b.CurrentBlock.restoreScopeIfMissing()
 		return b.CurrentBlock.ScopeTable
 	})
 
@@ -347,6 +349,7 @@ func (i *IfBuilder) Build() *IfBuilder {
 	*/
 	// just use ssautil scope cfg ScopeBuilder
 	SSABuilder := i.builder
+	i.enter.restoreScopeIfMissing()
 	scope := i.enter.ScopeTable
 	ScopeBuilder := ssautil.NewIfStmt(ssautil.ScopedVersionedTableIF[Value](scope))
 
@@ -378,6 +381,8 @@ func (i *IfBuilder) Build() *IfBuilder {
 			// cannot be emitted. Calling AddTrue/SetCondition on a nil *If
 			// panics; skip the wiring and keep the builder walkable by moving
 			// on to the false branch.
+			SSABuilder.CurrentBlock.restoreScopeIfMissing()
+			falseBlock.SetScope(SSABuilder.CurrentBlock.ScopeTable)
 			SSABuilder.CurrentBlock = falseBlock
 			IfStatementBlock = falseBlock
 			return
@@ -511,11 +516,21 @@ func (t *TryBuilder) BuildFinally(f func()) {
 func (t *TryBuilder) Finish() {
 	builder := t.b
 	enter := t.enter
+	enter.restoreScopeIfMissing()
 	scope := enter.ScopeTable
 
 	tryBuilder := ssautil.NewTryStmt(ssautil.ScopedVersionedTableIF[Value](scope), generatePhi(builder, nil, t.enter))
 
-	builder.CurrentBlock = t.enter
+	// An earlier return/raise may already terminate the source block. The
+	// try body and its catches still need SSA for analysis, but cannot attach
+	// an ErrorHandler to a finished block. Give that unreachable syntax an
+	// isolated entry block instead of emitting a nil handler.
+	entry := t.enter
+	if entry.finish {
+		entry = builder.NewBasicBlock("try.unreachable-entry")
+		entry.SetScope(scope)
+	}
+	builder.CurrentBlock = entry
 	tryBlock := builder.NewBasicBlock(TryStart)
 	enterTryBlock := tryBlock
 	errorHandler := builder.EmitErrorHandler(tryBlock)

@@ -424,11 +424,15 @@ func isAlphaByte(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c 
 // expr 须是 RE2 可解析的正则 (含 flag 前缀). anchoredStart/requireEnd 由调用方传入.
 func extractNecFactor(expr string, anchoredStart, requireEnd bool) necFactor {
 	var nf necFactor
-	parsed, err := syntax.Parse(expr, syntax.Perl)
+	parsed, err := parseRegexSyntax(expr, syntax.Perl)
 	if err != nil {
 		return nf
 	}
 	s := parsed.Simplify()
+	// ASCII byte classes cannot constrain Unicode folds.
+	if hasNonASCIIFold(s) {
+		return nf
+	}
 
 	// 1. 首字节约束 (anchoredStart): first 子树接受的字节类必须包含 data[0]
 	if anchoredStart {

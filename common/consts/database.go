@@ -20,6 +20,7 @@ import (
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/damenggorm"
 	"github.com/yaklang/yaklang/common/utils/permutil"
 	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
 )
@@ -44,10 +45,68 @@ type databaseOpenOptions struct {
 	// sqliteTxLock is the SQLite DSN _txlock value.
 	// Empty omits _txlock from the DSN.
 	sqliteTxLock string
+	// sqliteBusyTimeoutMS is PRAGMA busy_timeout. Zero keeps the 10s default.
+	sqliteBusyTimeoutMS int
+	// sqliteJournalSizeLimitBytes caps the WAL file after a checkpoint
+	// (PRAGMA journal_size_limit). Zero keeps SQLite's default of no limit,
+	// which lets the WAL file grow to its high-water mark and stay there.
+	sqliteJournalSizeLimitBytes int64
+	// sqliteCacheKiB is PRAGMA cache_size in KiB (applied as a negative value).
+	// Zero keeps the generic 8000-page cache.
+	sqliteCacheKiB int64
+	// sqliteMmapBytes is PRAGMA mmap_size. Zero leaves SQLite's default.
+	sqliteMmapBytes int64
+	// sqliteWALAutocheckpoint is PRAGMA wal_autocheckpoint in pages.
+	// Applied only when sqliteWALAutocheckpointSet is true, because zero is a
+	// real setting: it turns automatic checkpoints off.
+	sqliteWALAutocheckpoint    int
+	sqliteWALAutocheckpointSet bool
 }
 
 func defaultDatabaseOpenOptions() databaseOpenOptions {
 	return databaseOpenOptions{sqliteMaxOpenConns: 1}
+}
+
+func sqliteBusyTimeout(options databaseOpenOptions) int {
+	if options.sqliteBusyTimeoutMS > 0 {
+		return options.sqliteBusyTimeoutMS
+	}
+	return 10000
+}
+
+// applySQLiteConnectionPragmas runs on every new pooled connection.
+// database/sql checks a connection out, runs one statement, and returns it,
+// so a PRAGMA executed through *gorm.DB only ever reaches whichever
+// connection happens to be checked out — and a replacement connection opened
+// later never sees it. The driver hook is the only place that covers the
+// whole pool. (mattn/go-sqlite3 has no generic _pragma DSN parameter; the
+// upstream change is still an unmerged pull request.)
+func applySQLiteConnectionPragmas(conn *sqlite3.SQLiteConn, options databaseOpenOptions) error {
+	if options.sqliteJournalSizeLimitBytes > 0 {
+		_, err := conn.Exec(fmt.Sprintf("PRAGMA journal_size_limit = %d;", options.sqliteJournalSizeLimitBytes), nil)
+		if err != nil {
+			return err
+		}
+	}
+	if options.sqliteCacheKiB > 0 {
+		_, err := conn.Exec(fmt.Sprintf("PRAGMA cache_size = %d;", -options.sqliteCacheKiB), nil)
+		if err != nil {
+			return err
+		}
+	}
+	if options.sqliteMmapBytes > 0 {
+		_, err := conn.Exec(fmt.Sprintf("PRAGMA mmap_size = %d;", options.sqliteMmapBytes), nil)
+		if err != nil {
+			return err
+		}
+	}
+	if options.sqliteWALAutocheckpointSet {
+		_, err := conn.Exec(fmt.Sprintf("PRAGMA wal_autocheckpoint = %d;", options.sqliteWALAutocheckpoint), nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func DeleteDatabaseFile(path string) error {
@@ -59,6 +118,22 @@ func DeleteDatabaseFile(path string) error {
 	os.RemoveAll(path + "-wal")
 	os.RemoveAll(path + "-shm")
 	return nil
+}
+
+// sqliteConnectionPragmas is installed by registerDriver and read by the
+// SQLiteExtend driver's ConnectHook. registerDriver runs exactly once, so
+// the hook closes over this variable instead of the options of whichever
+// database happened to trigger driver registration.
+//
+// It is published before any SQLiteExtend pool exists (pools are opened
+// only after RegisterDriverOnce) and the SSA options are fixed for the
+// process, so there is no concurrent writer.
+var sqliteConnectionPragmas = defaultDatabaseOpenOptions()
+
+// SetSQLiteConnectionPragmas selects the PRAGMA profile applied to every
+// SQLiteExtend connection. Call it before the first database opens.
+func SetSQLiteConnectionPragmas(options databaseOpenOptions) {
+	sqliteConnectionPragmas = options
 }
 
 func registerDriver() {
@@ -92,7 +167,7 @@ func registerDriver() {
 				if err != nil {
 					return err
 				}
-				return nil
+				return applySQLiteConnectionPragmas(conn, sqliteConnectionPragmas)
 			},
 		})
 }
@@ -137,7 +212,7 @@ func createAndConfigDatabaseWithOptions(path string, options databaseOpenOptions
 		params := url.Values{
 			"mode":          []string{"rwc"},
 			"cache":         []string{cacheMode},
-			"_busy_timeout": []string{"10000"},
+			"_busy_timeout": []string{strconv.Itoa(sqliteBusyTimeout(options))},
 			"_synchronous":  []string{syncMode},
 			"_cache_size":   []string{"8000"},
 		}
@@ -150,7 +225,20 @@ func createAndConfigDatabaseWithOptions(path string, options databaseOpenOptions
 	default:
 	}
 
-	db, err := gorm.Open(driver, path)
+	var db *gorm.DB
+	var err error
+	if driver == damenggorm.Dialect {
+		sqlDB, openErr := openDMSQLDatabase(path, damenggorm.OpenDB)
+		if openErr != nil {
+			return nil, openErr
+		}
+		db, err = gorm.Open(damenggorm.ORMName, sqlDB)
+		if err != nil {
+			_ = sqlDB.Close()
+		}
+	} else {
+		db, err = gorm.Open(driver, path)
+	}
 	if err != nil && (driver == SQLite || driver == SQLiteExtend) {
 		log.Warnf("open database[%s] with driver[%s] failed: %s, try to check and fix it", purePath, driver, err)
 		err = checkAndTryFixDatabase(purePath)
@@ -212,6 +300,14 @@ func configureAndOptimizeDB(drive string, db *gorm.DB) {
 }
 
 func configureAndOptimizeDBWithOptions(drive string, db *gorm.DB, options databaseOpenOptions) {
+	if damenggorm.IsDialect(drive) {
+		// The DM factory configures its pool before handing it to GORM. SSA
+		// configures again after migration; preserve that caller-selected pool.
+		if db.DB().Stats().MaxOpenConnections == 0 {
+			defaultDMDatabasePool().apply(db.DB())
+		}
+		return
+	}
 	// reference: https://stackoverflow.com/questions/35804884/sqlite-concurrent-writing-performance
 	db.DB().SetConnMaxLifetime(time.Hour)
 	// SQLite must keep a single writer connection to avoid "database is locked" under concurrent writes.
@@ -239,8 +335,12 @@ func configureAndOptimizeDBWithOptions(drive string, db *gorm.DB, options databa
 		// set journal_mode for write speed
 		db.Exec("PRAGMA journal_mode = WAL;")
 		db.Exec("PRAGMA temp_store = MEMORY;")
-		db.Exec("PRAGMA cache_size = 8000;")
-		db.Exec("PRAGMA busy_timeout = 10000;")
+		if options.sqliteCacheKiB > 0 {
+			db.Exec(fmt.Sprintf("PRAGMA cache_size = %d;", -options.sqliteCacheKiB))
+		} else {
+			db.Exec("PRAGMA cache_size = 8000;")
+		}
+		db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d;", sqliteBusyTimeout(options)))
 	}
 }
 

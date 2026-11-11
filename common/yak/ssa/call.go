@@ -57,6 +57,7 @@ func (f *FunctionBuilder) EmitCall(c *Call) *Call {
 
 // handleMethod handle method for call,this call have more type,need handle this type
 func (c *Call) handleMethod() {
+	defer c.markPersistenceDirty()
 	callMethod, ok := c.GetValueById(c.Method)
 	if !ok || callMethod == nil {
 		return
@@ -239,6 +240,7 @@ func (c *Call) handlerGeneric() {
 	}
 }
 func (c *Call) handlerObjectMethod() {
+	defer c.markPersistenceDirty()
 	args := c.Args
 	target, ok := c.GetValueById(c.Method)
 	if !ok || target == nil {
@@ -284,8 +286,13 @@ func (c *Call) handlerReturnType() {
 	}
 	// For lazy-built functions (like TypeScript arrow functions), we need to build them first
 	// to ensure their Type is set before we try to get the return type
-	if fun, isFunc := ToFunction(method); isFunc && fun.Type == nil {
-		fun.Build()
+	if fun, isFunc := ToFunction(method); isFunc {
+		fun.typeMu.RLock()
+		untyped := fun.Type == nil
+		fun.typeMu.RUnlock()
+		if untyped {
+			fun.buildOnLookup()
+		}
 	}
 	funcTyp, ok := ToFunctionType(method.GetType())
 	if !ok {
@@ -305,13 +312,26 @@ func (c *Call) handlerReturnType() {
 			return
 		}
 	}
-	if utils.IsNil(funcTyp.ReturnType) {
+	// Finish publishes ReturnType under typeMu. Copy it out under the same
+	// lock; the pointer above can be observed while that field is written.
+	returnType := funcTyp.ReturnType
+	freeValue := funcTyp.FreeValue
+	if fun, isFunc := ToFunction(method); isFunc {
+		fun.typeMu.RLock()
+		if fun.Type != nil {
+			funcTyp = fun.Type
+			returnType = fun.Type.ReturnType
+			freeValue = fun.Type.FreeValue
+		}
+		fun.typeMu.RUnlock()
+	}
+	if utils.IsNil(returnType) {
 		log.Debugf("[ssa.Call.handlerReturnType] skip setting type for call %s: return type is nil", method.GetName())
 		return
 	}
 	// inference call instruction type
 	if c.IsDropError {
-		if retType, ok := funcTyp.ReturnType.(*ObjectType); ok {
+		if retType, ok := returnType.(*ObjectType); ok {
 			if retType.Combination && retType.FieldTypes[len(retType.FieldTypes)-1].GetTypeKind() == ErrorTypeKind {
 				if len(retType.FieldTypes) == 1 {
 					c.SetType(CreateNullType())
@@ -330,7 +350,7 @@ func (c *Call) handlerReturnType() {
 				}
 				return
 			}
-		} else if t, ok := funcTyp.ReturnType.(*BasicType); ok && t.Kind == ErrorTypeKind {
+		} else if t, ok := returnType.(*BasicType); ok && t.Kind == ErrorTypeKind {
 			// pass
 			c.SetType(CreateNullType())
 			for _, variable := range c.GetAllVariables() {
@@ -340,14 +360,15 @@ func (c *Call) handlerReturnType() {
 		}
 		c.NewError(Warn, SSATAG, FunctionContReturnError())
 	} else {
-		c.SetType(funcTyp.ReturnType)
+		c.SetType(returnType)
 	}
 	// handler free value
-	c.HandleFreeValue(funcTyp.FreeValue)
+	c.HandleFreeValue(freeValue)
 }
 
 // handler if method, set object for first argument
 func (c *Call) handleCalleeFunction() {
+	defer c.markPersistenceDirty()
 	function := c.GetFunc()
 	builder := function.builder
 
@@ -363,12 +384,19 @@ func (c *Call) handleCalleeFunction() {
 			caller := param.GetFunc()
 			callee := caller.anValue.GetFunc()
 			caller.SideEffects = append(caller.SideEffects, callee.SideEffects...)
+			caller.markPersistenceDirty()
 		}
 
 		// Handle case where method is a Call instruction (e.g., f1() where f1 = f())
 		// Try to get the FunctionType from the call's return value
 		funcTyp = c.tryGetFunctionTypeFromCallReturn(method)
 		if funcTyp == nil {
+			// Extern/yaklib callees (e.g. retry) have no SSA body or typed
+			// signature, but callback arguments with side effects still need
+			// propagation to the call site. handleArgumentFunctionSideEffect
+			// handles nil callee types by treating every function-typed
+			// argument as potentially invoked.
+			handleArgumentFunctionSideEffect(c, nil)
 			return
 		}
 	}
@@ -386,11 +414,12 @@ func (c *Call) handleCalleeFunction() {
 		recoverBuilder()
 	}()
 
+	members := funcTyp.LiveParameterMembers()
 	for true {
-		if len(c.ArgMember) == len(funcTyp.ParameterMember) {
+		if len(c.ArgMember) == len(members) {
 			break
 		}
-		for _, p := range funcTyp.ParameterMember {
+		for _, p := range members {
 			wantFunction := false
 			if typ := p.GetType(); typ != nil {
 				if typ.GetTypeKind() == FunctionTypeKind {
@@ -535,6 +564,7 @@ func (c *Call) handleCalleeFunction() {
 }
 
 func (c *Call) HandleFreeValue(fvs []*Parameter) {
+	defer c.markPersistenceDirty()
 	builder := c.GetFunc().builder
 
 	// Functions rebuilt from DB have no builder; free-value binding needs the
@@ -633,7 +663,7 @@ func (c *Call) tryGetFunctionTypeFromCallReturn(method Value) *FunctionType {
 
 	// Build the function if not yet built (for lazy-built functions like TypeScript arrow functions)
 	if innerFunc.Type == nil {
-		innerFunc.Build()
+		innerFunc.buildOnLookup()
 	}
 
 	// Try to get return type from innerFunc.Type first

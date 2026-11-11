@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/ai"
+	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiconfig"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiskillloader"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
@@ -47,6 +48,10 @@ const DefaultMaxSubAgentConcurrency = 5
 
 // AbsoluteMaxSubAgentConcurrency 是子 Agent 并发数的硬上限。
 const AbsoluteMaxSubAgentConcurrency = 20
+
+// DefaultTimelineContentSizeLimit 是运行时上下文的服务端默认压缩阈值，单位是 token。
+// RuntimeContextSizeLimit <= 0 时使用该值，避免零值把带有 Skill、Evidence 的时间线提前压小。
+const DefaultTimelineContentSizeLimit = 300 * 1024
 
 type ConfigOption func(*Config) error
 
@@ -207,7 +212,12 @@ type Config struct {
 	AICallbacks *AICallbacks
 
 	// Optional per-runtime helper implementation; the default uses the registered LiteForge.
-	LiteForgeExecutor LiteForgeExecuteCallback
+	LiteForgeExecutor   LiteForgeExecuteCallback
+	promptOverflowJudge promptOverflowJudgeState
+	promptOverflowLimit promptOverflowLimitState
+	// promptOverflowRetryMax bounds compress-and-retry rounds per iteration
+	// after a confirmed prompt overflow. 0 disables the retry.
+	promptOverflowRetryMax int
 
 	// userUsageCallback 由用户脚本通过 ai.usageCallback(...) 注册并经
 	// aiengine.WithAIConfig 透传. Tiered AI 路径
@@ -256,7 +266,8 @@ type Config struct {
 	inheritedToolManager         bool
 
 	// browserSessionTracker records browser ids opened by yak tools for session cleanup.
-	browserSessionTracker BrowserSessionTracker
+	browserSessionTracker           BrowserSessionTracker
+	browserHTTPFlowIdentityResolver BrowserHTTPFlowIdentityResolver
 
 	// tool config
 	DisableToolUse               bool
@@ -389,6 +400,11 @@ type Config struct {
 	singleAIModelMode                  bool // 单模型简易模式：辅助任务统一调度，详见 config_auxiliary_scheduler.go
 	singleAIModelModeResolved          bool // NewConfig freezes the effective mode after applying options.
 	PerTaskUserInteractiveLimitedTimes int64
+	userInteractLimitExplicit          bool
+	clarificationPolicy                func() (allowed, blocking bool, limit int64)
+	clarificationCounts                map[string]int64
+	clarificationMu                    sync.Mutex
+	disableBlockingClarification       bool
 
 	/*
 		Meta Info
@@ -401,8 +417,9 @@ type Config struct {
 	/*
 		debug config
 	*/
-	DebugPrompt bool
-	DebugEvent  bool
+	NetworkDebug bool
+	DebugPrompt  bool
+	DebugEvent   bool
 
 	// other Options
 	OtherOption []any
@@ -429,6 +446,11 @@ type Config struct {
 	// When set, it enables the loading_skills and change_skill_view_offset actions in ReActLoop
 	// Multiple sources can be added via WithSkillsLocalDir, WithSkillsZipFile, WithSkillsFS
 	skillLoader *aiskillloader.AutoSkillLoader
+
+	// Session 入口使用独立 manager；loop 保留自己的 manager，通过 Timeline 互相可见。
+	// 不经 ConvertConfigToOptions 传播，避免子 config 重新绑定父 manager。
+	skillsContextManagerMu sync.Mutex
+	skillsContextManager   *aiskillloader.SkillsContextManager
 
 	// disableAutoSkills controls whether to automatically load skills from the default directory
 	// (~/.yakit-projects/ai-skills). Default is false (auto-load enabled).
@@ -644,6 +666,7 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 			log.Errorf("Failed to set AI callback: %v", err)
 		}
 	}
+	config.applyProviderFunctionCallDefault()
 	if consumptionState := config.ensureConsumptionState(); consumptionState != nil {
 		consumptionState.InitializeEffectiveSingleModelMode(config.IsSingleAIModelMode())
 	}
@@ -768,7 +791,8 @@ func newConfig(ctx context.Context) *Config {
 		ContextProviderManager:             NewContextProviderManager(),
 		AiAutoRetry:                        5,
 		AiTransactionAutoRetry:             5,
-		TimelineContentSizeLimit:           50 * 1024, // Default limit for 50k tokens
+		TimelineContentSizeLimit:           DefaultTimelineContentSizeLimit,
+		promptOverflowRetryMax:             promptOverflowDefaultRetryMax,
 		Guardian:                           NewAsyncGuardian(ctx, id),
 		PerTaskUserInteractiveLimitedTimes: 1, // Default to 1 time
 		EnablePlanAndExec:                  true,
@@ -1272,6 +1296,18 @@ func WithAITransactionAutoRetry(n int64) ConfigOption {
 		c.m.Lock()
 		c.AiTransactionAutoRetry = n
 		c.m.Unlock()
+		return nil
+	}
+}
+
+// WithPromptOverflowRetryMax bounds compress-and-retry rounds after a confirmed
+// prompt overflow. 0 disables the retry and keeps the previous behavior.
+func WithPromptOverflowRetryMax(n int) ConfigOption {
+	return func(c *Config) error {
+		if n < 0 {
+			return utils.Error("prompt overflow retry max must be >= 0")
+		}
+		c.promptOverflowRetryMax = n
 		return nil
 	}
 }
@@ -1841,6 +1877,14 @@ func WithDisableToolUse(disable bool) ConfigOption {
 	}
 }
 
+func (c *Config) IsToolUseDisabled() bool {
+	if c.m != nil {
+		c.m.Lock()
+		defer c.m.Unlock()
+	}
+	return c.DisableToolUse
+}
+
 func WithEnableToolManagerAISearch(enable bool) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -2049,6 +2093,9 @@ func WithAllowRequireForUserInteract(v bool) ConfigOption {
 		c.m.Lock()
 		c.AllowRequireForUserInteract = v
 		c.m.Unlock()
+		if !v {
+			return c.cancelPendingClarifications()
+		}
 		return nil
 	}
 }
@@ -2244,13 +2291,16 @@ func WithMemoryLimits(contentSizeLimit, totalContentLimit int) ConfigOption {
 		if contentSizeLimit < 0 || totalContentLimit < 0 {
 			return utils.Error("memory limits cannot be negative")
 		}
+		if c == nil {
+			return nil
+		}
 		if c.m == nil {
 			c.m = &sync.Mutex{}
 		}
 		c.m.Lock()
-		c.TimelineContentSizeLimit = contentSizeLimit
 		c.TimelineTotalContentLimit = totalContentLimit
 		c.m.Unlock()
+		c.applyTimelineContentSizeLimit(contentSizeLimit)
 		return nil
 	}
 }
@@ -2662,11 +2712,31 @@ func WithAIChatInfo(serviceName string, modelName string) ConfigOption {
 			cfg.m = &sync.Mutex{}
 		}
 		cfg.m.Lock()
-		defer cfg.m.Unlock()
 		cfg.AiServerName = serviceName
 		cfg.AiModelName = modelName
+		cfg.m.Unlock()
+		cfg.applyProviderFunctionCallDefault()
 		return nil
 	}
+}
+
+// Resolve the default before loops assemble their protocol-specific prompts.
+// This also handles choosing a provider from the desktop model selector before
+// a new task. Explicit protocol options and legacy callbacks keep their mode.
+func (c *Config) applyProviderFunctionCallDefault() {
+	c.m.Lock()
+	defer c.m.Unlock()
+	if c.functionCallModeExplicit || c.legacyAICallbackConfigured {
+		return
+	}
+	provider := &ypb.ThirdPartyApplicationConfig{Type: c.AiServerName}
+	// Resolving a protocol must not bootstrap global routing: that can replace
+	// caller-supplied callbacks in subsequent configs or child agents.
+	if model := aiconfig.FindModelConfig(consts.GetIntelligentAIConfigs(), c.AiServerName, c.AiModelName); model != nil {
+		provider = model.GetProvider()
+	}
+	c.EnableFunctionCallMode = aispec.ProviderFunctionCallDefault(provider)
+	c.SetConfig("EnableFunctionCallMode", c.EnableFunctionCallMode)
 }
 
 func WithDisableEnhanceDirectlyAnswer(disable bool) ConfigOption {
@@ -2777,9 +2847,9 @@ func WithSingleAIModelMode(enable bool) ConfigOption {
 }
 
 // WithEnableFunctionCallMode enables native functioncall (tool_calls) mode for
-// ReAct loops created from this config. When enabled, each ReAct loop iteration
-// uses a single "execute_action" tool whose arguments are a complete action
-// protocol JSON, instead of the text-based @action JSON parsing.
+// ReAct loops created from this config, including nested focus modes and forks.
+// Native mode exposes each available action as a provider function. Text mode
+// uses the framework's @action JSON protocol without provider tool schemas.
 func WithEnableFunctionCallMode(enable bool) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -2824,6 +2894,7 @@ func WithPerTaskUserInteractiveLimitedTimes(n int64) ConfigOption {
 		}
 		c.m.Lock()
 		c.PerTaskUserInteractiveLimitedTimes = n
+		c.userInteractLimitExplicit = n > 0
 		c.m.Unlock()
 		return nil
 	}
@@ -3325,19 +3396,38 @@ func WithDisableOutputEvent(types ...string) ConfigOption {
 }
 
 // WithTimelineLimit sets the timeline content size limit (deprecated name, kept for compatibility).
+// The value is applied to the bound Timeline as well. Writing only the config field leaves
+// compression on the previous threshold, so the new setting looks successful but does not take effect.
 func WithTimelineLimit(limit int) ConfigOption {
 	return func(c *Config) error {
 		if limit < 0 {
 			return utils.Error("timeline limit cannot be negative")
 		}
-		if c.m == nil {
-			c.m = &sync.Mutex{}
+		if c == nil {
+			return nil
 		}
-		c.m.Lock()
-		c.TimelineContentSizeLimit = limit
-		c.m.Unlock()
+		c.applyTimelineContentSizeLimit(limit)
 		return nil
 	}
+}
+
+// applyTimelineContentSizeLimit stores the base threshold and pushes it onto the live timeline.
+// The main-loop compressor also reads the config field, so both views must move together.
+func (c *Config) applyTimelineContentSizeLimit(limit int) {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		c.m = &sync.Mutex{}
+	}
+	c.m.Lock()
+	c.TimelineContentSizeLimit = limit
+	timeline := c.Timeline
+	c.m.Unlock()
+	if timeline == nil {
+		return
+	}
+	timeline.SetTimelineContentLimit(int64(limit))
 }
 
 func WithTimeline(t *Timeline) ConfigOption {
@@ -3540,8 +3630,6 @@ func (c *Config) CallAfterReview(seq int64, reviewQuestion string, userInput ait
 	if c.Timeline != nil {
 		c.Timeline.PushUserInteraction(UserInteractionStage_Review, seq, reviewQuestion, string(utils.Jsonify(userInput)))
 	}
-	// 价值评估 (review_decision 触发) 改由工具审批路径调用 SubmitToolReviewValueFeedback,
-	// 以便拿到原始/最终参数与审批运行时来源 (见 toolcall.go).
 }
 
 func (c *Config) AcquireId() int64 {
@@ -3623,20 +3711,28 @@ func (c *Config) GetSessionEvidenceRendered() string {
 }
 
 func (c *Config) ApplySessionEvidenceOps(ops []EvidenceOperation) {
+	c.ApplySessionEvidenceOpsWithChange(ops)
+}
+
+// ApplySessionEvidenceOpsWithChange reports an atomic business-content change;
+// timestamp-only retries do not notify consumers or grow the evidence journal.
+// The existing AICallerConfigIf write API remains unchanged.
+func (c *Config) ApplySessionEvidenceOpsWithChange(ops []EvidenceOperation) bool {
 	if c == nil || len(ops) == 0 {
-		return
+		return false
 	}
 	if c.GetTimeline() == nil {
 		state := c.GetSessionPromptState()
 		state.m.Lock()
 		defer state.m.Unlock()
 		store := UnmarshalEvidenceStore(state.evidenceJSON)
+		before := store.Render()
 		store.ApplyOperations(ops)
 		store.ShrinkToTokenBudget(sessionEvidenceTokenBudget)
 		state.evidenceJSON = store.Marshal()
-		return
+		return store.Render() != before
 	}
-	c.applyEvidenceToTimeline(ops)
+	return c.applyEvidenceToTimeline(ops)
 }
 
 // GetVerificationTodoRendered returns the rendered TODO snapshot for the
@@ -4027,6 +4123,10 @@ func (c *Config) GetMaxIterationCount() int64 {
 }
 
 func (c *Config) GetAllowUserInteraction() bool {
+	if c.m != nil {
+		c.m.Lock()
+		defer c.m.Unlock()
+	}
 	return c.AllowRequireForUserInteract
 }
 
@@ -4278,6 +4378,15 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	}
 
 	opts = append(opts, WithAllowRequireForUserInteract(i.AllowRequireForUserInteract))
+	if i.browserHTTPFlowIdentityResolver != nil {
+		opts = append(opts, WithBrowserHTTPFlowIdentityResolver(i.browserHTTPFlowIdentityResolver))
+	}
+	// Goal strategy itself is top-level only, but its no-blocking boundary must
+	// survive a handoff into a coordinator or another nested runtime.
+	opts = append(opts, func(c *Config) error {
+		c.disableBlockingClarification = i.disableBlockingClarification || i.EnableGoalMode
+		return nil
+	})
 
 	// aiCallback
 	if i.AiServerName != "" {
@@ -4322,7 +4431,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 
 	// Other boolean/flag options
 	opts = append(opts, WithAllowRequireForUserInteract(i.AllowRequireForUserInteract))
-	opts = append(opts, WithAllowPlanUserInteract(i.AllowPlanUserInteract))
+	opts = append(opts, WithAllowPlanUserInteract(i.AllowPlanUserInteract), WithPlanUserInteractMaxCount(i.PlanUserInteractMaxCount))
 	opts = append(opts, WithEnablePlanAndExec(i.EnablePlanAndExec))
 	opts = append(opts, WithEnableDetachedPlan(i.EnableDetachedPlan))
 	opts = append(opts, WithEnableSubagentsInPlan(i.EnableSubagentsInPlan))
@@ -4382,7 +4491,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	opts = append(opts, WithPeriodicVerificationInterval(i.PeriodicVerificationInterval))
 
 	if i.PerTaskUserInteractiveLimitedTimes > 0 {
-		opts = append(opts, WithPerTaskUserInteractiveLimitedTimes(i.PerTaskUserInteractiveLimitedTimes))
+		opts = append(opts, WithPerTaskUserInteractiveLimitedTimes(i.PerTaskUserInteractiveLimitedTimes), func(c *Config) error { c.userInteractLimitExplicit = i.userInteractLimitExplicit; return nil })
 	}
 
 	// Timeline / memory limits
@@ -4536,7 +4645,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	// once init config flag
 	opts = append(opts, WithInitConfigStatus(i.InitStatus))
 
-	opts = append(opts, WithContext(i.Ctx))
+	opts = append(opts, WithContext(i.Ctx), WithNetworkDebug(i.NetworkDebug))
 
 	// Propagate browser session tracker so child invokers (P&E, focus loops)
 	// record browser.Open ids on the parent ReAct session for cleanup.
@@ -4593,9 +4702,9 @@ func (c *Config) invokeSpeedPriorityLiteForge(prompt string, opts ...any) (*Forg
 }
 
 func (c *Config) invokeLiteForgeWithCallback(prompt string, callback AICallbackType, opts ...any) (*ForgeResult, error) {
-	// Retain bounded supporting context without inheriting the parent's protocol.
-	// LiteForge defaults to text; explicit invocation options may select native.
-	opts = append([]any{WithEnableFunctionCallMode(false),
+	// Supporting structured calls inherit the session protocol, just like child
+	// loops. Standalone LiteForge invocations retain their own default.
+	opts = append([]any{WithEnableFunctionCallMode(c.EnableFunctionCallMode),
 		WithTimeline(c.Timeline), WithAppendPersistentContext(c.PersistentMemory...)}, opts...)
 	opts = append(opts, WithFastAICallback(callback))
 	opts = append(opts, WithDisableCreateDBRuntime(true)) // Avoid creating runtime records for lite forge calls

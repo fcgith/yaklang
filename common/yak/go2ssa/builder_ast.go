@@ -3,6 +3,7 @@ package go2ssa
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
@@ -26,13 +27,29 @@ func (b *astbuilder) build(ast *gol.SourceFileContext) {
 			lib.SetExportType(aliasName, aliasType)
 		}
 		b.GetProgram().Funcs.ForEach(func(funcName string, funcValue *ssa.Function) bool {
-			if !funcValue.IsMethod() && funcValue.GetName() != string(ssa.MainFunctionName) {
-				lib.SetExportValue(funcName, funcValue)
+			// Receiver methods belong to their receiver's method set, never to the
+			// package namespace. A named type's synthetic constructor stands for the
+			// type, not a package-level value. Only an exported function is visible
+			// to another package, and it is published under the name importers use.
+			if funcValue.IsMethod() || funcValue.GetName() == string(ssa.MainFunctionName) {
+				return true
+			}
+			exportName := funcValue.GetName()
+			if exportName == "" {
+				exportName = funcName
+			}
+			if _, isType := lib.GetExportType(exportName); isType {
+				return true
+			}
+			if goExportedName(exportName) {
+				lib.SetExportValue(exportName, funcValue)
 			}
 			return true
 		})
 		for globalName, globalValue := range b.GetGlobalVariables() {
-			lib.SetExportValue(globalName, globalValue)
+			if goExportedName(globalName) {
+				lib.SetExportValue(globalName, globalValue)
+			}
 		}
 	}
 	_ = exportHandler
@@ -96,9 +113,8 @@ func (b *astbuilder) build(ast *gol.SourceFileContext) {
 				currentBuilder := b.FunctionBuilder
 				b.FunctionBuilder = builder
 				defer func() {
-					for _, e := range builder.GetProgram().GetErrors() {
-						currentBuilder.GetProgram().AddError(e)
-					}
+					// Program errors already belong to the application. Copying
+					// GetErrors back into it doubles the list on every file.
 					b.FunctionBuilder = currentBuilder
 				}()
 			}
@@ -119,7 +135,7 @@ func (b *astbuilder) build(ast *gol.SourceFileContext) {
 
 			for i, name := range names {
 				pathl := strings.Split(paths[i], "/")
-				b.SetImportPackage(name, pathl[len(pathl)-1], paths[i], impo.(*gol.ImportDeclContext).ImportSpec(i))
+				b.SetImportPackage(name, pathl[len(pathl)-1], paths[i], ssa.DetachAST(impo.(*gol.ImportDeclContext).ImportSpec(i)))
 				importUseNames = append(importUseNames, name)
 			}
 		}
@@ -277,9 +293,7 @@ func (b *astbuilder) build(ast *gol.SourceFileContext) {
 				currentBuilder := b.FunctionBuilder
 				b.FunctionBuilder = builder
 				defer func() {
-					for _, e := range builder.GetProgram().GetErrors() {
-						currentBuilder.GetProgram().AddError(e)
-					}
+					// Errors are shared through the application owner already.
 					b.FunctionBuilder = currentBuilder
 				}()
 			}
@@ -365,6 +379,16 @@ func (b *astbuilder) buildImportPath(importPath *gol.ImportPathContext) string {
 	return ""
 }
 
+// goExportedName reports whether name is visible to another package.
+// Go exports an identifier exactly when its first character is an uppercase
+// letter (Unicode category Lu); blank identifiers are never exported.
+func goExportedName(name string) bool {
+	if name == "" || name == "_" {
+		return false
+	}
+	return unicode.IsUpper([]rune(name)[0])
+}
+
 func (b *astbuilder) handleImportPackage() {
 	for id, info := range b.importMap {
 		ex := ssa.NewExternLib(id, b.FunctionBuilder, nil)
@@ -374,16 +398,58 @@ func (b *astbuilder) handleImportPackage() {
 		// 手动设置range
 		ex.SetRange(b.GetRangeByToken(info.Pos))
 
-		if importp, _ := b.GetImportPackageUser(id); importp != nil {
-			for n, g := range importp.ExportValue {
-				ssa.AddObjectKeyPair(g, ex, b.EmitConstInst(n))
-				ex.AddMember(b.EmitConstInst(n), g)
-			}
-		}
+		// The dependency's export set is not known until every file in it has
+		// finished its prehandler. Materializing members here would read a
+		// partial, order-dependent snapshot. The namespace is bound once, after
+		// all declarations are discovered, by the deferred binding task.
 
 		ex.SetType(HandleFullTypeNames(ex.GetType(), []string{info.Path}))
 		b.AssignVariable(b.CreateVariable(id, info.Pos), ex)
+
+		b.registerGoImportBinding(id, info.Name)
 	}
+}
+
+// registerGoImportBinding binds an imported namespace to the complete export
+// set of its dependency. It runs in the binding phase, after every package's
+// declarations have been discovered and before any body is built, so the set
+// no longer depends on which file the parser happened to finish first.
+func (b *astbuilder) registerGoImportBinding(alias, libName string) {
+	prog := b.GetProgram()
+	if prog == nil {
+		return
+	}
+	app := prog.GetApplication()
+	if app == nil {
+		app = prog
+	}
+	importer := prog
+	extern := b.PeekValue(alias)
+	if utils.IsNil(extern) {
+		return
+	}
+	capturedAlias := alias
+	capturedLib := libName
+	prog.RegisterDeferredBuild(ssa.DeferredBuildKindBinding, "go-export-bind:"+importer.Name+":"+alias, func() {
+		lib, _ := app.GetLibrary(capturedLib)
+		if lib == nil {
+			return
+		}
+		namespace := extern
+		if current, ok := importer.ReadImportValue(capturedAlias); ok && !utils.IsNil(current) {
+			namespace = current
+		}
+		lib.ExportValue.ForEach(func(name string, value ssa.Value) bool {
+			if !goExportedName(name) {
+				return true
+			}
+			if _, bound := ssa.GetLatestMemberByKeyString(namespace, name); bound {
+				return true
+			}
+			ssa.BindMemberRelation(namespace, value, b.EmitConstInstPlaceholder(name))
+			return true
+		})
+	})
 }
 
 func (b *astbuilder) buildDeclaration(decl *gol.DeclarationContext, isglobal bool) {
@@ -510,10 +576,11 @@ func (b *astbuilder) buildVarSpec(varSpec *gol.VarSpecContext, isglobal bool) {
 		}
 		registerExpr := func(id string, expr *gol.ExpressionContext) {
 			checkCannotAssign(id)
+			capturedExpr := ssa.DetachAST(expr)
 			b.AddGlobalVariable(id, func() ssa.Value {
 				switchHandler := b.SwitchFunctionBuilder(store)
 				defer switchHandler()
-				rightv, _ := b.buildExpression(expr, false)
+				rightv, _ := b.buildExpression(capturedExpr, false)
 				return rightv
 			})
 		}
@@ -824,8 +891,21 @@ func (b *astbuilder) buildFunctionDeclFront(fun *gol.FunctionDeclContext) {
 
 	store := b.StoreFunctionBuilder()
 	capturedFun := ssa.DetachAST(fun)
+	prepareSignature := b.registerGoDeclarationSignature(newFunc, func() {
+		restore := b.SwitchFunctionBuilder(store)
+		defer restore()
+		b.FunctionBuilder = b.PushFunction(newFunc)
+		b.SupportClosure = false
+		defer func() { b.FunctionBuilder = b.PopFunction() }()
+		if para, ok := capturedFun.Signature().(*gol.SignatureContext); ok {
+			params, result = b.buildSignature(para)
+		}
+		handleFunctionType(newFunc)
+		newFunc.Type.This = newFunc
+	})
 	log.Debugf("add function funcName = %s", funcName)
 	newFunc.AddLazyBuilder(func() {
+		prepareSignature()
 		log.Debugf("build function funcName = %s", funcName)
 		switchHandler := b.SwitchFunctionBuilder(store)
 		defer func() {
@@ -838,15 +918,9 @@ func (b *astbuilder) buildFunctionDeclFront(fun *gol.FunctionDeclContext) {
 		b.FunctionBuilder = b.PushFunction(newFunc)
 		b.SupportClosure = false
 
-		if para, ok := capturedFun.Signature().(*gol.SignatureContext); ok {
-			params, result = b.buildSignature(para)
-		}
-
 		if typeps := capturedFun.TypeParameters(); typeps != nil {
 			b.tpHandler[funcName] = b.buildTypeParameters(typeps.(*gol.TypeParametersContext))
 		}
-
-		handleFunctionType(b.Function)
 
 		if hitDefinedFunction {
 			b.MarkedFunctions = append(b.MarkedFunctions, newFunc)
@@ -877,7 +951,7 @@ func (b *astbuilder) buildFunctionDeclFront(fun *gol.FunctionDeclContext) {
 		// StaticMember directly (O(1) per name) instead of GetLastWinsMemberPairs
 		// which resolved every member pair via resolveLinkedValue (O(N²)).
 		if prog := b.GetProgram(); prog != nil && prog.GlobalVariablesBlueprint != nil {
-			for name := range prog.GlobalVariablesBlueprint.StaticMember {
+			for _, name := range prog.GlobalVariablesBlueprint.StaticMember.Keys() {
 				if name == "" {
 					continue
 				}
@@ -926,6 +1000,70 @@ func (b *astbuilder) getReceiverDecl(para *gol.ParameterDeclContext) string {
 	return ""
 }
 
+// receiverIsPointer reports whether a method is declared with a pointer
+// receiver. A pointer-receiver method belongs only to the pointer type's
+// method set; a value-receiver method belongs to both.
+func receiverIsPointer(fun *gol.MethodDeclContext) bool {
+	if fun == nil || fun.Receiver() == nil {
+		return false
+	}
+	parameters := fun.Receiver().(*gol.ReceiverContext).Parameters()
+	if parameters == nil {
+		return false
+	}
+	for _, decl := range parameters.(*gol.ParametersContext).AllParameterDecl() {
+		if typ := decl.(*gol.ParameterDeclContext).Type_(); typ != nil && len(typ.GetText()) > 0 && typ.GetText()[0] == '*' {
+			return true
+		}
+	}
+	return false
+}
+
+// bindGoMethod attaches a declared method to its receiver type. The type may
+// not exist yet when the method's file is prehandled first, so the binding is
+// retried in the binding phase, which runs after every declaration is known.
+// The method function created here is the one identity callers resolve to.
+func (b *astbuilder) bindGoMethod(typeName, methodName string, fun *ssa.Function, pointerReceiver bool) {
+	// Capture the declaring library now. The binding phase runs after the
+	// builder has moved on to other files, so looking the type up through the
+	// builder then would search the wrong program and silently drop the method.
+	lib := b.GetProgram()
+	if lib == nil {
+		return
+	}
+	apply := func() bool {
+		typ, ok := lib.GetExportType(typeName)
+		if !ok || typ == nil {
+			return false
+		}
+		// Both receiver kinds are recorded on the named type every use of the
+		// name resolves to. A struct gets the pointer-receiver marker; a defined
+		// non-struct type (named string, slice, and so on) still owns a method
+		// set, so the method is attached there too instead of being dropped.
+		if pointerReceiver {
+			if _, ok := typ.(*ssa.ObjectType); ok {
+				fun.SetVerboseName("*" + typeName + "." + methodName)
+			}
+		}
+		if adder, ok := typ.(interface{ AddMethod(string, *ssa.Function) }); ok {
+			adder.AddMethod(methodName, fun)
+		}
+		if lib.Blueprint != nil {
+			if bp, ok := lib.Blueprint.Get(typeName); ok && bp != nil {
+				bp.AddMethod(methodName, fun)
+			}
+		}
+		fun.SetMethod(true, typ)
+		return true
+	}
+	if apply() {
+		return
+	}
+	lib.RegisterDeferredBuild(ssa.DeferredBuildKindBinding, "go-method-bind:"+typeName+"$"+methodName, func() {
+		apply()
+	})
+}
+
 func (b *astbuilder) buildMethodDeclFront(fun *gol.MethodDeclContext) {
 	recoverRange := b.SetRange(&fun.BaseParserRuleContext)
 	defer recoverRange()
@@ -951,10 +1089,17 @@ func (b *astbuilder) buildMethodDeclFront(fun *gol.MethodDeclContext) {
 	newFunc := b.NewFunc(funcName)
 	newFunc.SetMethodName(methodName)
 
+	// A method is a method from the moment it is declared, not from the moment
+	// its body happens to be built. Classifying it here keeps the export pass
+	// from publishing a receiver method as an ordinary package-level function,
+	// and gives the method a stable identity before any caller is compiled.
+	newFunc.SetMethod(true, nil)
+
+	// The receiver type may be declared in another file that has not been
+	// prehandled yet. Record the binding so it can be applied once that type
+	// exists, instead of dropping the method when the blueprint is missing.
 	for _, n := range ssatypName {
-		if bp := b.GetBluePrint(n); bp != nil {
-			bp.AddMethod(n, newFunc)
-		}
+		b.bindGoMethod(n, methodName, newFunc, receiverIsPointer(fun))
 	}
 
 	hitDefinedFunction := false
@@ -985,25 +1130,33 @@ func (b *astbuilder) buildMethodDeclFront(fun *gol.MethodDeclContext) {
 		b.AssignVariable(variable, newFunc)
 	}
 
-	{
+	store := b.StoreFunctionBuilder()
+	capturedFun := ssa.DetachAST(fun)
+	prepareSignature := b.registerGoDeclarationSignature(newFunc, func() {
+		restore := b.SwitchFunctionBuilder(store)
+		defer restore()
 		b.FunctionBuilder = b.PushFunction(newFunc)
 		b.SupportClosure = false
-
-		if recove := fun.Receiver(); recove != nil {
-			ssatyp := b.buildReceiver(recove.(*gol.ReceiverContext))
-			for _, t := range ssatyp {
-				if it, ok := ssa.ToObjectType(t); ok {
-					it.AddMethod(methodName, newFunc)
+		defer func() { b.FunctionBuilder = b.PopFunction() }()
+		var receiverType ssa.Type
+		if receiver := capturedFun.Receiver(); receiver != nil {
+			for _, typ := range b.buildReceiver(receiver.(*gol.ReceiverContext)) {
+				receiverType = typ
+				if object, ok := ssa.ToObjectType(typ); ok {
+					object.AddMethod(methodName, newFunc)
 				}
 			}
 		}
-		b.FunctionBuilder = b.PopFunction()
-	}
-
-	store := b.StoreFunctionBuilder()
-	capturedFun := ssa.DetachAST(fun)
+		if para, ok := capturedFun.Signature().(*gol.SignatureContext); ok {
+			params, result = b.buildSignature(para)
+		}
+		handleFunctionType(newFunc)
+		newFunc.Type.This = newFunc
+		newFunc.SetMethod(true, receiverType)
+	})
 	log.Debugf("add method funcName = %s", funcName)
 	newFunc.AddLazyBuilder(func() {
+		prepareSignature()
 		log.Debugf("build method funcName = %s", funcName)
 		switchHandler := b.SwitchFunctionBuilder(store)
 		defer func() {
@@ -1015,12 +1168,6 @@ func (b *astbuilder) buildMethodDeclFront(fun *gol.MethodDeclContext) {
 		}()
 		b.FunctionBuilder = b.PushFunction(newFunc)
 		b.SupportClosure = false
-
-		if para, ok := capturedFun.Signature().(*gol.SignatureContext); ok {
-			params, result = b.buildSignature(para)
-		}
-
-		handleFunctionType(b.Function)
 
 		if hitDefinedFunction {
 			b.MarkedFunctions = append(b.MarkedFunctions, newFunc)
@@ -1080,6 +1227,51 @@ func (b *astbuilder) buildReceiverDecl(para *gol.ParameterDeclContext) ssa.Type 
 	}
 
 	return typeType
+}
+
+// functionTypeSignature collects the types of a function type literal
+// without emitting Parameter instructions into the enclosing function.
+func (b *astbuilder) functionTypeSignature(stmt *gol.SignatureContext) ([]ssa.Type, ssa.Type) {
+	recoverRange := b.SetRange(&stmt.BaseParserRuleContext)
+	defer recoverRange()
+	var paramt []ssa.Type
+	var rett ssa.Type
+	if paras := stmt.Parameters(); paras != nil {
+		paramt = b.functionTypeParameters(paras.(*gol.ParametersContext))
+	}
+	if rety := stmt.Result(); rety != nil {
+		rett = b.buildResult(rety.(*gol.ResultContext))
+	}
+	return paramt, rett
+}
+
+func (b *astbuilder) functionTypeParameters(parms *gol.ParametersContext) []ssa.Type {
+	recoverRange := b.SetRange(&parms.BaseParserRuleContext)
+	defer recoverRange()
+	var paramt []ssa.Type
+	for _, decl := range parms.AllParameterDecl() {
+		a, ok := decl.(*gol.ParameterDeclContext)
+		if !ok {
+			continue
+		}
+		typ := ssa.CreateAnyType()
+		if raw := a.Type_(); raw != nil {
+			typ = b.buildType(raw.(*gol.Type_Context))
+		}
+		n := 1
+		if ids := a.IdentifierList(); ids != nil {
+			if list := ids.(*gol.IdentifierListContext).AllIdentifier(); len(list) > 0 {
+				n = len(list)
+			}
+		}
+		for i := 0; i < n; i++ {
+			paramt = append(paramt, typ)
+		}
+	}
+	if len(paramt) == 0 {
+		paramt = append(paramt, ssa.CreateAnyType())
+	}
+	return paramt
 }
 
 func (b *astbuilder) buildSignature(stmt *gol.SignatureContext) ([]ssa.Type, ssa.Type) {
@@ -1210,11 +1402,14 @@ func (b *astbuilder) buildResult(rety *gol.ResultContext) ssa.Type {
 	}
 
 	if paras := rety.Parameters(); paras != nil {
-		key, field := b.buildResultParameters(paras.(*gol.ParametersContext))
+		_, field := b.buildResultParameters(paras.(*gol.ParametersContext))
 		obj := ssa.NewStructType()
 		obj.SetTypeKind(ssa.TupleTypeKind)
 		for i := range field {
-			obj.AddField(key[i], field[i])
+			// Result declarations can each have a zero-valued default, but the
+			// tuple slots are positional. Reusing every default as key 0 let a
+			// later error result overwrite the factory's receiver result type.
+			obj.AddField(b.EmitConstInst(i), field[i])
 		}
 		return obj
 	}
@@ -2201,7 +2396,9 @@ func (b *astbuilder) buildTypeName(tname *gol.TypeNameContext) ssa.Type {
 
 		if lib != nil && path != "" {
 			if _, ok := lib.GetExportType(libName); !ok {
-				if err := b.GetProgram().ImportTypeFromLib(lib, libName, iqul); err != nil {
+				// Go names the type at its use site, not in a declaration header. Passing
+				// no token keeps the shared external type free of the first importer.
+				if err := b.GetProgram().ImportTypeFromLib(lib, libName, nil); err != nil {
 					b.NewError(ssa.Warn, TAG, "get namespace type fail: %s", err)
 				}
 			}
@@ -2210,7 +2407,7 @@ func (b *astbuilder) buildTypeName(tname *gol.TypeNameContext) ssa.Type {
 			if ok {
 				return exportType
 			} else { // 找到包但没有找到类型，可能是包中引用了golang库
-				if err := b.GetProgram().ImportTypeFromLib(lib, typName, iqul); err != nil {
+				if err := b.GetProgram().ImportTypeFromLib(lib, typName, nil); err != nil {
 					b.NewError(ssa.Warn, TAG, "get namespace type fail: %s", err)
 				}
 			}
@@ -2244,7 +2441,10 @@ func (b *astbuilder) buildTypeName(tname *gol.TypeNameContext) ssa.Type {
 		}
 		if ssatyp == nil {
 			b.NewError(ssa.Warn, TAG, StructNotFind(name))
-			ssatyp = ssa.CreateAnyType()
+			// The declaration may be later in this package. Keep a forward use and
+			// retarget it once every file has published its types, instead of
+			// freezing the field as any.
+			ssatyp = b.forwardNamedType(name)
 		}
 
 		return ssatyp

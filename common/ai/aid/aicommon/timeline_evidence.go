@@ -65,10 +65,19 @@ func (m *Timeline) importSessionEvidence(session *Timeline) {
 // Evidence mutations use the same journal and freeze transaction as cached
 // tools. The runtime view includes pending operations; the semi-dynamic view
 // includes only committed operations. Neither view advances a freeze boundary.
-func (m *Timeline) evidenceStoreLocked() (*EvidenceStore, bool) {
+func (m *Timeline) evidenceStoreLocked(throughID ...int64) (*EvidenceStore, bool) {
+	return m.evidenceStoreMatchingLocked(func(id int64) bool {
+		return len(throughID) == 0 || id <= throughID[0]
+	})
+}
+
+func (m *Timeline) evidenceStoreMatchingLocked(include func(int64) bool) (*EvidenceStore, bool) {
 	store := NewEvidenceStore()
 	found := m.evidenceInitialized
 	for _, id := range m.idToTimelineItem.Keys() {
+		if !include(id) {
+			continue
+		}
 		item, ok := m.idToTimelineItem.Get(id)
 		if !ok || item == nil {
 			continue
@@ -128,8 +137,15 @@ func (m *Timeline) replaceEvidence(store *EvidenceStore, acquireID func() int64)
 // Read/apply/journal under one Timeline lock: a concurrent fork merge or rollback
 // must not be overwritten by a business snapshot read before that operation.
 func (m *Timeline) applyEvidenceOperations(ops []EvidenceOperation, legacyJSON string, acquireID func() int64) (*EvidenceStore, error) {
+	store, _, err := m.applyEvidenceOperationsWithChange(ops, legacyJSON, acquireID)
+	return store, err
+}
+
+// Report content changes under the same journal lock as the mutation. A parent
+// write racing a child retry must not turn that retry into a new discovery.
+func (m *Timeline) applyEvidenceOperationsWithChange(ops []EvidenceOperation, legacyJSON string, acquireID func() int64) (*EvidenceStore, bool, error) {
 	if m == nil || acquireID == nil {
-		return nil, fmt.Errorf("evidence timeline and ID allocator are required")
+		return nil, false, fmt.Errorf("evidence timeline and ID allocator are required")
 	}
 	m.mu.Lock()
 	var notifications []func()
@@ -138,12 +154,14 @@ func (m *Timeline) applyEvidenceOperations(ops []EvidenceOperation, legacyJSON s
 	if !found {
 		store = UnmarshalEvidenceStore(legacyJSON)
 	}
+	before := store.Render()
 	store.ApplyOperations(ops)
 	store.ShrinkToTokenBudget(sessionEvidenceTokenBudget)
+	changed := store.Render() != before
 	if err := m.replaceEvidenceLocked(store, acquireID, &notifications); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return store, nil
+	return store, changed, nil
 }
 
 func (m *Timeline) replaceEvidenceLocked(store *EvidenceStore, acquireID func() int64, notifications *[]func()) error {

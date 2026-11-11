@@ -35,15 +35,15 @@ func buildExitBlockedByTodoMessage(actionName string, items []aicommon.Verificat
 }
 
 func buildFinishBlockedByGoalModeMessage() string {
-	return "goal mode's host-side completion gate is not open yet. Do not retry finish or clear unfinished TODOs to satisfy it. Continue the most valuable evidence-producing work, and use directly_answer only for a necessary progress update."
+	return "目标模式的宿主完成门禁尚未开放。不要反复请求 finish 或清空未完成待办来过关；继续最有价值的验证与执行，仅在必要时用 directly_answer 汇报进度。"
 }
 
 func buildFinishBlockedByDeadlineMessage(remaining time.Duration) string {
-	return fmt.Sprintf("goal mode time window is still active (%s remaining). Do not retry finish. Continue the most valuable evidence-producing work; explore deeper angles, verify earlier results, or address remaining TODOs.", remaining.Round(time.Second))
+	return fmt.Sprintf("目标时间窗尚未结束，剩余 %d 秒。不要反复请求 finish；继续深入探索、验证已有结果或处理剩余待办。", remaining.Round(time.Second)/time.Second)
 }
 
 func buildFinishBlockedByAcceptanceMessage(reason string) string {
-	return fmt.Sprintf("goal mode acceptance criteria are not satisfied yet: %s. Do not retry finish or clear unfinished TODOs to bypass this. Address the gaps above with concrete tool actions and evidence, then attempt finish again.", reason)
+	return fmt.Sprintf("目标验收标准尚未满足：%s。不要反复请求 finish 或清空未完成待办来绕过验收；用具体工具操作和证据补齐缺口后再申请结束。", reason)
 }
 
 var loopAction_Finish = &LoopAction{
@@ -119,7 +119,7 @@ var loopAction_Finish = &LoopAction{
 func NativeDirectlyAnswerOptions() []aitool.ToolOption {
 	return []aitool.ToolOption{
 		aitool.WithStringParam("answer_payload",
-			aitool.WithParam_Description("Complete answer to deliver to the user, including long Markdown or code when needed. Do not use an external AITAG."),
+			aitool.WithParam_Description("Complete answer to hand over formally to the user, including long Markdown or code when needed. When choosing directly_answer, leave ordinary content empty; do not preview, repeat or paraphrase this answer there."),
 			aitool.WithParam_Required(true),
 		),
 	}
@@ -127,7 +127,7 @@ func NativeDirectlyAnswerOptions() []aitool.ToolOption {
 
 var loopAction_DirectlyAnswer = &LoopAction{
 	ActionType:        "directly_answer",
-	NativeDescription: "Deliver the complete answer to the user in answer_payload. For ordinary tasks this delivers an answer without ending the loop; use finish after all work is complete. Do not repeat an unchanged answer. Adjust TODO state with adjust_todolist, alone or in the same batch.",
+	NativeDescription: "Hand the formal answer directly to the user via answer_payload. Ordinary content is also user-visible, but informal; when choosing this action, leave content empty instead of previewing, repeating or paraphrasing the answer. For ordinary tasks this delivers an answer without ending the loop; use finish after all work is complete. Do not repeat an unchanged answer. Adjust TODO state with adjust_todolist, alone or in the same batch.",
 	NativeOptions:     NativeDirectlyAnswerOptions(),
 	Description: "Emit a direct answer to the user via 'answer_payload' or FINAL_ANSWER tag. For simple direct answers, omit 'human_readable_thought'. " +
 		"For ordinary tasks directly_answer ONLY delivers the answer; use 'finish' when the latest user input is fully answered and no open TODO remains. " +

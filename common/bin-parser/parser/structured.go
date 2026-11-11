@@ -52,6 +52,22 @@ func ParseStructured(data []byte, rule string, keys ...string) (map[string]any, 
 					return value, nil
 				}
 			}
+		case "application-layer.dcerpc":
+			if len(keys) == 1 && keys[0] == "DCERPC" {
+				if value, ok := captureDCERPCStructured(data); ok {
+					return map[string]any{"fields": value, "metadata": nil}, nil
+				}
+			}
+		case "application-layer.smb2":
+			if len(keys) == 1 && keys[0] == "SMB2" {
+				value, ok, err := captureSMB2Structured(data)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					return map[string]any{"fields": value, "metadata": nil}, nil
+				}
+			}
 		}
 	}
 	if len(keys) == 1 && base.ParserRegistration("default") == defaultParserRegistration {
@@ -86,6 +102,12 @@ func parseStructuredFallback(data []byte, rule string, keys ...string) (map[stri
 	}
 	if reader.Len() != 0 {
 		return nil, fmt.Errorf("structured parse: %d unconsumed message bytes", reader.Len())
+	}
+	if fields, selected, projectErr := cifsStructuredProjection(node, data, rule, keys); selected {
+		if projectErr != nil {
+			return nil, projectErr
+		}
+		return map[string]any{"fields": fields, "metadata": node.Cfg.GetItem("additionInfo")}, nil
 	}
 	return map[string]any{"fields": stream_parser.NodeToMap(node), "metadata": node.Cfg.GetItem("additionInfo")}, nil
 }

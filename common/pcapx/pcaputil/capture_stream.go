@@ -29,6 +29,12 @@ type CaptureReader struct {
 }
 
 func NewCaptureReader(input io.Reader) (*CaptureReader, error) {
+	return NewCaptureReaderWithOptions(input, PcapReaderOptions{})
+}
+
+// NewCaptureReaderWithOptions applies explicit classic PCAP metadata policy.
+// PCAPNG retains its existing strict block/record validation unchanged.
+func NewCaptureReaderWithOptions(input io.Reader, opts PcapReaderOptions) (*CaptureReader, error) {
 	b := bufio.NewReader(input)
 	magic, err := b.Peek(4)
 	if err != nil {
@@ -36,7 +42,7 @@ func NewCaptureReader(input io.Reader) (*CaptureReader, error) {
 	}
 	r := &CaptureReader{}
 	if binary.LittleEndian.Uint32(magic) == 0x0a0d0d0a {
-		r.ng, err = NewBoundedNgReader(b, pcapgo.NgReaderOptions{WantMixedLinkType: true, SectionEndCallback: func(_ []pcapgo.NgInterface, _ pcapgo.NgSectionInfo) { r.section++ }})
+		r.ng, err = newBoundedNgReader(b, pcapgo.NgReaderOptions{WantMixedLinkType: true, SectionEndCallback: func(_ []pcapgo.NgInterface, _ pcapgo.NgSectionInfo) { r.section++ }}, opts.IgnoreEmbeddedSecrets)
 		if err == nil {
 			r.first, r.firstInfo, err = r.ReadPacketData()
 			if err == nil {
@@ -49,7 +55,7 @@ func NewCaptureReader(input io.Reader) (*CaptureReader, error) {
 			}
 		}
 	} else {
-		r.classic, err = newClassicPcapReader(b)
+		r.classic, err = NewBoundedPcapReaderWithOptions(b, opts)
 		if err == nil {
 			r.link = r.classic.link
 		}
@@ -129,7 +135,7 @@ func NewPacketAnalyzer(options ...CaptureOption) (*PacketAnalyzer, error) {
 			return nil, err
 		}
 	}
-	if c.captureBuffer > 0 || c.BPFFilter != "" || c.Filename != "" || len(c.Device) != 0 || len(c.DeviceAdapter) != 0 || c.deviceAdapter != nil || c.outputFile != "" || c.Output != nil || c.onNetInterfaceCreated != nil || c.mock != nil || c.DisableAssembly || c.EnableCache {
+	if c.normalizePcapLength || c.ignoreEmbeddedSecrets || c.captureBuffer > 0 || c.BPFFilter != "" || c.Filename != "" || len(c.Device) != 0 || len(c.DeviceAdapter) != 0 || c.deviceAdapter != nil || c.outputFile != "" || c.Output != nil || c.onNetInterfaceCreated != nil || c.mock != nil || c.DisableAssembly || c.EnableCache {
 		return nil, fmt.Errorf("PacketAnalyzer does not support capture-source, BPF, recording, cache, or disabled-reassembly options")
 	}
 	if err := c.prepareBinParser(); err != nil {
@@ -144,7 +150,7 @@ func NewPacketAnalyzer(options ...CaptureOption) (*PacketAnalyzer, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	c.Context = ctx
-	p := newTrafficPool(ctx, c.reassemblyOptions)
+	p := newTrafficPool(ctx, c.tcpPoolOptions())
 	c.trafficPool, p.captureConf = p, c
 	p.captureAccountingAvailable = true
 	for _, init := range c.onPoolCreated {
@@ -174,7 +180,7 @@ func (a *PacketAnalyzer) Feed(raw []byte, ci gopacket.CaptureInfo, link layers.L
 		a.number = e.Ref.Number
 	}
 	a.pool.observeCaptureInfo(len(raw), ci)
-	if len(a.conf.onEveryPacket) > 0 || a.conf.Debug {
+	if len(a.conf.onEveryPacket) > 0 || len(a.conf.beforeTransportPacket) > 0 || a.conf.Debug {
 		packet := gopacket.NewPacket(raw, captureLinkDecoder(link), gopacket.DecodeOptions{Lazy: true, NoCopy: false, DecodeStreamsAsDatagrams: a.conf.binParser == nil})
 		packet.Metadata().CaptureInfo = ci
 		a.conf.packetHandler(a.conf.Context, packet)

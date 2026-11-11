@@ -1,9 +1,0 @@
-.git
-.github
-docs
-dist
-node_modules
-releases
-vendor
-*.log
-*.out

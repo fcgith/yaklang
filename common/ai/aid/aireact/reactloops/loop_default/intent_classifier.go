@@ -420,7 +420,7 @@ func buildFastMatchSummary(result *FastMatchResult) string {
 
 	if len(result.MatchedMCPTools) > 0 {
 		sb.WriteString("### Matched MCP Tools\n")
-		sb.WriteString("Call via `require_tool` using the full name `mcp_{server}_{tool}`.\n\n")
+		sb.WriteString("Use `require_tool` with `require_tool_payload` set to the full name `mcp_{server}_{tool}` only to load its Schema; it does not execute. Then submit complete business arguments via `directly_call_tool`. Reuse an already visible Schema.\n\n")
 		for _, t := range result.MatchedMCPTools {
 			fullName := fmt.Sprintf("mcp_%s_%s", t.ServerName, t.ToolName)
 			sb.WriteString(fmt.Sprintf("- **%s** [MCP:%s]: %s\n", fullName, t.ServerName, truncateString(t.Description, 120)))
@@ -489,7 +489,7 @@ func applyFastMatchResult(r aicommon.AIInvokeRuntime, loop *reactloops.ReActLoop
 				"[CRITICAL] User's input explicitly contains internet search keywords. "+
 					"You MUST use web_search tool or switch to internet_research focus mode to satisfy this request. "+
 					"Do NOT use do_http_request with placeholder URLs. "+
-					"Do NOT rely solely on knowledge_enhance_answer. "+
+					"Do NOT substitute local knowledge for the requested internet results. "+
 					"The user is requesting real-time internet search results.")
 		}
 
@@ -497,9 +497,9 @@ func applyFastMatchResult(r aicommon.AIInvokeRuntime, loop *reactloops.ReActLoop
 			if schTool.Name == "web_search" {
 				r.AddToTimeline("web_search_recommended",
 					"web_search tool was identified as relevant for this query. "+
-						"If knowledge_enhance_answer or knowledge base search cannot provide sufficient results, "+
+						"If local knowledge cannot provide sufficient results, "+
 						"you MUST call web_search to find the answer from the internet. "+
-						"Do NOT repeatedly retry knowledge_enhance_answer if it already failed.")
+						"Do NOT repeatedly retry the same local query if it already failed.")
 				break
 			}
 		}

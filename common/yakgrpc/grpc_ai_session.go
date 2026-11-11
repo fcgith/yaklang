@@ -9,6 +9,7 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/lowhttp/httptrace"
 	"github.com/yaklang/yaklang/common/yakgrpc/aisessioncleanup"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
@@ -84,6 +85,47 @@ func (s *Server) QueryAISession(ctx context.Context, req *ypb.QueryAISessionRequ
 		},
 		Total: int64(pag.TotalRecord),
 		Data:  respData,
+	}, nil
+}
+
+func convertAISessionTaskResourceInfos(resources []yakit.AISessionTaskResource) []*ypb.AISessionTaskResourceInfo {
+	result := make([]*ypb.AISessionTaskResourceInfo, 0, len(resources))
+	for _, resource := range resources {
+		result = append(result, &ypb.AISessionTaskResourceInfo{
+			Type:   resource.Type,
+			Key:    resource.Key,
+			Value:  resource.Value,
+			Scope:  resource.Scope,
+			Source: resource.Source,
+		})
+	}
+	return result
+}
+
+func (s *Server) GetAISessionCurrentResources(ctx context.Context, req *ypb.GetAISessionCurrentResourcesRequest) (*ypb.GetAISessionCurrentResourcesResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, utils.Error("request is nil")
+	}
+	sessionID := strings.TrimSpace(req.GetSessionID())
+	if sessionID == "" {
+		return nil, utils.Error("session_id is required")
+	}
+	current, err := yakit.GetAISessionCurrentResources(s.GetProjectDatabase(), sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return &ypb.GetAISessionCurrentResourcesResponse{SessionID: sessionID}, nil
+	}
+	return &ypb.GetAISessionCurrentResourcesResponse{
+		SessionID:        current.SessionID,
+		TaskID:           current.TaskID,
+		UserInputUUID:    current.UserInputUUID,
+		TaskResources:    convertAISessionTaskResourceInfos(current.TaskResources),
+		SessionResources: convertAISessionTaskResourceInfos(current.SessionResources),
 	}, nil
 }
 
@@ -164,6 +206,10 @@ func (s *Server) DeleteAISession(ctx context.Context, req *ypb.DeleteAISessionRe
 	projectDB := s.GetProjectDatabase()
 
 	if req.GetDeleteAll() {
+		sessionIDs, err := yakit.QueryAISessionIDsForDelete(projectDB, filter, true)
+		if err != nil {
+			return nil, err
+		}
 		attachedScheduleUUIDs, err := yakit.QueryAllAttachedAIReActScheduleUUIDs(projectDB)
 		if err != nil {
 			return nil, err
@@ -177,6 +223,9 @@ func (s *Server) DeleteAISession(ctx context.Context, req *ypb.DeleteAISessionRe
 			s.cancelAIReActScheduleExecution(scheduleUUID)
 		}
 		if _, err := yakit.DeleteAllAttachedAIReActSchedules(projectDB); err != nil {
+			return nil, err
+		}
+		if err := httptrace.RemoveSessions(sessionIDs); err != nil {
 			return nil, err
 		}
 		deletedWorkDirs, err := yakit.CleanupAISpaceWorkDirsForAllSessions(projectDB)
@@ -240,6 +289,9 @@ func (s *Server) DeleteAISession(ctx context.Context, req *ypb.DeleteAISessionRe
 		return nil, err
 	}
 
+	if err := httptrace.RemoveSessions(targetSessionIDs); err != nil {
+		return nil, err
+	}
 	deletedWorkDirs, err := yakit.CleanupAISpaceWorkDirsForSessions(projectDB, targetSessionIDs)
 	if err != nil {
 		return nil, err

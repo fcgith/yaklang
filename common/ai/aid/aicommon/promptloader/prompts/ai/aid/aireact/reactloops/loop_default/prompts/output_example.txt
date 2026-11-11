@@ -15,7 +15,7 @@
 
 * 再次强调：非空 `answer_payload` 与 `FINAL_ANSWER` AI Tag 严格互斥；任一响应只能出现其中一种答案内容。
 
-*. 所有 action 必须直接输出使用 Schema 原始英文键名的 JSON object；禁止 `<@action=...>` 标签、中文字段说明、YAML 或 JSON 外包装。
+*. 工具调用也用 JSON，例如 `{"@action":"manage_async_execution_runtime","op":"list"}`；按本轮 Schema 填参数。禁止 `<@action=...>` 标签、DSML 或 JSON 外包装；AITAG 仅按本轮要求附加。
 *. 缺少任务所需的一手证据时，本轮工具 action 就是执行机会；立即选择工具，禁止回答“没有工具执行机会”或要求重发任务。
 
 *. 如果你想要使用工具，先枚举本轮可立即执行的真实调用：
@@ -41,9 +41,7 @@
     * 排除一条路径时，写明实验条件和对照，而不是单次未命中就下结论：
       `{"@action": "save_evidence", "evidence_id": "admin-anonymous-access", "evidence_content": "排除 /admin/ 路径存在未授权访问：对比携带有效 session 与清空 Cookie 两种请求，未登录时返回 302 跳转至登录页，与预期基线一致，字段和状态码均无差异"}`
 
-{{ if .AllowKnowledgeEnhanceAnswer }}*. 如果你觉得问题是事实密集型、需要精确数据、或涉及特定专业领域的概念解释，可以通过外部知识检索来增强回答的准确性和深度:
-    * `{"@action": "knowledge_enhance_answer", "rewrite_user_query_for_knowledge_enhance": "..[rewrite-user-query]..", "human_readable_thought": "先补充资料"}
-{{end}}
+*. 查询知识库时按 `yaklang-system` Skill 加载并调用 `manage_knowledge_base` / `query_knowledge_base`。先选择明确的库范围，再提交带 `token_limit` 的实际查询；已可见的定义无需重复加载。
 {{ if .AllowPlan }}如果这个任务本身比较复杂：
     * 如果你发现有对应的 AI Blueprint(Forge) 可以使用，请你输出: `{"@action": "require_ai_blueprint", "blueprint_payload": "[your-blueprint-name]", ...}` 可以启动一个已经存在 AI 预设应用执行这个任务。
     * 如果你觉得任务复杂，且没有现有任务模版（Blueprint）需要使用任务规划能力，可使用 `request_plan`（规划+审查后再执行），需提供 `plan_request_payload`
@@ -60,15 +58,3 @@
 * 把 Schema 加载当作业务工具已经执行或当前任务已完成
 {{end}}
 
-*. 当你在下方动态段看到 `# Tool Context` 或 `<|TOOL_SCHEMA_...|>` 时，说明系统要求你为指定工具生成参数：
-    * 简单参数直接写入 `params`：
-      `{"@action": "call-tool", "identifier": "scan_target", "params": {"target": "example.com"}, "call_expectations": "~5s, success when results are returned"}`
-    * 多行/复杂参数使用 AITAG 承载：
-      `{"@action": "call-tool", "identifier": "run_script", "params": {"timeout": 30}}`
-      然后在 JSON 之后附加 AITAG 块（nonce 见动态段）：
-      `<|TOOL_PARAM_script_CURRENT_NONCE|>`
-      ...raw content...
-      `<|TOOL_PARAM_script_END_CURRENT_NONCE|>`
-    * 为 AI Blueprint 生成参数：
-      `{"@action": "call-ai-blueprint", "blueprint": "blueprint_name", "params": {"key": "value"}}`
-    * 如果动态段提供了旧参数（`<|OLD_PARAMS_...|>`），请基于失败原因重新生成，不要原样复制

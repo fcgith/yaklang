@@ -67,10 +67,9 @@ var (
 type ReAct struct {
 	*aicommon.Emitter
 
-	currentIteration            int
-	currentUserInteractiveCount int64 // 当前用户交互次数
-	config                      *aicommon.Config
-	promptManager               *PromptManager
+	currentIteration int
+	config           *aicommon.Config
+	promptManager    *PromptManager
 
 	// 任务队列相关
 	currentTaskMu sync.RWMutex
@@ -96,6 +95,10 @@ type ReAct struct {
 	lifecycleWG         *sync.WaitGroup
 	memoryTriage        aicommon.MemoryTriage
 	memoryContinuations sync.Map // planning/handoff boundaries, runtime-only task IDs
+
+	memoryFinalizationMu      sync.Mutex
+	memoryFinalizationPending func() error // coalesced: each drain reads the session ledger
+	memoryFinalizationDone    chan struct{}
 
 	taskHandoffMu      sync.Mutex
 	taskHandoffs       int
@@ -365,19 +368,17 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 		if len(skillNames) == 0 {
 			return
 		}
-		if loop := react.GetCurrentLoop(); loop != nil {
-			if mgr := loop.GetSkillsContextManager(); mgr != nil {
-				for _, name := range skillNames {
-					added, err := mgr.LoadForcedSkill(name)
-					if err != nil {
-						log.Warnf("hotload skill %q failed: %v", name, err)
-						continue
-					}
-					if added {
-						// 用户强制加载: timeline 明确记录 + 命中反馈.
-						react.AddToTimeline("user_loaded_skill", fmt.Sprintf("User forced load: %s", name))
-						aicommon.SubmitSkillHit(react.config, name, aicommon.StatsSourceSkillUserForce)
-					}
+		if mgr := react.skillManagerForSessionInput(); mgr != nil {
+			for _, name := range skillNames {
+				added, err := mgr.LoadForcedSkill(name)
+				if err != nil {
+					log.Warnf("hotload skill %q failed: %v", name, err)
+					continue
+				}
+				if added {
+					// 用户强制加载: timeline 明确记录 + 命中反馈.
+					react.AddToTimeline("user_loaded_skill", fmt.Sprintf("User forced load: %s", name))
+					aicommon.SubmitSkillHit(react.config, name, aicommon.StatsSourceSkillUserForce)
 				}
 			}
 		}
@@ -396,12 +397,10 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 		if len(skillNames) == 0 {
 			return
 		}
-		if loop := react.GetCurrentLoop(); loop != nil {
-			if mgr := loop.GetSkillsContextManager(); mgr != nil {
-				for _, name := range skillNames {
-					if mgr.UnloadSkill(name) {
-						log.Infof("hot-unload skill %q from context", name)
-					}
+		if mgr := react.skillManagerForSessionInput(); mgr != nil {
+			for _, name := range skillNames {
+				if mgr.UnloadSkill(name) {
+					log.Infof("hot-unload skill %q from context", name)
 				}
 			}
 		}
@@ -458,6 +457,7 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 		return nil, err
 	}
 	cfg.FlushRestoredSessionEvidence()
+	cfg.ResumeTrajectoryEvaluations()
 	// EmitPinDirectory is deferred to ensureWorkDirectory when user input arrives
 
 	// When the session is restricted to its injected MCP servers, the profile/DB
@@ -568,6 +568,9 @@ func (r *ReAct) SendInputEventAndWaitAccepted(event *ypb.AIInputEvent) (ret erro
 	}
 	if r.config.InputEventManager != nil {
 		r.config.InputEventManager.CallMirrorOfAIInputEvent(event)
+		if event.GetUserInteraction() != "" {
+			defer r.config.InputEventManager.CallAfterInputEvent(event)
+		}
 	}
 	return r.handleFreeValue(event)
 }
@@ -943,14 +946,15 @@ func (r *ReAct) Wait() {
 	r.wg.Wait()
 }
 
-// WaitLifecycleStopped waits for the long-lived input and task-queue loops to
-// exit after their context is cancelled. It is separate from Wait so existing
+// WaitLifecycleStopped waits for the input, task queue and background memory
+// persistence to exit after their context is cancelled. It is separate from Wait so existing
 // AIEngine/ReAct callers keep the original Wait behavior.
 func (r *ReAct) WaitLifecycleStopped() {
 	if r == nil || r.lifecycleWG == nil {
 		return
 	}
 	r.lifecycleWG.Wait()
+	r.waitMemoryFinalization()
 	if r.config != nil {
 		r.config.WaitHotPatchLoopStopped()
 	}

@@ -185,7 +185,7 @@ func immutableBridgeArgument(arg string) bool {
 
 func reusableBridgeName(name string) bool {
 	switch name {
-	case "parseMemcachedFields",
+	case "parseCIFSSessionSetup", "parseMemcachedFields",
 		"parseCassandraFields",
 		"parseTNSFields",
 		"parseTDSFields",
@@ -193,6 +193,7 @@ func reusableBridgeName(name string) bool {
 		"parsePostgreSQLFields",
 		"parseMySQLFields",
 		"parseIMAPFields",
+		"parseIMAPSASL",
 		"parsePOP3Fields",
 		"parseSMTPFields",
 		"parseMQTTFields",
@@ -205,6 +206,7 @@ func reusableBridgeName(name string) bool {
 		"parseX509CertificateDERExtensions",
 		"parseX509CertificateDER",
 		"parseTLSChangeCipherSpecRecord",
+		"parseTLSEndOfEarlyData",
 		"parseTLS12CertificateAuth",
 		"parseTLS12KeyExchange",
 		"parseTLS12ControlHandshake",
@@ -220,6 +222,8 @@ func reusableBridgeName(name string) bool {
 		"parseKubernetesAPIRequest",
 		"parseWinRMRecord",
 		"parseGSSAPIToken",
+		"parseSSDPMessage",
+		"parseNetworkControl",
 		"parseSMB3Negotiate",
 		"parseRMIRecord",
 		"parseXTPMessage",

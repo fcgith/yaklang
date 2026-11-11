@@ -25,9 +25,8 @@ func TestConvertYPBAIStartParamsToReActConfig(t *testing.T) {
 
 	// make sure risk > 0
 	risk := utils.RandFloat64()
-	maxIter := rand.Intn(10) + 1                 // >0
-	timelineLimit := int32(rand.Intn(2000) + 1)  // >0
-	userInteractLimit := int32(rand.Intn(5) + 1) // >0
+	maxIter := rand.Intn(10) + 1                // >0
+	timelineLimit := int32(rand.Intn(2000) + 1) // >0
 
 	includeKeywords := []string{uuid.New().String(), uuid.New().String()}
 	aiService := uuid.NewString()
@@ -44,8 +43,11 @@ func TestConvertYPBAIStartParamsToReActConfig(t *testing.T) {
 		ReviewPolicy:                 "yolo",
 		AIReviewRiskControlScore:     risk,
 		ReActMaxIteration:            int64(maxIter),
-		TimelineContentSizeLimit:     int64(timelineLimit),
-		UserInteractLimit:            int64(userInteractLimit),
+		RuntimeContextSizeLimit:      int64(timelineLimit),
+		// Distinct, non-default limits catch cross-wiring between task and plan budgets.
+		UserInteractLimit:            2,
+		AllowPlanUserInteract:        true,
+		PlanUserInteractMaxCount:     4,
 		DisableToolUse:               disableToolUse,
 		IncludeSuggestedToolKeywords: includeKeywords,
 		AIService:                    aiService,
@@ -85,8 +87,10 @@ func TestConvertYPBAIStartParamsToReActConfig(t *testing.T) {
 		aicommon.EnsureGoalModeMaxIterations(int64(start.ReActMaxIteration), goalMinIterations),
 		cfg.MaxIterationCount,
 	)
-	require.Equal(t, int(start.TimelineContentSizeLimit), cfg.TimelineContentSizeLimit)
-	require.Equal(t, int64(start.UserInteractLimit), cfg.PlanUserInteractMaxCount)
+	require.Equal(t, int(start.RuntimeContextSizeLimit), cfg.TimelineContentSizeLimit)
+	require.Equal(t, start.UserInteractLimit, cfg.GetUserInteractiveLimitedTimes())
+	require.Equal(t, start.AllowPlanUserInteract, cfg.AllowPlanUserInteract)
+	require.Equal(t, start.PlanUserInteractMaxCount, cfg.PlanUserInteractMaxCount)
 	require.Equal(t, start.DisableToolUse, cfg.DisableToolUse)
 	require.ElementsMatch(t, start.IncludeSuggestedToolKeywords, cfg.Keywords)
 	require.Equal(t, start.AICallTokenLimit, cfg.AiCallTokenLimit)
@@ -155,4 +159,27 @@ func TestResolveAISessionStartParams(t *testing.T) {
 	require.Equal(t, "cached-model", got.GetAIModelName())
 	require.Equal(t, "ai", got.GetReviewPolicy())
 	require.Equal(t, "hello", got.GetUserQuery())
+}
+
+// 运行时上下文阈值: 旧字段被前端默认值占用, 不能再覆盖服务端默认值;
+// 新字段 RuntimeContextSizeLimit 才是有效入口。
+func TestConvertYPBAIStartParams_RuntimeContextSizeLimit(t *testing.T) {
+	buildConfig := func(params *ypb.AIStartParams) *aicommon.Config {
+		opts := ConvertYPBAIStartParamsToReActConfig(params)
+		opts = append(opts, aicommon.WithDisableAutoSkills(true))
+		return aicommon.NewConfig(context.Background(), opts...)
+	}
+
+	serverDefault := aicommon.NewConfig(context.Background(), aicommon.WithDisableAutoSkills(true)).TimelineContentSizeLimit
+	require.Equal(t, 300*1024, serverDefault, "服务端默认阈值需要覆盖运行时上下文")
+
+	legacy := buildConfig(&ypb.AIStartParams{TimelineContentSizeLimit: 20 * 1024})
+	require.Equal(t, serverDefault, legacy.TimelineContentSizeLimit,
+		"已废弃字段不能覆盖服务端默认值")
+
+	configured := buildConfig(&ypb.AIStartParams{RuntimeContextSizeLimit: 128 * 1024})
+	require.Equal(t, 128*1024, configured.TimelineContentSizeLimit)
+
+	empty := buildConfig(&ypb.AIStartParams{})
+	require.Equal(t, serverDefault, empty.TimelineContentSizeLimit)
 }

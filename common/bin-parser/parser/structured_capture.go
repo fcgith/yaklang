@@ -43,6 +43,11 @@ func ParseStructuredWithConfig(data []byte, rule string, config map[string]any, 
 			return value, nil
 		}
 	}
+	if rule == "application-layer.dcerpc" && len(keys) == 1 && keys[0] == "DCERPC" && base.ParserRegistration("default") == defaultParserRegistration {
+		if value, ok := captureDCERPCStructured(data); ok {
+			return map[string]any{"fields": value, "metadata": nil}, nil
+		}
+	}
 	r := &structuredReader{Reader: bytes.NewReader(data), bits: uint64(len(data)) * 8}
 	node, err := ParseBinaryWithConfig(r, rule, config, keys...)
 	if err != nil {
@@ -50,6 +55,12 @@ func ParseStructuredWithConfig(data []byte, rule string, config map[string]any, 
 	}
 	if r.Len() != 0 {
 		return nil, fmt.Errorf("structured parse: %d unconsumed message bytes", r.Len())
+	}
+	if fields, selected, projectErr := cifsStructuredProjection(node, data, rule, keys); selected {
+		if projectErr != nil {
+			return nil, projectErr
+		}
+		return map[string]any{"fields": fields, "metadata": node.Cfg.GetItem("additionInfo")}, nil
 	}
 	return map[string]any{"fields": stream_parser.NodeToMap(node), "metadata": node.Cfg.GetItem("additionInfo")}, nil
 }

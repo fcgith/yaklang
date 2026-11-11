@@ -36,6 +36,7 @@ func DeleteInst(i Instruction) {
 		log.Debugf("void block!! %s:%s", i, i.GetRange())
 		return
 	}
+	defer b.markPersistenceDirty()
 	if phi, ok := ToPhi(i); ok {
 		b.Phis = lo.Filter(b.Phis, func(item int64, index int) bool {
 			return item != phi.GetId()
@@ -206,6 +207,7 @@ func (f *FunctionBuilder) EmitInstructionAfter(i, after Instruction) {
 func (f *FunctionBuilder) emitAroundInstruction(i, other Instruction, insert func(Instruction)) {
 	recoverBuilder := f.SetCurrent(other, true)
 	defer recoverBuilder()
+	defer f.CurrentBlock.markPersistenceDirty()
 
 	f.emitEx(i, insert)
 }
@@ -223,10 +225,13 @@ func (f *FunctionBuilder) SetInstructionPosition(i Instruction) {
 }
 
 func (f *FunctionBuilder) EmitOnly(i Instruction) {
+	defer f.CurrentBlock.markPersistenceDirty()
 	f.CurrentBlock.Insts = append(f.CurrentBlock.Insts, i.GetId())
 }
 
 func (f *FunctionBuilder) emitEx(i Instruction, insert func(Instruction)) {
+	defer f.CurrentBlock.markPersistenceDirty()
+	defer f.Function.markPersistenceDirty()
 	// i.SetScope(f.CurrentScope)
 	if i.GetRange() == nil {
 		i.SetRange(f.CurrentRange)
@@ -236,6 +241,35 @@ func (f *FunctionBuilder) emitEx(i Instruction, insert func(Instruction)) {
 	f.GetProgram().SetVirtualRegister(i)
 	insert(i)
 	fixupUseChain(i) // this function should after set Program
+	f.maybeFlushEmitted()
+}
+
+// maybeFlushEmitted writes the saver queues of a large function before they
+// hold every offset row. Batch 105 of the yaklang self-scan reached 23GiB
+// in use while one batch was still building; 4GiB of that was offset rows
+// and their dedup keys waiting for the batch barrier.
+func (f *FunctionBuilder) maybeFlushEmitted() {
+	const emitFlushEvery = 8192
+	if f == nil || f.flushingEmits {
+		return
+	}
+	f.emitSinceFlush++
+	if f.emitSinceFlush < emitFlushEvery {
+		return
+	}
+	f.emitSinceFlush = 0
+	f.flushingEmits = true
+	defer func() { f.flushingEmits = false }()
+	prog := f.GetProgram()
+	if prog == nil || prog.Cache == nil || !prog.Cache.HaveDatabaseBackend() {
+		return
+	}
+	prog.Cache.FlushInstructionSaver()
+	if prog.Cache.indexes != nil && prog.Cache.indexes.offsetSaver != nil {
+		_ = prog.Cache.indexes.offsetSaver.Flush()
+	}
+	prog.ReleaseSettledIndexes()
+	releasePersistedOffsetValues(prog)
 }
 
 // EmitUndefined emit undefined value
@@ -253,6 +287,9 @@ func (f *FunctionBuilder) EmitUnOp(op UnaryOpcode, v Value) Value {
 	}
 	u := NewUnOp(op, v)
 	f.emit(u)
+	if valueCapturedByClosure(v) {
+		return u
+	}
 	if c, ok := ToConstInst(HandlerUnOp(u)); ok {
 		f.emit(c)
 		return c
@@ -269,11 +306,53 @@ func (f *FunctionBuilder) EmitBinOp(op BinaryOpcode, x, y Value) Value {
 	}
 	binOp := NewBinOp(op, x, y)
 	f.emit(binOp)
+	// A closure can store into this variable from inside a later call that
+	// has no side-effect edge (an HTTP handler run by poc.Download). The
+	// reaching value is still the const, but the compare is not.
+	if valueCapturedByClosure(x) || valueCapturedByClosure(y) {
+		return binOp
+	}
 	if c, ok := ToConstInst(HandlerBinOp(binOp)); ok {
 		f.emit(c)
 		return c
 	}
 	return binOp
+}
+
+// markCapturedByClosure records that v is the current value of a variable a
+// nested function captures. Const folding checks this bit instead of walking
+// child functions.
+func markCapturedByClosure(v Value) {
+	if utils.IsNil(v) {
+		return
+	}
+	av := v.getAnValue()
+	if av == nil {
+		return
+	}
+	av.capturedByClosure = true
+}
+
+// noteCapturedByClosure marks v and remembers name on the function that owns
+// v. Later assignments of name in that function are marked too.
+func noteCapturedByClosure(v Value, name string) {
+	markCapturedByClosure(v)
+	if name == "" || utils.IsNil(v) {
+		return
+	}
+	fn := v.GetFunc()
+	if fn == nil || fn.builder == nil || fn.builder.capturedNames == nil {
+		return
+	}
+	fn.builder.capturedNames.Set(name, struct{}{})
+}
+
+func valueCapturedByClosure(v Value) bool {
+	if utils.IsNil(v) {
+		return false
+	}
+	av := v.getAnValue()
+	return av != nil && av.capturedByClosure
 }
 
 func (f *FunctionBuilder) EmitIf() *If {
@@ -362,10 +441,7 @@ func (f *FunctionBuilder) EmitAssert(cond, msgValue Value, msg string) *Assert {
 
 func (f *FunctionBuilder) emitMake(parentI Value, typ Type, low, high, max, Len, Cap Value) *Make {
 	if f.CurrentBlock.finish {
-		log.Errorf("BUG: current block is finish, can't emit make")
-		log.Errorf("BUG: current block is finish, can't emit make")
-		log.Errorf("BUG: current block is finish, can't emit make")
-		log.Errorf("BUG: current block is finish, can't emit make")
+		log.Errorf("BUG: current block is finish, can't emit make: function=%s range=%v", f.GetName(), f.CurrentRange)
 		// return nil
 	}
 	i := NewMake(parentI, typ, low, high, max, Len, Cap)
@@ -478,7 +554,7 @@ func (f *FunctionBuilder) GetOriginValue(obj Value) Value {
 func (f *FunctionBuilder) EmitConstInstWithUnary(i any, un int) *ConstInst {
 	ci := f.EmitConstInst(i)
 	ci.Unary = un
-	f.emit(ci)
+	ci.markPersistenceDirty()
 	return ci
 }
 
@@ -493,6 +569,13 @@ func (f *FunctionBuilder) EmitConstInst(i any) *ConstInst {
 }
 
 func (f *FunctionBuilder) emitConstInst(i any, isPlaceholder bool) *ConstInst {
+	if isPlaceholder {
+		return f.emitSharedPlaceholder(i)
+	}
+	return f.emitFreshConst(i, false)
+}
+
+func (f *FunctionBuilder) emitFreshConst(i any, isPlaceholder bool) *ConstInst {
 	ci := NewConst(i, isPlaceholder)
 	f.emit(ci)
 	if ci.IsNormalConst() {
@@ -614,6 +697,7 @@ func (f *FunctionBuilder) EmitPhi(name string, vs Values) *Phi {
 }
 
 func (f *FunctionBuilder) SetReturnSideEffects() {
+	defer f.Function.markPersistenceDirty()
 	SideEffectsReturn := make(map[*Variable]*FunctionSideEffect)
 	var value Value
 	scope := f.CurrentBlock.ScopeTable
@@ -647,6 +731,17 @@ func (f *FunctionBuilder) SetReturnSideEffects() {
 		}
 
 		SideEffectsReturn[variable] = ser
+		variableName := ""
+		if variable != nil {
+			variableName = variable.GetName()
+		}
+		f.SideEffectReturnSites = append(f.SideEffectReturnSites, FunctionSideEffectSite{
+			Name:         ser.Name,
+			VerboseName:  ser.VerboseName,
+			Modify:       ser.Modify,
+			Kind:         ser.Kind,
+			VariableName: variableName,
+		})
 	}
 	f.SideEffects = nil
 	f.SideEffectsReturn = append(f.SideEffectsReturn, SideEffectsReturn)

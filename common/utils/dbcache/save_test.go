@@ -19,6 +19,41 @@ type TestItem struct {
 	Data string
 }
 
+func TestSaverByteBudgetFlushesBeforeRowCount(t *testing.T) {
+	var mu sync.Mutex
+	var batches [][]int
+	saver := dbcache.NewSave(func(items []int) error {
+		mu.Lock()
+		batches = append(batches, append([]int(nil), items...))
+		mu.Unlock()
+		return nil
+	},
+		dbcache.WithSaveSize(1000),
+		dbcache.WithSaveTimeout(time.Hour),
+		dbcache.WithSaveByteBudget(100, func(n int) int { return n }),
+	)
+	for _, n := range []int{40, 40, 40, 30, 150, 20} {
+		saver.Save(n)
+	}
+	require.NoError(t, saver.Close())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, [][]int{{40, 40}, {40, 30}, {150}, {20}}, batches)
+	var got []int
+	for _, batch := range batches {
+		var sum int
+		for _, n := range batch {
+			sum += n
+		}
+		if len(batch) > 1 {
+			require.LessOrEqual(t, sum, 100)
+		}
+		got = append(got, batch...)
+	}
+	require.Equal(t, []int{40, 40, 40, 30, 150, 20}, got)
+}
+
 func TestNewSaver(t *testing.T) {
 	// Test with default options
 	savedItems := make([]TestItem, 0)
@@ -220,6 +255,36 @@ func TestSaveAutoSaveSize(t *testing.T) {
 		total += size
 	}
 	require.Equal(t, 100, total)
+}
+
+func TestSaver_DoesNotGrowPastConfiguredSize(t *testing.T) {
+	var mu sync.Mutex
+	var sizes []int
+	var total int
+	saver := dbcache.NewSave(func(items []int) error {
+		mu.Lock()
+		sizes = append(sizes, len(items))
+		total += len(items)
+		mu.Unlock()
+		// Hold the first batches long enough for the queue to get ahead.
+		// The saver used to multiply the next batch by 5 or 10 in that case.
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}, dbcache.WithSaveSize(900), dbcache.WithSaveTimeout(time.Hour), dbcache.WithInitialBufferSize(8000))
+
+	const n = 5000
+	for i := 0; i < n; i++ {
+		saver.Save(i)
+	}
+	require.NoError(t, saver.Close())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, n, total)
+	require.Greater(t, len(sizes), 1)
+	for _, size := range sizes {
+		require.LessOrEqual(t, size, 900)
+	}
 }
 
 func TestSaver_SaveRunsSerially(t *testing.T) {

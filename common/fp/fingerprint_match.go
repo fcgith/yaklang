@@ -38,6 +38,7 @@ func (m *Matcher) reportFinished(port *MatchResult) {
 func (m *Matcher) reportOpen(port *MatchResult) {
 	reportOpenMutex.Lock()
 	defer reportOpenMutex.Unlock()
+	port.mergeProtocolFields(nil)
 
 	if m.Config.OpenPortSyncMap == nil {
 		m.Config.OpenPortSyncMap = new(sync.Map)
@@ -60,6 +61,12 @@ func (f *Matcher) Match(host string, port int, options ...ConfigOption) (result 
 }
 
 func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, options ...ConfigOption) (result *MatchResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// One target shares a parse budget across every probe so protocol fields
+	// cannot accumulate unbounded CPU or memory.
+	ctx = withScanProtocolBudget(ctx)
 	host = utils2.ExtractHost(host)
 	proto, port := utils2.ParsePortToProtoPort(port)
 	addr := utils2.HostPort(host, port)
@@ -84,20 +91,29 @@ func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, o
 	}
 
 	if proto == "udp" {
+		// Encoded UDP ports used to overwrite the matcher's shared transport
+		// list. A later TCP target on the same matcher then dialed UDP.
+		if config == f.Config {
+			copied := NewConfig()
+			if err := copier.Copy(copied, f.Config); err != nil {
+				return nil, errors.Errorf("copy config failed: %s", err)
+			}
+			config = copied
+		}
 		config.TransportProtos = []TransportProto{UDP}
 	}
 
+	cacheProto := fingerprintCacheProto(proto, config)
+	cacheKey := fingerprintCacheAddr(host, port, cacheProto)
 	if config.EnableCache {
-		result := GetMatchResultCache(addr)
-		if result != nil {
+		if result := cachedMatchResult(GetMatchResultCache, cacheKey, addr, cacheProto); result != nil {
 			f.reportFinished(result)
 			return result, nil
 		}
 	}
 
 	if config.EnableDatabaseCache {
-		result := GetMatchResultDatabaseCache(addr)
-		if result != nil {
+		if result := cachedMatchResult(GetMatchResultDatabaseCache, cacheKey, addr, cacheProto); result != nil {
 			f.reportFinished(result)
 			return result, nil
 		}
@@ -105,9 +121,10 @@ func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, o
 
 	// 设置初始化匹配结果
 	result = &MatchResult{
-		Target: host,
-		Port:   port,
-		State:  CLOSED,
+		Target:         host,
+		Port:           port,
+		State:          CLOSED,
+		ProtocolFields: make(map[string]any),
 		Fingerprint: &FingerprintInfo{
 			IP:   host,
 			Port: port,
@@ -201,7 +218,7 @@ func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, o
 		serviceName := result.GetServiceName()
 		f.log("service name detected: %v", serviceName)
 
-		if f.Config.DisableWebFingerprint {
+		if f.Config.DisableWebFingerprint || result.GetProto() == UDP || config.CanOnlyScanUDP() {
 			return result, nil
 		}
 
@@ -220,7 +237,13 @@ func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, o
 	}
 
 	var matchResult *MatchResult
-	if config.OnlyEnableWebFingerprint {
+	// A UDP-only target must not dial TCP first. Web ports such as 8080 would
+	// otherwise report closed, or merge the UDP banner into an empty protocol
+	// that Tidy records as TCP.
+	if proto == "udp" || config.CanOnlyScanUDP() {
+		f.log("service-detect first for udp %v", utils2.HostPort(host, port))
+		matchResult, err = serviceFirst()
+	} else if config.OnlyEnableWebFingerprint {
 		f.log("web-detect first for: %v", utils2.HostPort(host, port))
 		matchResult, err = webFirst()
 	} else {
@@ -242,7 +265,7 @@ func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, o
 	}
 
 	// if port open, check tls...
-	if matchResult.State == OPEN && matchResult.Fingerprint != nil && (len(matchResult.Fingerprint.TLSInspectResults) == 0 && !matchResult.Fingerprint.CheckedTLS) {
+	if matchResult.State == OPEN && matchResult.Fingerprint != nil && matchResult.GetProto() != UDP && (len(matchResult.Fingerprint.TLSInspectResults) == 0 && !matchResult.Fingerprint.CheckedTLS) {
 		f.log("start TLS inspection for %v", utils2.HostPort(host, port))
 		matchResult.Fingerprint.TLSInspectResults, _ = netx.TLSInspectTimeout(utils2.HostPort(host, port), 5)
 		f.log("TLS inspection completed")
@@ -253,11 +276,11 @@ func (f *Matcher) MatchWithContext(ctx context.Context, host string, port int, o
 	if matchResult.State == OPEN {
 		if config.EnableCache {
 			f.log("saving result to memory cache")
-			SetMatchResultCache(addr, matchResult)
+			SetMatchResultCache(cacheKey, matchResult)
 		}
 		if config.EnableDatabaseCache {
 			f.log("saving result to database cache")
-			SetMatchResultDatabaseCache(addr, matchResult)
+			SetMatchResultDatabaseCache(cacheKey, matchResult)
 		}
 	}
 	f.reportFinished(matchResult)

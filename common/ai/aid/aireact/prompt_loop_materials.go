@@ -38,6 +38,7 @@ const (
 )
 
 var loopDynamicSectionTemplate = promptloader.MustLoad("ai/aid/aireact/prompts/loop/dynamic_section.txt")
+var loopCompressionDynamicSectionTemplate = promptloader.MustLoad("ai/aid/aireact/prompts/loop/context_compression_dynamic_section.txt")
 
 func (r *ReAct) GetLoopPromptBaseMaterials(tools []*aitool.Tool, nonce string) (*reactloops.LoopPromptBaseMaterials, error) {
 	if r == nil || r.promptManager == nil {
@@ -139,6 +140,7 @@ func (pm *PromptManager) getLoopPromptBaseMaterials(
 		if actions := loop.Actions(); actions != nil {
 			_, hasLoadCapability = actions.Get("load_capability")
 		}
+		materials.SkillInventory = loop.GetSkillsContextManager().SkillInventory()
 	}
 
 	materials.AllowPlanAndExec = allowPlanAndExec
@@ -174,6 +176,12 @@ func (pm *PromptManager) AssembleLoopPrompt(tools []*aitool.Tool, input *reactlo
 	if input == nil {
 		return nil, fmt.Errorf("loop prompt assembly input is nil")
 	}
+	if input.PromptMode != aicommon.LoopPromptModeNormal && input.PromptMode != aicommon.LoopPromptModeCompressContext {
+		return nil, fmt.Errorf("unsupported loop prompt mode %d", input.PromptMode)
+	}
+	if input.PromptMode == aicommon.LoopPromptModeCompressContext && strings.TrimSpace(input.CompressionGuide) == "" {
+		return nil, fmt.Errorf("context-compression prompt requires its snapshot guide")
+	}
 	if pm.react == nil || pm.react.config == nil || pm.react.config.GetTimeline() == nil {
 		return nil, fmt.Errorf("main-loop timeline is not initialized")
 	}
@@ -183,9 +191,16 @@ func (pm *PromptManager) AssembleLoopPrompt(tools []*aitool.Tool, input *reactlo
 		IncludeLatestModelReplay: input.IncludeLatestModelReplay,
 		PromoteUserInput:         true,
 		UserInputOnly:            input.Lightweight,
+		ThroughID:                input.HistoryThroughID,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if input.AutoContext != "" {
+		if base.AutoContext != "" {
+			base.AutoContext += "\n"
+		}
+		base.AutoContext += input.AutoContext
 	}
 	// Keep the existing shared plan_document storage; relocate only its main-loop
 	// presentation. Extract before lightweight projection so the full document survives.
@@ -228,7 +243,7 @@ func (pm *PromptManager) AssembleLoopPrompt(tools []*aitool.Tool, input *reactlo
 		return nil, err
 	}
 
-	sections := make([]*reactloops.PromptSectionObservation, 0, len(prefix.Sections))
+	sections := make([]*aicommon.PromptSectionObservation, 0, len(prefix.Sections))
 	sections = append(sections, prefix.Sections...)
 	if dynamicSection := pm.buildDynamicObservation(base, effectiveInput, dynamic); dynamicSection != nil {
 		sections = append(sections, dynamicSection)
@@ -244,8 +259,11 @@ func (pm *PromptManager) AssembleLoopPrompt(tools []*aitool.Tool, input *reactlo
 		base.Nonce,
 	)
 	return &reactloops.LoopPromptAssemblyResult{
-		Prompt:   prompt,
-		Sections: sections,
+		Prompt:            prompt,
+		Mode:              input.PromptMode,
+		Sections:          sections,
+		TimelineThroughID: &base.TimelineThroughID,
+		TimelineItemIDs:   base.TimelineItemIDs,
 	}, nil
 }
 
@@ -253,8 +271,6 @@ const (
 	lightweightLoopRecentTimelineTokens  = 4096
 	lightweightLoopTaskInstructionTokens = 6144
 	lightweightLoopOutputExampleTokens   = 1024
-	lightweightLoopSkillsTokens          = 1024
-	lightweightLoopSkillBodyTokens       = 2048
 	lightweightLoopPlanContextTokens     = 2048
 	lightweightLoopExtraTokens           = 1024
 	lightweightLoopReactiveTokens        = 3072
@@ -281,13 +297,13 @@ func (pm *PromptManager) projectLightweightLoopMaterials(
 	lightBase.TopToolsCount = len(lightBase.TopTools)
 	lightBase.HasMoreTools = lightBase.ToolsCount > lightBase.TopToolsCount
 	lightBase.MoreToolsCount = lightBase.ToolsCount - lightBase.TopToolsCount
+	// SkillInventory already has a fixed 2K budget; use the same snapshot in both modes.
 
 	lightInput := *input
 	lightInput.TaskInstruction = boundedLightweightPromptBlock(input.TaskInstruction, lightweightLoopTaskInstructionTokens, "task instruction")
 	lightInput.OutputExample = boundedLightweightPromptBlock(input.OutputExample, lightweightLoopOutputExampleTokens, "output example")
-	lightInput.SkillsContext = boundedLightweightPromptBlock(input.SkillsContext, lightweightLoopSkillsTokens, "skills context")
-	lightInput.ForcedSkills = boundedLightweightPromptBlock(input.ForcedSkills, lightweightLoopSkillBodyTokens, "forced skill body")
-	lightInput.AutoLoadedSkills = boundedLightweightPromptBlock(input.AutoLoadedSkills, lightweightLoopSkillBodyTokens, "auto-loaded skill body")
+	// Retained skill guidance comes from the same Timeline snapshot in both
+	// modes; freezing must not silently drop it under a separate skill budget.
 	lightInput.FrozenUserContext = boundedLightweightPromptBlock(input.FrozenUserContext, lightweightLoopPlanContextTokens, "plan context")
 	lightInput.FrozenPartitions = nil
 	// TODO already has a single store-level budget. Do not omit the entire work
@@ -326,6 +342,7 @@ func (pm *PromptManager) NewPromptMaterials(base *reactloops.LoopPromptBaseMater
 		materials.TopTools = append([]*aitool.Tool{}, base.TopTools...)
 		materials.HasMoreTools = base.HasMoreTools
 		materials.MoreToolsCount = base.MoreToolsCount
+		materials.SkillInventory = base.SkillInventory
 		materials.ForgeInventory = base.ShowForgeInventory && strings.TrimSpace(base.AIForgeList) != ""
 		materials.AIForgeList = base.AIForgeList
 
@@ -343,7 +360,6 @@ func (pm *PromptManager) NewPromptMaterials(base *reactloops.LoopPromptBaseMater
 		materials.FunctionCallMode = input.FunctionCallMode
 		materials.TaskInstruction = input.TaskInstruction
 		materials.OutputExample = input.OutputExample
-		materials.SkillsContext = input.SkillsContext
 		materials.Schema = input.Schema
 		materials.FunctionCallSchemas = input.FunctionCallSchemas
 		// 全局 TODO 块: 在普通 Timeline 之后透传, 物理位置在 timeline-open 段
@@ -361,10 +377,6 @@ func (pm *PromptManager) NewPromptMaterials(base *reactloops.LoopPromptBaseMater
 		//        缓存边界外
 		materials.FrozenUserContext = input.FrozenUserContext
 		materials.FrozenPartitions = append(materials.FrozenPartitions, input.FrozenPartitions...)
-		// SKILL 三态透传: forced (frozen_block 顶部) / auto (semi_dynamic_2 尾部).
-		// SkillsContext (含 catalog) 已透传, 这里补 forced / auto.
-		materials.ForcedSkills = input.ForcedSkills
-		materials.AutoLoadedSkills = input.AutoLoadedSkills
 	}
 	if base != nil {
 		// Legacy helper prompts retain their bounded history view.
@@ -380,7 +392,7 @@ func (pm *PromptManager) NewPromptMaterials(base *reactloops.LoopPromptBaseMater
 // OutputExample) | TimelineOpen。Prompt 字段是 5 段拼接结果, 调用方拼上 Dynamic
 // 段后形成完整 prompt。
 //
-// FrozenBlock 段 (Tool Inventory + Forge Inventory + Timeline-frozen) 整体字节稳定,
+// FrozenBlock 段 (Tool/Skill/Forge Inventory + Timeline-frozen) 整体字节稳定,
 // 由 buildTaggedPromptSections 用 <|AI_CACHE_FROZEN_semi-dynamic|>...
 // <|AI_CACHE_FROZEN_END_semi-dynamic|> 标签包裹, 供 aicache hijacker
 // splitByFrozenBoundary 精准切片 user1 (frozen prefix) / user2 (open tail)。
@@ -412,14 +424,14 @@ func (pm *PromptManager) AssemblePromptPrefix(materials *aicommon.PromptMaterial
 	semiDynamic2 := assembled.SemiDynamic2
 	timelineOpen := assembled.TimelineOpen
 
-	sections := []*reactloops.PromptSectionObservation{
+	sections := []*aicommon.PromptSectionObservation{
 		pm.buildHighStaticObservation(materials, highStatic),
 		pm.buildFrozenBlockObservation(materials, frozenBlock),
 		pm.buildSemiDynamic1Observation(materials, semiDynamic1),
 		pm.buildSemiDynamic2Observation(materials, semiDynamic2),
 		pm.buildTimelineOpenObservation(materials, timelineOpen),
 	}
-	var filtered []*reactloops.PromptSectionObservation
+	var filtered []*aicommon.PromptSectionObservation
 	for _, section := range sections {
 		if section != nil {
 			filtered = append(filtered, section)
@@ -445,7 +457,6 @@ func (pm *PromptManager) buildLoopPromptSectionData(base *reactloops.LoopPromptB
 		"TaskInstruction":    "",
 		"OutputExample":      "",
 		"Schema":             "",
-		"SkillsContext":      "",
 		"ExtraCapabilities":  "",
 		"TodoSnapshot":       "",
 		"ReactiveData":       "",
@@ -493,13 +504,14 @@ func (pm *PromptManager) buildLoopPromptSectionData(base *reactloops.LoopPromptB
 	}
 	if input != nil {
 		data["Nonce"] = input.Nonce
+		data["CompressContext"] = input.PromptMode == aicommon.LoopPromptModeCompressContext
+		data["CompressionGuide"] = input.CompressionGuide
 		data["FunctionCallMode"] = input.FunctionCallMode
 		data["UserQuery"] = input.UserQuery
 		data["TaskInstruction"] = input.TaskInstruction
 		data["OutputExample"] = input.OutputExample
 		data["Schema"] = input.Schema
 		data["FunctionCallSchemas"] = input.FunctionCallSchemas
-		data["SkillsContext"] = input.SkillsContext
 		data["ExtraCapabilities"] = input.ExtraCapabilities
 		data["TodoSnapshot"] = input.TodoSnapshot
 		data["ReactiveData"] = input.ReactiveData
@@ -512,11 +524,11 @@ func (pm *PromptManager) buildLoopPromptSectionData(base *reactloops.LoopPromptB
 func (pm *PromptManager) buildHighStaticObservation(
 	materials *reactloops.PromptPrefixMaterials,
 	rendered string,
-) *reactloops.PromptSectionObservation {
-	section := reactloops.NewPromptContainerSection(
+) *aicommon.PromptSectionObservation {
+	section := aicommon.NewPromptContainerSection(
 		"section.high_static",
 		"Highly Static",
-		reactloops.PromptSectionRoleHighStatic,
+		aicommon.PromptSectionRoleHighStatic,
 	)
 	// section.high_static 已重构为完全无变量的纯静态系统提示词:
 	//   - OutputExample (caller-specific) 在 semi-dynamic 段 Schema 之前
@@ -531,11 +543,11 @@ func (pm *PromptManager) buildHighStaticObservation(
 	// 子节点 Name 已去掉 "Highly Static / " 前缀: UI 字节统计面板里父容器
 	// "Highly Static" 已经表达层级, 子节点重复前缀只是噪声.
 	// 关键词: section.high_static 子节点 Name 去前缀, UI 信息密度
-	children := []*reactloops.PromptSectionObservation{
-		reactloops.NewPromptSectionObservation(
+	children := []*aicommon.PromptSectionObservation{
+		aicommon.NewPromptSectionObservation(
 			"section.high_static.static_preamble",
 			"Traits & Agent Systems",
-			reactloops.PromptSectionRoleHighStatic,
+			aicommon.PromptSectionRoleHighStatic,
 			false,
 			pm.renderHighStaticPreamble(materials),
 		),
@@ -544,15 +556,15 @@ func (pm *PromptManager) buildHighStaticObservation(
 	if strings.TrimSpace(rendered) != "" {
 		section.Content = ""
 	}
-	return reactloops.FinalizePromptContainerSection(section)
+	return aicommon.FinalizePromptContainerSection(section)
 }
 
 // buildFrozenBlockObservation 给"AI_CACHE_FROZEN 块"做观测树:
-// Tool Inventory + Forge Inventory + Timeline-frozen (reducer + 非末 interval)。
+// Tool/Skill/Forge Inventory + Timeline-frozen (reducer + 非末 interval)。
 //
-// 段顺序: Tool/Forge 是整个 root 任务生命周期都不变的"系统级"内容, 排在最前;
+// 段顺序: Tool/Skill/Forge 是初始化后不变的目录内容, 排在最前;
 // Timeline-frozen 随时间轴增长可能间歇性扩展 (新一段 reducer 块产生时), 排在
-// 最后, 让前两段的前缀缓存更稳定。
+// 最后, 让前面的目录前缀缓存更稳定。
 //
 // PlanContext (PE-TASK PLAN 产物) 历史上曾在此段渲染, 但因仅 PE-TASK 子任务
 // 有内容, root task / 普通 ReAct 时为空, 这种"有时存在有时不存在"的渲染态
@@ -560,40 +572,44 @@ func (pm *PromptManager) buildHighStaticObservation(
 // prefix cache 命中。现已迁到 buildSemiDynamicResidualObservation
 // (section.semi_dynamic.plan_context, AI_CACHE_SEMI 边界包裹)。
 //
-// 关键词: buildFrozenBlockObservation, Tool/Forge/Timeline-frozen,
+// 关键词: buildFrozenBlockObservation, Tool/Skill/Forge/Timeline-frozen,
 //
 //	AI_CACHE_FROZEN, PlanContext 已迁出
 func (pm *PromptManager) buildFrozenBlockObservation(
 	materials *reactloops.PromptPrefixMaterials,
 	rendered string,
-) *reactloops.PromptSectionObservation {
-	section := reactloops.NewPromptContainerSection(
+) *aicommon.PromptSectionObservation {
+	section := aicommon.NewPromptContainerSection(
 		"section.frozen_block",
 		"Frozen Block",
-		reactloops.PromptSectionRoleFrozenBlock,
+		aicommon.PromptSectionRoleFrozenBlock,
 	)
 	// 子节点 Name 已去掉 "Frozen Block / " 前缀: UI 字节统计面板里父容器
 	// "Frozen Block" 已经表达层级.
 	// 关键词: section.frozen_block 子节点 Name 去前缀, UI 信息密度
-	children := []*reactloops.PromptSectionObservation{
-		reactloops.NewPromptSectionObservation(
-			"section.frozen_block.user_forced_skill",
-			"User Forced Skills",
-			reactloops.PromptSectionRoleFrozenBlock,
-			true,
-			renderUserForcedSkillBlock(materials),
-		),
-		reactloops.NewPromptSectionObservation(
+	var skillInventory string
+	if materials != nil {
+		skillInventory = materials.SkillInventory
+	}
+	children := []*aicommon.PromptSectionObservation{
+		aicommon.NewPromptSectionObservation(
 			"section.frozen_block.tool_inventory",
 			"Tool Inventory",
-			reactloops.PromptSectionRoleFrozenBlock,
+			aicommon.PromptSectionRoleFrozenBlock,
 			true,
 			renderToolInventoryBlock(materials),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
+			"section.frozen_block.skill_inventory",
+			"Skill Inventory",
+			aicommon.PromptSectionRoleFrozenBlock,
+			true,
+			skillInventory,
+		),
+		aicommon.NewPromptSectionObservation(
 			"section.frozen_block.forge_inventory",
 			"Forge Inventory",
-			reactloops.PromptSectionRoleFrozenBlock,
+			aicommon.PromptSectionRoleFrozenBlock,
 			true,
 			renderForgeInventoryBlock(materials),
 		),
@@ -607,19 +623,19 @@ func (pm *PromptManager) buildFrozenBlockObservation(
 		if strings.TrimSpace(label) == "" {
 			label = partition.ID
 		}
-		children = append(children, reactloops.NewPromptSectionObservation(
+		children = append(children, aicommon.NewPromptSectionObservation(
 			"section.frozen_block.partition."+partition.ID,
 			label,
-			reactloops.PromptSectionRoleFrozenBlock,
+			aicommon.PromptSectionRoleFrozenBlock,
 			true,
 			renderFrozenPartitionBlock(partition),
 		))
 	}
 	children = append(children,
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.frozen_block.timeline_frozen",
 			"Timeline (Frozen Prefix)",
-			reactloops.PromptSectionRoleFrozenBlock,
+			aicommon.PromptSectionRoleFrozenBlock,
 			true,
 			renderTimelineFrozenBlock(materials),
 		),
@@ -628,7 +644,7 @@ func (pm *PromptManager) buildFrozenBlockObservation(
 	if strings.TrimSpace(rendered) != "" {
 		section.Content = ""
 	}
-	return reactloops.FinalizePromptContainerSection(section)
+	return aicommon.FinalizePromptContainerSection(section)
 }
 
 // renderPlanContextBlock 渲染 PE-TASK 的 PLAN_CONTEXT 段。
@@ -673,58 +689,58 @@ func renderPlanContextBlock(materials *reactloops.PromptPrefixMaterials) string 
 func (pm *PromptManager) buildSemiDynamic1Observation(
 	materials *reactloops.PromptPrefixMaterials,
 	rendered string,
-) *reactloops.PromptSectionObservation {
+) *aicommon.PromptSectionObservation {
 	// Role 用 PromptSectionRoleSemiDynamic1 ("半动态段1") 而非通用 SemiDynamic,
 	// 让上下文字节统计图 / 上下文成分面板把 SemiDynamic1 与 SemiDynamic2 作为
 	// 独立类型分开统计, 避免两块字节抖动被合并掩盖导致面板趋势线不稳定.
 	// 关键词: section.semi_dynamic_1 独立 Role, 字节统计独立分类, P1.1
-	section := reactloops.NewPromptContainerSection(
+	section := aicommon.NewPromptContainerSection(
 		"section.semi_dynamic_1",
 		"Semi Dynamic 1",
-		reactloops.PromptSectionRoleSemiDynamic1,
+		aicommon.PromptSectionRoleSemiDynamic1,
 	)
 	// 子节点 Name 已去掉 "Semi Dynamic 1 / " 前缀: UI 字节统计面板里父容器
 	// 已经表达层级.
 	// 关键词: section.semi_dynamic_1 子节点 Name 去前缀, UI 信息密度
-	children := []*reactloops.PromptSectionObservation{
-		reactloops.NewPromptSectionObservation(
+	children := []*aicommon.PromptSectionObservation{
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_1.workspace", "Workspace",
-			reactloops.PromptSectionRoleSemiDynamic1, false, renderWorkspaceBlock(materials),
+			aicommon.PromptSectionRoleSemiDynamic1, false, renderWorkspaceBlock(materials),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_1.skills_context",
 			"Skills Context",
-			reactloops.PromptSectionRoleSemiDynamic1,
+			aicommon.PromptSectionRoleSemiDynamic1,
 			true,
 			materials.SkillsContext,
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_1.recent_tools",
 			"Recently Used Tools",
-			reactloops.PromptSectionRoleSemiDynamic1,
+			aicommon.PromptSectionRoleSemiDynamic1,
 			true,
 			materials.PromotedRecentTools,
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_1.user_history", "User Input History",
-			reactloops.PromptSectionRoleSemiDynamic1, true, materials.PromotedUserInputHistory,
+			aicommon.PromptSectionRoleSemiDynamic1, true, materials.PromotedUserInputHistory,
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_1.plan_document", "PLAN DOCUMENT",
-			reactloops.PromptSectionRoleSemiDynamic1, false, materials.PlanDocument,
+			aicommon.PromptSectionRoleSemiDynamic1, false, materials.PlanDocument,
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_1.plan_definition", "PLAN DEFINITION",
-			reactloops.PromptSectionRoleSemiDynamic1, false, materials.PlanDefinition,
+			aicommon.PromptSectionRoleSemiDynamic1, false, materials.PlanDefinition,
 		),
-		reactloops.NewPromptSectionObservation("section.semi_dynamic_1.evidence", "Session Evidence", reactloops.PromptSectionRoleSemiDynamic1, true, materials.SessionEvidenceSemiDynamic),
-		reactloops.NewPromptSectionObservation("section.semi_dynamic_1.current_report", "CURRENT REPORT", reactloops.PromptSectionRoleSemiDynamic1, false, materials.CurrentReport),
+		aicommon.NewPromptSectionObservation("section.semi_dynamic_1.evidence", "Session Evidence", aicommon.PromptSectionRoleSemiDynamic1, true, materials.SessionEvidenceSemiDynamic),
+		aicommon.NewPromptSectionObservation("section.semi_dynamic_1.current_report", "CURRENT REPORT", aicommon.PromptSectionRoleSemiDynamic1, false, materials.CurrentReport),
 	}
 	section.Children = filterIncludedPromptSections(children)
 	if strings.TrimSpace(rendered) != "" {
 		section.Content = ""
 	}
-	return reactloops.FinalizePromptContainerSection(section)
+	return aicommon.FinalizePromptContainerSection(section)
 }
 
 // buildSemiDynamic2Observation 给"PROMPT_SECTION_semi-dynamic-2 段"做观测树:
@@ -742,44 +758,44 @@ func (pm *PromptManager) buildSemiDynamic1Observation(
 func (pm *PromptManager) buildSemiDynamic2Observation(
 	materials *reactloops.PromptPrefixMaterials,
 	rendered string,
-) *reactloops.PromptSectionObservation {
+) *aicommon.PromptSectionObservation {
 	// Role 用 PromptSectionRoleSemiDynamic2 ("半动态段2") 而非通用 SemiDynamic,
 	// 让上下文字节统计图 / 上下文成分面板把 SemiDynamic1 与 SemiDynamic2 作为
 	// 独立类型分开统计.
 	// 关键词: section.semi_dynamic_2 独立 Role, 字节统计独立分类, P1.1
-	section := reactloops.NewPromptContainerSection(
+	section := aicommon.NewPromptContainerSection(
 		"section.semi_dynamic_2",
 		"Semi Dynamic 2",
-		reactloops.PromptSectionRoleSemiDynamic2,
+		aicommon.PromptSectionRoleSemiDynamic2,
 	)
 	// 子节点 Name 已去掉 "Semi Dynamic 2 / " 前缀: UI 字节统计面板里父容器
 	// 已经表达层级.
 	// 关键词: section.semi_dynamic_2 子节点 Name 去前缀, UI 信息密度
-	children := []*reactloops.PromptSectionObservation{
+	children := []*aicommon.PromptSectionObservation{
 		// section.semi_dynamic_2.task_instruction 从 high-static 段迁入:
 		// TaskInstruction 是 caller 注入的 PERSISTENT 指令, caller-specific,
 		// 跨同一 caller 的 turn 字节稳定. 留在 high-static 段会污染
 		// AI_CACHE_SYSTEM 边界, 因此下沉到 semi-dynamic 段.
 		// 关键词: section.semi_dynamic_2.task_instruction, PERSISTENT 迁入,
 		//        high-static 反污染
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_2.task_instruction",
 			"Task Instruction",
-			reactloops.PromptSectionRoleSemiDynamic2,
+			aicommon.PromptSectionRoleSemiDynamic2,
 			true,
 			renderStaticTaggedBlock("PERSISTENT", materials.TaskInstruction),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_2.schema",
 			"Schema",
-			reactloops.PromptSectionRoleSemiDynamic2,
+			aicommon.PromptSectionRoleSemiDynamic2,
 			true,
 			renderSchemaBlock(materials.Schema),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_2.function_call_schemas",
 			"Action Tools",
-			reactloops.PromptSectionRoleSemiDynamic2,
+			aicommon.PromptSectionRoleSemiDynamic2,
 			true,
 			materials.FunctionCallSchemas,
 		),
@@ -788,29 +804,19 @@ func (pm *PromptManager) buildSemiDynamic2Observation(
 		// 差异较大, 留在 high-static 段会破坏 AI_CACHE_SYSTEM 段的 hash 稳定性.
 		// 关键词: section.semi_dynamic_2.output_example, OutputExample 迁入,
 		//        high-static 反污染
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.semi_dynamic_2.output_example",
 			"Output Example",
-			reactloops.PromptSectionRoleSemiDynamic2,
+			aicommon.PromptSectionRoleSemiDynamic2,
 			true,
 			renderStaticTaggedBlock("OUTPUT_EXAMPLE", materials.OutputExample),
-		),
-		// section.semi_dynamic_2.auto_loaded_skills: AI 意图驱动加载的 SKILL 段 (尾部).
-		// 物理位置在 OutputExample 之后 Schema 之前, 保 TaskInstr/Example 前缀字节稳定 →
-		// AI_CACHE_SEMI2 前缀缓存命中, 仅尾部变化.
-		reactloops.NewPromptSectionObservation(
-			"section.semi_dynamic_2.auto_loaded_skills",
-			"Auto-loaded Skills",
-			reactloops.PromptSectionRoleSemiDynamic2,
-			true,
-			renderAutoLoadedSkillsBlock(materials),
 		),
 	}
 	section.Children = filterIncludedPromptSections(children)
 	if strings.TrimSpace(rendered) != "" {
 		section.Content = ""
 	}
-	return reactloops.FinalizePromptContainerSection(section)
+	return aicommon.FinalizePromptContainerSection(section)
 }
 
 // buildTimelineOpenObservation mirrors the variable timeline-open template.
@@ -818,39 +824,39 @@ func (pm *PromptManager) buildSemiDynamic2Observation(
 func (pm *PromptManager) buildTimelineOpenObservation(
 	materials *reactloops.PromptPrefixMaterials,
 	rendered string,
-) *reactloops.PromptSectionObservation {
-	section := reactloops.NewPromptContainerSection(
+) *aicommon.PromptSectionObservation {
+	section := aicommon.NewPromptContainerSection(
 		"section.timeline_open",
 		"Timeline Open",
-		reactloops.PromptSectionRoleTimelineOpen,
+		aicommon.PromptSectionRoleTimelineOpen,
 	)
-	children := []*reactloops.PromptSectionObservation{
-		reactloops.NewPromptSectionObservation(
+	children := []*aicommon.PromptSectionObservation{
+		aicommon.NewPromptSectionObservation(
 			"section.timeline_open.timeline_open",
 			"Timeline (Open Tail)",
-			reactloops.PromptSectionRoleTimelineOpen,
+			aicommon.PromptSectionRoleTimelineOpen,
 			true,
 			renderTimelineOpenBlock(materials),
 		),
 
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.timeline_open.plan_status", "PLAN STATUS",
-			reactloops.PromptSectionRoleTimelineOpen, false, materials.PlanStatus,
+			aicommon.PromptSectionRoleTimelineOpen, false, materials.PlanStatus,
 		),
 		// TODO 快照紧跟 Open Timeline / PLAN STATUS；状态由普通 ReAct action 更新。
 		// 段位仍属 timeline-open, 落在所有 cache 边界外, 不污染上游 prefix cache.
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.timeline_open.todo_list",
 			"Todo List",
-			reactloops.PromptSectionRoleTimelineOpen,
+			aicommon.PromptSectionRoleTimelineOpen,
 			true,
 			materials.TodoSnapshot,
 		),
 		// Legacy helpers keep their bounded history field; main prompts clear it
 		// and use the exact Open/Semi1 projection instead.
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.timeline_open.user_history", "User History",
-			reactloops.PromptSectionRoleTimelineOpen, false, materials.UserHistory,
+			aicommon.PromptSectionRoleTimelineOpen, false, materials.UserHistory,
 		),
 		// PlanContext (PE-TASK PLAN 产物) 末尾注入: 该字段仅 PE-TASK 子任务
 		// 非空, 内容随子任务切换抖动, 不适合放任何 cache 边界内。
@@ -858,10 +864,10 @@ func (pm *PromptManager) buildTimelineOpenObservation(
 		// cache 边界之外, 不污染上游 system / frozen / semi 三段缓存命中。
 		// 关键词: section.timeline_open.plan_context, PLAN_CONTEXT 末尾,
 		//        缓存边界外, 上游缓存保护
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.timeline_open.plan_context",
 			"Plan Context (PE-TASK PLAN Output)",
-			reactloops.PromptSectionRoleTimelineOpen,
+			aicommon.PromptSectionRoleTimelineOpen,
 			true,
 			renderPlanContextBlock(materials),
 		),
@@ -870,72 +876,84 @@ func (pm *PromptManager) buildTimelineOpenObservation(
 	if strings.TrimSpace(rendered) != "" {
 		section.Content = ""
 	}
-	return reactloops.FinalizePromptContainerSection(section)
+	return aicommon.FinalizePromptContainerSection(section)
 }
 
 func (pm *PromptManager) buildDynamicObservation(
 	base *reactloops.LoopPromptBaseMaterials,
 	input *reactloops.LoopPromptAssemblyInput,
 	rendered string,
-) *reactloops.PromptSectionObservation {
-	section := reactloops.NewPromptContainerSection(
+) *aicommon.PromptSectionObservation {
+	section := aicommon.NewPromptContainerSection(
 		"section.dynamic",
 		"Pure Dynamic",
-		reactloops.PromptSectionRoleDynamic,
+		aicommon.PromptSectionRoleDynamic,
 	)
 	// 子节点 Name 已去掉 "Pure Dynamic / " 前缀: UI 字节统计面板里父容器
 	// "Pure Dynamic" 已经表达层级.
 	// 关键词: section.dynamic 子节点 Name 去前缀, UI 信息密度
-	children := []*reactloops.PromptSectionObservation{
-		reactloops.NewPromptSectionObservation(
+	children := []*aicommon.PromptSectionObservation{
+		aicommon.NewPromptSectionObservation(
 			"section.dynamic.current_time", "Current Time",
-			reactloops.PromptSectionRoleDynamic, false,
+			aicommon.PromptSectionRoleDynamic, false,
 			renderCurrentTimeBlock(&aicommon.PromptMaterials{CurrentTime: base.CurrentTime}),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.dynamic.auto_context",
 			"Auto Context",
-			reactloops.PromptSectionRoleDynamic,
+			aicommon.PromptSectionRoleDynamic,
 			true,
 			base.AutoContext,
 		),
 		// P1-C2: user_history 已上移到 section.timeline_open.user_history,
 		// 此处 dynamic 段不再渲染 PREV_USER_INPUT.
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.dynamic.extra_capabilities",
 			"Extra Capabilities",
-			reactloops.PromptSectionRoleDynamic,
+			aicommon.PromptSectionRoleDynamic,
 			true,
 			renderTaggedBlock("EXTRA_CAPABILITIES", input.Nonce, input.ExtraCapabilities),
 		),
 		// 此处 dynamic 段不再渲染 SESSION_ARTIFACTS.
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.dynamic.reactive_data",
 			"Reactive Data",
-			reactloops.PromptSectionRoleDynamic,
+			aicommon.PromptSectionRoleDynamic,
 			true,
 			renderTaggedBlock("REACTIVE_DATA", input.Nonce, input.ReactiveData),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.dynamic.injected_memory",
 			"Injected Memory",
-			reactloops.PromptSectionRoleDynamic,
+			aicommon.PromptSectionRoleDynamic,
 			true,
 			renderInjectedMemoryBlock(input.Nonce, input.InjectedMemory),
 		),
-		reactloops.NewPromptSectionObservation(
+		aicommon.NewPromptSectionObservation(
 			"section.dynamic.todo_checkpoint",
 			"TODO Checkpoint",
-			reactloops.PromptSectionRoleDynamic,
+			aicommon.PromptSectionRoleDynamic,
 			false,
 			input.TodoCheckpoint,
 		),
+	}
+	if input.PromptMode == aicommon.LoopPromptModeCompressContext {
+		state := []*aicommon.PromptSectionObservation{
+			aicommon.NewPromptSectionObservation("section.dynamic.context_compression", "Context Compression",
+				aicommon.PromptSectionRoleDynamic, false, input.CompressionGuide),
+		}
+		for _, child := range children {
+			if child.Key != "section.dynamic.extra_capabilities" {
+				state = append(state, child)
+			}
+		}
+		children = state
 	}
 	section.Children = filterIncludedPromptSections(children)
 	if strings.TrimSpace(rendered) != "" {
 		section.Content = ""
 	}
-	return reactloops.FinalizePromptContainerSection(section)
+	return aicommon.FinalizePromptContainerSection(section)
 }
 
 // renderHighStaticPreamble 渲染 high-static 段的"前导文" (TRAITS + 方法论
@@ -982,8 +1000,8 @@ func (pm *PromptManager) UserHistoryContextWithNonce(nonce string) string {
 	return pm.react.config.FormatUserInputHistoryAITag(nonce, prevUserInputTagMaxTokens)
 }
 
-func filterIncludedPromptSections(items []*reactloops.PromptSectionObservation) []*reactloops.PromptSectionObservation {
-	var result []*reactloops.PromptSectionObservation
+func filterIncludedPromptSections(items []*aicommon.PromptSectionObservation) []*aicommon.PromptSectionObservation {
+	var result []*aicommon.PromptSectionObservation
 	for _, item := range items {
 		if item != nil && item.IsIncluded() {
 			result = append(result, item)
@@ -1079,22 +1097,6 @@ func renderTimelineFrozenBlock(materials *reactloops.PromptPrefixMaterials) stri
 	return "# Timeline Memory (Frozen Prefix)\n" + materials.TimelineFrozen
 }
 
-// renderUserForcedSkillBlock 渲染用户强制加载 SKILL 段 (frozen_block 顶部, 满内容).
-func renderUserForcedSkillBlock(materials *reactloops.PromptPrefixMaterials) string {
-	if materials == nil {
-		return ""
-	}
-	return strings.TrimSpace(materials.ForcedSkills)
-}
-
-// renderAutoLoadedSkillsBlock 渲染 AI 意图驱动加载 SKILL 段 (semi_dynamic_2 尾部).
-func renderAutoLoadedSkillsBlock(materials *reactloops.PromptPrefixMaterials) string {
-	if materials == nil {
-		return ""
-	}
-	return strings.TrimSpace(materials.AutoLoadedSkills)
-}
-
 // renderTimelineOpenBlock 渲染 timeline 开放尾段 (最末 interval)。
 // 用于 TimelineOpen 段的观测树。
 //
@@ -1151,6 +1153,9 @@ func (pm *PromptManager) renderLoopFrozenBlockSection(materials *reactloops.Prom
 }
 
 func (pm *PromptManager) renderLoopDynamicSection(data map[string]any) (string, error) {
+	if data["CompressContext"] == true {
+		return pm.executeTemplate("loop-context-compression-dynamic", loopCompressionDynamicSectionTemplate, data)
+	}
 	return pm.executeTemplate("loop-dynamic", loopDynamicSectionTemplate, data)
 }
 

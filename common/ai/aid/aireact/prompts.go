@@ -189,11 +189,14 @@ func (pm *PromptManager) GetBasicPromptInfo(tools []*aitool.Tool) (string, map[s
 		result["AIForgeList"] = pm.GetAvailableAIForgeBlueprints()
 	}
 	result["ShowForgeList"] = pm.react.config.GetShowForgeListInPrompt()
-	result["AllowAskForClarification"] = pm.react.config.GetEnableUserInteract()
-	result["AllowKnowledgeEnhanceAnswer"] = pm.react.config.GetEnhanceKnowledgeManager() == nil ||
-		!pm.react.config.GetDisableEnhanceDirectlyAnswer()
-	result["AskForClarificationCurrentTime"] = pm.react.currentUserInteractiveCount
-	result["AskForClarificationMaxTimes"] = pm.react.config.GetUserInteractiveLimitedTimes()
+	taskID := ""
+	if task := pm.react.GetCurrentTask(); task != nil {
+		taskID = task.GetId()
+	}
+	result["AllowAskForClarification"] = pm.react.config.CheckClarificationAllowed(taskID, true) == nil ||
+		(pm.react.config.UIQuestionsEnabled() && pm.react.config.CheckClarificationAllowed(taskID, false) == nil)
+	result["AllowKnowledgeEnhanceAnswer"] = true // Legacy template key; retrieval uses Skill-guided tools.
+	result["AskForClarificationCurrentTime"], result["AskForClarificationMaxTimes"] = pm.react.config.ClarificationUsage(taskID)
 
 	if len(tools) > 0 {
 		// caller-supplied subset: render verbatim, no token-budget trimming.
@@ -271,8 +274,7 @@ func (pm *PromptManager) assemblePromptWithDynamicSection(
 
 // applyLoopInstructionAndExample fills TaskInstruction / OutputExample on the
 // prefix materials from the active loop, falling back to the caller-supplied
-// defaults. It also attaches the skills context rendered from the loop's
-// SkillsContextManager.
+// defaults. Skill guidance is already supplied by the shared Timeline materials.
 func (pm *PromptManager) applyLoopInstructionAndExample(
 	materials *aicommon.PromptMaterials,
 	fallbackInstruction, fallbackExample string,
@@ -280,7 +282,6 @@ func (pm *PromptManager) applyLoopInstructionAndExample(
 	instruction, example := pm.currentLoopInstructionAndExample(fallbackInstruction, fallbackExample)
 	materials.TaskInstruction = instruction
 	materials.OutputExample = example
-	materials.SkillsContext = pm.renderSkillsContextForPrompt()
 }
 
 // GenerateVerificationPrompt generates the verification prompt using the shared
@@ -302,7 +303,6 @@ func (pm *PromptManager) GenerateVerificationPrompt(
 	prefixMaterials.HasLoadCapability = false
 	prefixMaterials.TaskInstruction = strings.TrimSpace(verificationInstructionText)
 	prefixMaterials.OutputExample = strings.TrimSpace(verificationOutputExampleText)
-	prefixMaterials.SkillsContext = pm.renderSkillsContextForPrompt()
 
 	dynamicData := pm.buildLoopPromptSectionData(nil, &reactloops.LoopPromptAssemblyInput{
 		Nonce:     nonceString,
@@ -335,7 +335,6 @@ func (pm *PromptManager) GenerateDirectlyAnswerPrompt(userQuery string, tools []
 	prefixMaterials.HasLoadCapability = false
 	prefixMaterials.TaskInstruction = strings.TrimSpace(directlyAnswerInstructionText)
 	prefixMaterials.OutputExample = strings.TrimSpace(directlyAnswerOutputExampleText)
-	prefixMaterials.SkillsContext = pm.renderSkillsContextForPrompt()
 
 	dynamicData := pm.buildLoopPromptSectionData(nil, &reactloops.LoopPromptAssemblyInput{
 		Nonce:     nonceString,
@@ -373,7 +372,6 @@ func (pm *PromptManager) GenerateChangeAIBlueprintPrompt(
 	prefixMaterials.HasLoadCapability = false
 	prefixMaterials.TaskInstruction = strings.TrimSpace(changeBlueprintInstructionText)
 	prefixMaterials.OutputExample = strings.TrimSpace(changeBlueprintOutputExampleText)
-	prefixMaterials.SkillsContext = pm.renderSkillsContextForPrompt()
 	// Surface the forge inventory passed by the caller in the frozen-block so the
 	// change-blueprint instruction can reference it ("from the inventory above").
 	prefixMaterials.ForgeInventory = strings.TrimSpace(forgeList) != ""
@@ -501,26 +499,6 @@ func (pm *PromptManager) DynamicContextWithNonce(nonce string) string {
 	default:
 		return baseContext + "\n\n" + historyContext
 	}
-}
-
-// renderSkillsContextForPrompt mirrors the main ReAct loop skills block so
-// tool parameter generation can reuse loaded SKILL.md guidance.
-func (pm *PromptManager) renderSkillsContextForPrompt() string {
-	if pm == nil || pm.react == nil {
-		return ""
-	}
-	return renderSkillsContextForLoop(pm.react.GetCurrentLoop())
-}
-
-func renderSkillsContextForLoop(loop *reactloops.ReActLoop) string {
-	if loop == nil {
-		return ""
-	}
-	mgr := loop.GetSkillsContextManager()
-	if mgr == nil {
-		return ""
-	}
-	return mgr.RenderStable()
 }
 
 // GenerateIntervalReviewPromptWithContext generates a dedicated bounded prompt

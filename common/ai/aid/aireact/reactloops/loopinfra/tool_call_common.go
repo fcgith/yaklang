@@ -20,7 +20,7 @@ func directToolRetryFeedback(loop *reactloops.ReActLoop, name, reason string, ma
 	if config := loop.GetConfig(); config != nil && config.GetAiToolManager() != nil {
 		tool, err := config.GetAiToolManager().GetToolByName(name)
 		if err == nil && tool != nil && !buildinaitools.IsMCPPendingStub(tool) &&
-			(!buildinaitools.IsMCPToolName(name) || aicommon.IsMCPServersAllowedConfig(config)) {
+			(!buildinaitools.IsMCPRelatedToolName(name) || aicommon.IsMCPServersAllowedConfig(config)) {
 			mutation := loop.RecordRecentlyUsedTool(tool)
 			if mutation.Upsert != nil || mutation.Reuse != nil {
 				schemaState = "完整 Schema 已放入 CACHE_TOOL_CALL；按定义修正完整参数，不要重复加载或委托其他模型生成参数。"
@@ -89,6 +89,15 @@ func handleToolCallResult(
 	err error,
 	operator *reactloops.LoopActionHandlerOperator,
 ) {
+	var detached *aicommon.ToolCallDetached
+	if errors.As(err, &detached) {
+		feedback := fmt.Sprintf("工具已转为异步执行，尚未取得结果。execute_id: %q。通过 manage_async_execution_runtime 的 inspect/wait/stop 管理；所需执行结束并核验后再结束任务。", detached.Receipt.ID)
+		invoker.AddToTimeline("ASYNC_TOOL_SUBMITTED", feedback)
+		operator.Feedback(feedback)
+		operator.Continue()
+		return
+	}
+
 	// A non-nil ToolResult is the objective boundary that proves the plugin
 	// callback settled. Count both completed and protocol-failed calls. Review-driven
 	// direct_answer/cancel is terminal user intent, not a tool execution.

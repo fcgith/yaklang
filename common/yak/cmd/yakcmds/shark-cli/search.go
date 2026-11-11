@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"github.com/yaklang/yaklang/common/pcapx/pcaputil"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 )
+
+const fieldFilterPartialNoticePrefix = "Field filter partial: incomplete field evidence · "
 
 type packetSearch struct {
 	fields   *pcaputil.DisplayFilter
@@ -216,51 +219,14 @@ func (t searchTerm) stringMatch(value string) bool {
 // frames to strings or allocating lowercase copies on every refresh.
 type foldMatcher struct {
 	needle  []byte
-	failure []int
+	matcher *pcaputil.ContentMatcher
 }
 
-func foldByte(b byte) byte {
-	if b >= 'A' && b <= 'Z' {
-		return b + 'a' - 'A'
-	}
-	return b
-}
 func newFoldMatcher(needle []byte) *foldMatcher {
-	m := &foldMatcher{needle: append([]byte(nil), needle...), failure: make([]int, len(needle))}
-	for i, b := range m.needle {
-		m.needle[i] = foldByte(b)
-	}
-	for i, j := 1, 0; i < len(m.needle); i++ {
-		for j > 0 && m.needle[i] != m.needle[j] {
-			j = m.failure[j-1]
-		}
-		if m.needle[i] == m.needle[j] {
-			j++
-		}
-		m.failure[i] = j
-	}
-	return m
+	return &foldMatcher{needle: append([]byte(nil), needle...), matcher: pcaputil.NewContentMatcher(needle, true)}
 }
-func containsFold(data, needle []byte) bool { return newFoldMatcher(needle).contains(data) }
-func (m *foldMatcher) contains(data []byte) bool {
-	if len(m.needle) == 0 {
-		return true
-	}
-	matched := 0
-	for _, b := range data {
-		b = foldByte(b)
-		for matched > 0 && b != m.needle[matched] {
-			matched = m.failure[matched-1]
-		}
-		if b == m.needle[matched] {
-			matched++
-		}
-		if matched == len(m.needle) {
-			return true
-		}
-	}
-	return false
-}
+func containsFold(data, needle []byte) bool      { return newFoldMatcher(needle).contains(data) }
+func (m *foldMatcher) contains(data []byte) bool { return m.matcher.Contains(data) }
 
 type searchStream struct {
 	version            uint64
@@ -349,12 +315,27 @@ func streamContainsMatch(v *streamSnapshot, matcher *foldMatcher) bool {
 func (t searchTerm) matches(e *packetEntry, row packetSummary, c *packetSearchContext) bool {
 	switch t.kind {
 	case "proto":
-		for _, p := range row.Layers {
+		for _, p := range append(append(append([]string(nil), row.Layers...), row.ProtocolStack...), row.ConnectionStack...) {
+			if !t.exact && (t.value == "cflow" || t.value == "netflow-v9") && strings.EqualFold(p, "NetFlow v9") {
+				return true
+			}
+			if !t.exact && (t.value == "cflow" || t.value == "netflow-v5") && strings.EqualFold(p, "NetFlow v5") {
+				return true
+			}
+			if !t.exact && t.value == "isis" && (strings.EqualFold(p, "IS-IS") || strings.HasPrefix(strings.ToUpper(p), "IS-IS ")) {
+				return true
+			}
+			if !t.exact && t.value == "stp" && (strings.EqualFold(p, "PVST+") || strings.EqualFold(p, "RPVST+")) {
+				return true
+			}
 			if t.stringMatch(p) {
 				return true
 			}
+			if t.stringMatch(strings.ReplaceAll(p, "/", "")) {
+				return true
+			}
 		}
-		for _, p := range []string{row.Transport, row.packetProtocol, strings.TrimPrefix(row.Protocol, "TCP/")} {
+		for _, p := range []string{row.Transport, row.packetProtocol, row.Protocol, row.ConnectionProtocol} {
 			if p != "" && t.stringMatch(p) {
 				return true
 			}
@@ -396,18 +377,52 @@ func (u *tui) matchesSearch(e *packetEntry, c *packetSearchContext) bool {
 		return true
 	}
 	if u.search.fields != nil {
-		for _, event := range e.packet.protocolEvents() {
-			if u.search.fields.Match(event) {
-				return true
+		p := e.packet
+		var revision pcaputil.ProtocolPacketRevision
+		cached := false
+		if p.history != nil {
+			revision = p.history.PacketQueryRevision(p.reference, p.eventIDs, p.physicalRecord)
+			cached = e.searchGeneration != 0 && e.searchGeneration == u.searchGeneration && e.fieldHistory == p.history && e.fieldRevision == revision && slices.Equal(e.fieldEventIDs, p.eventIDs)
+		}
+		result := e.fieldResult
+		if !cached {
+			if e.fieldHistory != p.history || !slices.Equal(e.fieldEventIDs, p.eventIDs) {
+				e.fieldKnownIDs = nil
+			}
+			events, known := p.protocolEventSnapshot(e.fieldKnownIDs)
+			result = u.search.fields.EvaluateSnapshots(p.protocolQuerySnapshots(events))
+			if p.history != nil {
+				// Use the pre-evaluation token. A concurrent arrival/eviction must
+				// invalidate this result on the next redraw, never be absorbed by it.
+				e.searchGeneration, e.fieldHistory, e.fieldRevision = u.searchGeneration, p.history, revision
+				if !slices.Equal(e.fieldEventIDs, p.eventIDs) {
+					e.fieldEventIDs = append([]uint64(nil), p.eventIDs...)
+				}
+				e.fieldResult = result
+				e.fieldKnownIDs = known
 			}
 		}
-		return false
+		if result.Partial || !result.Complete {
+			suffix := ""
+			if strings.Contains(result.Reason, "retained history") {
+				suffix = "; replay with a larger --protocol-history-mib budget"
+			}
+			start := len(fieldFilterPartialNoticePrefix)
+			end := start + len(result.Reason)
+			if len(u.notice) != end+len(suffix) || !strings.HasPrefix(u.notice, fieldFilterPartialNoticePrefix) || u.notice[start:end] != result.Reason || u.notice[end:] != suffix {
+				u.notice = fieldFilterPartialNoticePrefix + result.Reason + suffix
+			}
+		}
+		return result.Complete && result.Matched
 	}
 	version := uint64(0)
 	var stream *searchStream
 	if u.search.dynamic {
 		stream = c.stream(e.packet.streamID)
 		version = stream.version
+		if e.packet.conversationID != 0 && e.packet.streamID == 0 {
+			version = u.streams.datagramVersion(e.packet)
+		}
 	}
 	if e.searchGeneration != 0 && e.searchGeneration == u.searchGeneration && e.searchVersion == version {
 		return e.searchMatched
@@ -415,6 +430,11 @@ func (u *tui) matchesSearch(e *packetEntry, c *packetSearchContext) bool {
 	var row packetSummary
 	if u.search.metadata {
 		row = e.row()
+		if e.packet.conversationID != 0 && e.packet.streamID == 0 {
+			row = u.streams.projectDatagram(row, e.packet)
+		} else {
+			row = u.streams.projectConversation(row, e.packet.streamID)
+		}
 	}
 	if stream != nil && stream.protocol != "" {
 		row = applyApplication(row, stream.protocol, stream.evidence, e.packet.streamID)

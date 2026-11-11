@@ -1,6 +1,10 @@
 package aicommon
 
-import "github.com/yaklang/yaklang/common/ai/aid/aitool"
+import (
+	"strings"
+
+	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+)
 
 // PromptMaterials 是 prefix 渲染的统一语义材料模型。
 //
@@ -24,7 +28,7 @@ type PromptMaterials struct {
 	OutputExample       string
 
 	// SemiDynamic 提示材料:
-	//   - aireact: SkillsContext
+	//   - SkillsContext: Timeline 中已冻结并提升的技能正文
 	//   - aid: PlanHelp / OriginalUserInput / StableInstruction 等 prompt-specific
 	//     但仍属可缓存半动态前缀的内容
 	SkillsContext string
@@ -43,13 +47,6 @@ type PromptMaterials struct {
 	OriginalUserInput string
 	StableInstruction string
 
-	// ForcedSkills 是「用户强制加载」SKILL 满内容, 进 frozen_block 顶部 (最高优先级).
-	// 空时 frozen_block 顶部子块不渲染.
-	ForcedSkills string
-	// AutoLoadedSkills 是「AI 意图驱动加载」SKILL, 进 semi_dynamic_2 尾部.
-	// 空时 semi_dynamic_2 尾部子块不渲染.
-	AutoLoadedSkills string
-
 	ToolInventory bool
 	ToolsCount    int
 	TopToolsCount int
@@ -60,6 +57,9 @@ type PromptMaterials struct {
 	// available via search_capabilities"), 而不是只给一个无信息的省略号.
 	// 关键词: MoreToolsCount, Tool Inventory 剩余工具数
 	MoreToolsCount int
+	// SkillInventory is the bounded directory fixed when the skill manager is initialized.
+	// Loaded skill content still comes exclusively from Timeline.
+	SkillInventory string
 	ForgeInventory bool
 	AIForgeList    string
 
@@ -121,7 +121,7 @@ func (m *PromptMaterials) SemiDynamic1Data() map[string]any {
 }
 
 // SemiDynamic2Data selects either the text example/schema or native action
-// tags for this request. AutoLoadedSkills remain visible in both modes.
+// tags for this request.
 func (m *PromptMaterials) SemiDynamic2Data() map[string]any {
 	if m == nil {
 		return map[string]any{}
@@ -133,17 +133,16 @@ func (m *PromptMaterials) SemiDynamic2Data() map[string]any {
 		"Schema":              m.Schema,
 		"FunctionCallSchemas": m.FunctionCallSchemas,
 		"OutputExample":       m.OutputExample,
-		"AutoLoadedSkills":    m.AutoLoadedSkills,
 	}
 }
 
-// FrozenBlockData 供 frozen-block 模板消费, 顶部前置 ForcedSkills (用户强制加载 SKILL 满内容).
+// FrozenBlockData 供 frozen-block 模板消费。技能正文不再进入 frozen block:
+// 它们统一在 SemiDynamic1 的单个技能块渲染; 未冻结部分留在 Timeline Open。
 func (m *PromptMaterials) FrozenBlockData() map[string]any {
 	if m == nil {
 		return map[string]any{}
 	}
 	return map[string]any{
-		"ForcedSkills":     m.ForcedSkills,
 		"FunctionCallMode": m.FunctionCallMode,
 		"ToolInventory":    m.ToolInventory,
 		"ToolsCount":       m.ToolsCount,
@@ -151,6 +150,7 @@ func (m *PromptMaterials) FrozenBlockData() map[string]any {
 		"TopTools":         m.TopTools,
 		"HasMoreTools":     m.HasMoreTools,
 		"MoreToolsCount":   m.MoreToolsCount,
+		"SkillInventory":   m.SkillInventory,
 		"ForgeInventory":   m.ForgeInventory,
 		"AIForgeList":      m.AIForgeList,
 		"FrozenPartitions": NormalizeFrozenBlockPartitions(m.FrozenPartitions),
@@ -181,12 +181,29 @@ func (m *PromptMaterials) TimelineOpenData() map[string]any {
 }
 
 type TimelineFrozenOpenBlocks struct {
+	ThroughID                int64
+	ItemIDs                  []int64
 	Frozen                   string
 	Open                     string
+	SkillsContext            string
 	PromotedRecentTools      string
 	PromotedUserInputHistory string
 	FrozenTimeUnix           int64
 	EvidenceSemiDynamic      string
+}
+
+// PromptText combines only the Timeline-owned material supplied to the prompt
+// templates, in section order. Threshold checks use these same rendered fields,
+// not journal JSON, compression-request text, or an extra effective-state fold.
+func (b TimelineFrozenOpenBlocks) PromptText() string {
+	var parts []string
+	for _, text := range []string{b.Frozen, b.SkillsContext, b.PromotedRecentTools,
+		b.PromotedUserInputHistory, b.EvidenceSemiDynamic, b.Open} {
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func RenderTimelineFrozenOpen(timeline *Timeline) TimelineFrozenOpenBlocks {
@@ -209,9 +226,50 @@ type TimelinePromptOptions struct {
 	// PromoteUserInput is opt-in for main context construction. Helper and
 	// parameter prompts retain typed user records in their ordinary history.
 	PromoteUserInput bool
-	// UserInputOnly supplies exact user context and session evidence to
+	// UserInputOnly supplies exact user context, skill guidance and session evidence to
 	// lightweight loops; ordinary execution history uses a separate recent window.
 	UserInputOnly bool
+	// ThroughID caps only the Open tail. Nil renders the current timeline.
+	// Frozen and semi-dynamic sections are owned by compression.
+	ThroughID *int64
+}
+
+func (timeline *Timeline) promptThroughLocked(options TimelinePromptOptions) (through int64, limited bool) {
+	through = timeline.getMaxIDLocked()
+	if options.ThroughID == nil || *options.ThroughID < 0 {
+		return through, false
+	}
+	return min(*options.ThroughID, through), true
+}
+
+// capOpenTimelineBlocks caps only Open intervals. Frozen intervals and the
+// compressed head are compression-owned state and remain unchanged.
+func capOpenTimelineBlocks(blocks TimelineRenderableBlocks, throughID int64) TimelineRenderableBlocks {
+	out := make(TimelineRenderableBlocks, 0, len(blocks))
+	for _, block := range blocks {
+		interval, ok := block.(*TimelineIntervalBlock)
+		if !ok || !interval.Open {
+			out = append(out, block)
+			continue
+		}
+		// An empty Open interval may be retained to preserve a filtered tool-cache
+		// boundary. Keep that boundary; only cap intervals that have real items.
+		if len(interval.Items) == 0 {
+			out = append(out, block)
+			continue
+		}
+		copy := *interval
+		copy.Items = nil
+		for _, item := range interval.Items {
+			if item != nil && item.GetID() <= throughID {
+				copy.Items = append(copy.Items, item)
+			}
+		}
+		if len(copy.Items) > 0 {
+			out = append(out, &copy)
+		}
+	}
+	return out
 }
 
 func RenderTimelineFrozenOpenWithOptions(timeline *Timeline, options TimelinePromptOptions) TimelineFrozenOpenBlocks {
@@ -221,19 +279,28 @@ func RenderTimelineFrozenOpenWithOptions(timeline *Timeline, options TimelinePro
 	// Freeze is committed on writes/import, never as a rendering side effect.
 	timeline.mu.RLock()
 	defer timeline.mu.RUnlock()
-	rb := timeline.frozenPromptBlocksLocked(options.ExcludeToolCache, options.UserInputOnly, options.PromoteUserInput || options.UserInputOnly)
-	var recentTools string
-	if !options.ExcludeToolCache && !options.UserInputOnly {
-		recentTools = renderPromotedRecentTools(timeline.promotedState)
+	return timeline.renderTimelinePromptLocked(options)
+}
+
+// Both prompt assembly and compression accounting capture these fields under
+// one lock, so Open and promoted content cannot be omitted or counted twice
+// while moving across a freeze boundary.
+func (timeline *Timeline) renderTimelinePromptLocked(options TimelinePromptOptions) TimelineFrozenOpenBlocks {
+	// Resolve the optional Open-tail boundary first. Frozen and semi-dynamic
+	// content are independent of this cap.
+	through, limited := timeline.promptThroughLocked(options)
+
+	// Build the complete block view, then cap only Open intervals before
+	// prompt projection.
+	rawBlocks := timeline.promptBlocksLocked(options.ExcludeToolCache, options.UserInputOnly, options.PromoteUserInput || options.UserInputOnly)
+	if limited {
+		rawBlocks = capOpenTimelineBlocks(rawBlocks, through)
 	}
-	evidenceSemi := timeline.projectEvidenceLocked()
-	promptBlocks := projectTimelineRenderableBlocksForPrompt(rb)
+	promptBlocks := projectTimelineRenderableBlocksForPrompt(rawBlocks)
 	if options.IncludeLatestModelReplay {
-		promptBlocks = projectTimelineRenderableBlocksForPromptWithLatestModelReplay(rb)
+		promptBlocks = projectTimelineRenderableBlocksForPromptWithLatestModelReplay(rawBlocks)
 	}
 	if options.ExcludeToolCache {
-		// Keep empty filtered intervals in rb for boundary metadata, but avoid
-		// sending an empty Timeline envelope to a parameter-generation prompt.
 		visible := make(TimelineRenderableBlocks, 0, len(promptBlocks))
 		for _, block := range promptBlocks {
 			if interval, ok := block.(*TimelineIntervalBlock); ok && len(interval.Items) == 0 {
@@ -243,23 +310,40 @@ func RenderTimelineFrozenOpenWithOptions(timeline *Timeline, options TimelinePro
 		}
 		promptBlocks = visible
 	}
+
+	// Semi-dynamic sections are stable snapshots and never capped by ThroughID.
+	promoted := timeline.promotedState
+	var recentTools string
+	if !options.ExcludeToolCache && !options.UserInputOnly {
+		recentTools = renderPromotedRecentTools(promoted)
+	}
 	var userInputHistory string
 	if options.PromoteUserInput || options.UserInputOnly {
 		userInputHistory = timeline.projectUserInputHistoryLocked()
 	}
+
+	// Compression candidates share the same Open boundary as the rendered tail.
+	itemIDs := timeline.compressionItemIDsLocked(through)
+
 	return TimelineFrozenOpenBlocks{
+		ThroughID:                through,
+		ItemIDs:                  itemIDs,
 		Frozen:                   promptBlocks.RenderFrozenOnly(TimelineDumpDefaultAITagName),
 		Open:                     promptBlocks.RenderOpenOnly(TimelineDumpDefaultAITagName),
+		SkillsContext:            renderPromotedSkillContent(promoted),
 		PromotedRecentTools:      recentTools,
 		PromotedUserInputHistory: userInputHistory,
-		FrozenTimeUnix:           timelineFrozenTimeUnixFromRenderable(rb),
-		EvidenceSemiDynamic:      evidenceSemi,
+		FrozenTimeUnix:           timelineFrozenTimeUnixFromRenderable(rawBlocks),
+		EvidenceSemiDynamic:      timeline.projectEvidenceLocked(),
 	}
 }
 
 type PromptFrozenOpenMaterials struct {
+	TimelineThroughID          int64
+	TimelineItemIDs            []int64
 	TimelineFrozen             string
 	TimelineOpen               string
+	SkillsContext              string
 	PromotedRecentTools        string
 	PromotedUserInputHistory   string
 	TimelineFrozenTimeUnix     int64
@@ -291,8 +375,11 @@ func BuildPromptFrozenOpenMaterialsWithOptions(config *Config, options TimelineP
 	timelineBlocks := RenderTimelineFrozenOpenWithOptions(config.GetTimeline(), options)
 	reportedRisks := config.GetSessionPromptState().GetReportedRisksRendered()
 	return PromptFrozenOpenMaterials{
+		TimelineThroughID:          timelineBlocks.ThroughID,
+		TimelineItemIDs:            timelineBlocks.ItemIDs,
 		TimelineFrozen:             timelineBlocks.Frozen,
 		TimelineOpen:               timelineBlocks.Open,
+		SkillsContext:              timelineBlocks.SkillsContext,
 		PromotedRecentTools:        timelineBlocks.PromotedRecentTools,
 		PromotedUserInputHistory:   timelineBlocks.PromotedUserInputHistory,
 		TimelineFrozenTimeUnix:     timelineBlocks.FrozenTimeUnix,
@@ -308,6 +395,7 @@ func ApplyPromptFrozenOpenMaterials(materials *PromptMaterials, frozenOpen Promp
 	}
 	materials.TimelineFrozen = frozenOpen.TimelineFrozen
 	materials.TimelineOpen = frozenOpen.TimelineOpen
+	materials.SkillsContext = frozenOpen.SkillsContext
 	materials.PromotedRecentTools = frozenOpen.PromotedRecentTools
 	materials.PromotedUserInputHistory = frozenOpen.PromotedUserInputHistory
 	materials.TimelineFrozenTimeUnix = frozenOpen.TimelineFrozenTimeUnix

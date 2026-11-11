@@ -17,7 +17,6 @@ import (
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
-	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
 func TestDefaultProcess(t *testing.T) {
@@ -29,16 +28,6 @@ func TestDefaultProcess(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, config)
 	require.NotNil(t, config.process)
-}
-
-func TestDefaultConfigUsesSerializableASTOrder(t *testing.T) {
-	config, err := DefaultConfig(
-		WithFileSystem(filesys.NewLocalFs()),
-		WithLanguage(ssaconfig.JAVA),
-		WithASTOrder(ssaconfig.ReverseOrder),
-	)
-	require.NoError(t, err)
-	require.Equal(t, ssaconfig.ReverseOrder, config.GetCompileASTSequence())
 }
 
 // TestUnifiedFsWithFileSystem 测试使用 WithFileSystem 选项时，fs 被正确转换为 UnifiedFileSys
@@ -471,13 +460,14 @@ func TestUnifiedFsWithConfigInfo(t *testing.T) {
 				if zipFS, ok := fs.(*filesys.ZipFS); ok {
 					return zipFS
 				}
-				// UnifiedFS 的底层文件系统是私有字段，无法直接访问
-				// 这里简化处理，只检查直接的 ZipFS
+				if unified, ok := fs.(*filesys.UnifiedFS); ok {
+					return findZipFS(unified.GetFileSystem())
+				}
 				return nil
 			}
-			if zipFS := findZipFS(config.fs); zipFS != nil {
-				zipFS.Close()
-			}
+			zipFS := findZipFS(config.fs)
+			require.NotNil(t, zipFS, "close the actual archive even through UnifiedFS")
+			require.NoError(t, zipFS.Close())
 		}()
 	})
 

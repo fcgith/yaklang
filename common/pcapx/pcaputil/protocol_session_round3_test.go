@@ -119,6 +119,12 @@ func TestRound3UDPReplay(t *testing.T) {
 		default:
 			continue
 		}
+		if sample.protocol == "radius" {
+			// M1's archived request omits mandatory NAS identity and remains a
+			// negative fixture. This replay checks the adjacent legal carrier.
+			sample.steps = append([]sessionStep(nil), sample.steps...)
+			sample.steps[0].wire = radiusPkt(1, 7, append(radiusAttr(1, []byte("alice")), radiusAttr(4, []byte{192, 0, 2, 9})...))
+		}
 		for _, deferred := range []bool{false, true} {
 			for _, workers := range []int{1, 2} {
 				t.Run(fmt.Sprintf("%s/deferred=%v/workers=%d", sample.protocol, deferred, workers), func(t *testing.T) {
@@ -128,6 +134,20 @@ func TestRound3UDPReplay(t *testing.T) {
 					require.NoError(t, err)
 					require.Len(t, events, len(sample.steps))
 					require.Zero(t, stats.Malformed)
+					if sample.protocol == "radius" {
+						require.NotZero(t, events[0].ID)
+						require.Equal(t, events[0].ID, events[0].TransactionID)
+						require.Zero(t, events[0].ResponseTo)
+						require.Equal(t, events[0].ID, events[1].TransactionID)
+						require.Equal(t, events[0].ID, events[1].ResponseTo)
+						request := radiusM1ReplyFields("", false)
+						request["Packet Name"], request["Code"], request["Role"] = "Access-Request", 1, "request"
+						request["Packet Length"], request["User-Name"], request["NAS-IP-Address"] = 33, "alice", "192.0.2.9"
+						request["Attributes"] = []map[string]any{{"Type": byte(1), "Raw": []byte("alice")}, {"Type": byte(4), "Raw": []byte{192, 0, 2, 9}}}
+						request["Attribute Count"] = 2
+						require.Equal(t, request, events[0].Session)
+						require.Equal(t, radiusM1ReplyFields("", true), events[1].Session)
+					}
 					for _, e := range events {
 						require.Equal(t, "udp", e.Transport)
 						require.Equal(t, sample.protocol, e.Protocol)
@@ -189,15 +209,28 @@ func TestRound3UpstreamCaptureReplay(t *testing.T) {
 		{"ftp", "ndpi/ndpi-ftp.pcap", 35, 1063}, {"modbus", "ndpi/ndpi-modbus.pcap", 102, 1173},
 		{"radius", "tcpdump/tcpdump-radius.pcap", 4, 519}, {"ntp", "ndpi/ndpi-ntpv4.pcap", 1, 48},
 		{"dhcp", "wireshark-tests/wireshark-dhcp.pcap", 4, 1144},
-		{"coap", "ndpi/ndpi-coap.pcap", 819, 47512},
+		// The first five packets carry only unknown option 2 (Wireshark warns
+		// "Invalid Option Number 2"), without an observed RFC 7252 URI. They
+		// no longer establish automatic identity from code/token shape alone.
+		{"coap", "ndpi/ndpi-coap.pcap", 814, 47388},
 	} {
 		for _, workers := range []int{1, 2} {
 			t.Run(fmt.Sprintf("%s/workers=%d", tc.protocol, workers), func(t *testing.T) {
 				events, stats, err := binReplay(t, binCorpusBytes(t, tc.capture), workers)
 				require.NoError(t, err)
+				if tc.protocol == "radius" {
+					// All four original frames remain required: two complete wire
+					// observations and two RFC3579 MUST-attribute refusals.
+					radiusEAPAssertReceived(t, events, events, stats, false)
+					return
+				}
 				count := 0
 				var messageBytes uint64
 				for _, event := range events {
+					if tc.protocol == "coap" && len(event.SourceBytes.PacketRefs) == 1 && event.SourceBytes.PacketRefs[0].Number <= 5 {
+						require.Empty(t, event.Protocol)
+						require.Equal(t, "unrecognized", event.Status)
+					}
 					if event.Protocol == tc.protocol && event.Status == "decoded" {
 						count++
 						messageBytes += uint64(event.Length)

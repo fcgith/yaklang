@@ -239,7 +239,13 @@ func MergeCachedAISessionStartParams(cached, request *ypb.AIStartParams) *ypb.AI
 	}
 
 	merged := proto.Clone(cached).(*ypb.AIStartParams)
+	// Capabilities describe this connection, never the client that saved the session.
+	merged.ClientUI = request.GetClientUI()
 	merged.SingleModelMode = cached.GetSingleModelMode() || request.GetSingleModelMode()
+	if request.NetworkDebug != nil {
+		value := request.GetNetworkDebug()
+		merged.NetworkDebug = &value
+	}
 	merged.CoordinatorId = request.GetCoordinatorId()
 	merged.Sequence = request.GetSequence()
 	merged.UserQuery = request.GetUserQuery()
@@ -261,6 +267,10 @@ func OverlayAISessionStartParams(base, patch *ypb.AIStartParams) *ypb.AIStartPar
 	}
 
 	next := proto.Clone(base).(*ypb.AIStartParams)
+	if patch.NetworkDebug != nil {
+		value := patch.GetNetworkDebug()
+		next.NetworkDebug = &value
+	}
 	if patch.GetSingleModelMode() {
 		next.SingleModelMode = true
 	}
@@ -352,8 +362,8 @@ func OverlayAISessionStartParams(base, patch *ypb.AIStartParams) *ypb.AIStartPar
 	if patch.GetTimelineItemLimit() > 0 {
 		next.TimelineItemLimit = patch.GetTimelineItemLimit()
 	}
-	if patch.GetTimelineContentSizeLimit() > 0 {
-		next.TimelineContentSizeLimit = patch.GetTimelineContentSizeLimit()
+	if patch.GetRuntimeContextSizeLimit() > 0 {
+		next.RuntimeContextSizeLimit = patch.GetRuntimeContextSizeLimit()
 	}
 	if patch.GetUserInteractLimit() > 0 {
 		next.UserInteractLimit = patch.GetUserInteractLimit()

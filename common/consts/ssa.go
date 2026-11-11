@@ -13,6 +13,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/damenggorm"
 
 	"github.com/yaklang/gorm"
 )
@@ -30,12 +31,36 @@ const (
 	ssaSQLiteMaxOpenConns = 8
 	ssaSQLiteSynchronous  = "NORMAL"
 	ssaSQLiteTxLock       = "immediate"
+	// Instruction batches can hold the write lock for well over the generic
+	// 10s busy_timeout. SSA waits 60s so the other store retries inside SQLite
+	// instead of failing with "database is locked".
+	ssaSQLiteBusyTimeoutMS = 60000
+	// Without a journal_size_limit the WAL file keeps its high-water size
+	// forever. A checkpoint then has to walk that whole file on every pass,
+	// which is what pinned scans when the disk was already busy. 64MiB matches
+	// the cap the project-database tuner uses.
+	ssaSQLiteJournalSizeLimitBytes int64 = 64 * 1024 * 1024
+	// The project-database tuner only reaches a 256MB cache after the file
+	// is already 2GB, and SSA never called that tuner. Hue's insert working
+	// set does not fit in the 8000-page (32MB) default, so every connection
+	// starts at the large-database tier.
+	ssaSQLiteCacheKiB  int64 = 256 * 1024
+	ssaSQLiteMmapBytes int64 = 512 * 1024 * 1024
+	// 100000 pages is about 400MB. hue-cache-01 checkpointed every ~80MB and
+	// rewrote the growing file (2127s). Turning the checkpoint off entirely
+	// (hue-wal-01) let the WAL reach 13GB and made compile reads slower, so the
+	// run was already behind at review 100%. 400MB is the middle: fewer copies
+	// than 80MB, without a multi-gigabyte WAL for readers to scan.
+	ssaSQLiteWALAutocheckpoint = 100000
 )
 
 var (
 	SSA_PROJECT_DB_RAW     = "default-yakssa.db"
 	SSA_PROJECT_DB_DIALECT = SQLiteExtend
-	ssaDatabase            *gorm.DB
+	// Plain pointer, same as profileDatabase. initYakitDatabaseOnce is the
+	// only guard: the handle is published when it is still unset, and later
+	// SetGormSSAProjectDatabase calls are explicit rebinds.
+	ssaDatabase *gorm.DB
 )
 
 const (
@@ -75,6 +100,8 @@ func parseDatabaseURL(raw string) (string, string) {
 			// Keep the full raw string to preserve URL scheme.
 			// lib/pq and gorm both accept URL DSNs like: postgres://user:pass@host:5432/db?sslmode=disable
 			return Postgres, raw
+		case "dm":
+			return damenggorm.Dialect, raw
 		// Add other supported dialects here
 		// case "postgres", "postgresql":
 		// 	return PostgreSQL, connectionDetails // Assuming PostgreSQL constant exists
@@ -104,9 +131,7 @@ func SetGormSSAProjectDatabaseByInfo(raw string) error {
 	if err != nil {
 		return err
 	}
-	ssaDatabase = db
-	// 同步更新 schema 包中的默认 SSA 数据库
-	schema.SetDefaultSSADatabase(db)
+	SetGormSSAProjectDatabase(db)
 	return nil
 }
 
@@ -117,6 +142,11 @@ func CreateSSAProjectDatabaseRaw(raw string) (*gorm.DB, error) {
 
 func CreateSSAProjectDatabase(dialect, path string) (*gorm.DB, error) {
 	options := ssaDatabaseOpenOptions()
+	// Connection PRAGMAs are applied by the driver hook, which is installed
+	// once, so the profile has to be published before the pool opens.
+	if dialect == SQLiteExtend || dialect == SQLite {
+		SetSQLiteConnectionPragmas(options)
+	}
 	db, err := createAndConfigDatabaseWithOptions(path, options, dialect)
 	if err != nil {
 		return nil, err
@@ -124,8 +154,19 @@ func CreateSSAProjectDatabase(dialect, path string) (*gorm.DB, error) {
 	// SSA-IR DB may be accessed with a read-only credential (scan-only nodes).
 	// In that case, AutoMigrate would fail even if the schema already exists.
 	if !utils.InterfaceToBoolean(os.Getenv(ENV_SSA_DB_SKIP_MIGRATE)) {
-		schema.AutoMigrate(db, schema.KEY_SCHEMA_SSA_DATABASE)
+		if dialect == damenggorm.Dialect {
+			if err := schema.AutoMigrateChecked(db, schema.KEY_SCHEMA_SSA_DATABASE); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+		} else {
+			schema.AutoMigrate(db, schema.KEY_SCHEMA_SSA_DATABASE)
+		}
 		schema.ApplyPatches(db, schema.KEY_SCHEMA_SSA_DATABASE)
+		if dialect == damenggorm.Dialect && db.Error != nil {
+			_ = db.Close()
+			return nil, db.Error
+		}
 	}
 	configureAndOptimizeDBWithOptions(dialect, db, options)
 	return db, nil
@@ -136,10 +177,16 @@ func ssaDatabaseOpenOptions() databaseOpenOptions {
 	// defaultDatabaseOpenOptions() (single connection, synchronous=OFF,
 	// no _txlock). Injected via databaseOpenOptions so database.go stays generic.
 	return databaseOpenOptions{
-		sqliteMaxOpenConns: ssaSQLiteMaxOpenConns,
-		sqlitePrivateCache: true,
-		sqliteSynchronous:  ssaSQLiteSynchronous,
-		sqliteTxLock:       ssaSQLiteTxLock,
+		sqliteMaxOpenConns:          ssaSQLiteMaxOpenConns,
+		sqlitePrivateCache:          true,
+		sqliteSynchronous:           ssaSQLiteSynchronous,
+		sqliteTxLock:                ssaSQLiteTxLock,
+		sqliteBusyTimeoutMS:         ssaSQLiteBusyTimeoutMS,
+		sqliteJournalSizeLimitBytes: ssaSQLiteJournalSizeLimitBytes,
+		sqliteCacheKiB:              ssaSQLiteCacheKiB,
+		sqliteMmapBytes:             ssaSQLiteMmapBytes,
+		sqliteWALAutocheckpoint:     ssaSQLiteWALAutocheckpoint,
+		sqliteWALAutocheckpointSet:  true,
 	}
 }
 
@@ -149,9 +196,9 @@ func GetTempSSADataBase() (*gorm.DB, error) {
 }
 
 func SetGormSSAProjectDatabase(db *gorm.DB) {
-	ssaDatabase = db
-	// 同步更新 schema 包中的默认 SSA 数据库
+	// schema 里的句柄只是这里的镜像，一起赋值。
 	schema.SetDefaultSSADatabase(db)
+	ssaDatabase = db
 }
 
 func GetGormSSAProjectDataBase() *gorm.DB {

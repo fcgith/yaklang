@@ -4,7 +4,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
@@ -37,6 +39,13 @@ func WithStructRules(rules ...*schema.SyntaxFlowRule) ssaconfig.Option {
 	})(rules)
 }
 
+// WithStructRuleLoader shares immutable decoded rule instructions across units.
+func WithStructRuleLoader(loader *sfvm.RuleLoader) ssaconfig.Option {
+	return ssaconfig.SetOption("ssa_compile/struct_rule_loader", func(c *Config, v *sfvm.RuleLoader) {
+		c.ensureStructScan().ruleLoader = v
+	})(loader)
+}
+
 func WithStructRuleDir(dir string) ssaconfig.Option {
 	return ssaconfig.SetOption("ssa_compile/struct_rule_dir", func(c *Config, v string) {
 		if strings.TrimSpace(v) == "" {
@@ -61,6 +70,18 @@ func WithStructRuleCallback(cb func(*schema.SSARisk)) ssaconfig.Option {
 	return ssaconfig.SetOption("ssa_compile/struct_rule_callback", func(c *Config, v func(*schema.SSARisk)) {
 		c.ensureStructScan().riskCB = v
 	})(cb)
+}
+
+// WithOnRisk registers another callback that receives each risk this
+// compile's struct rules produce. A scan passes the callback that submits
+// into its collect; the compile does not receive the scan's runtime.
+func WithOnRisk(fn func(*schema.SSARisk, ...func(*gorm.DB) error)) ssaconfig.Option {
+	return ssaconfig.SetOption("ssa/on_risk", func(c *Config, v func(*schema.SSARisk, ...func(*gorm.DB) error)) {
+		if v == nil {
+			return
+		}
+		c.onRisk = append(c.onRisk, v)
+	})(fn)
 }
 
 func WithStructRuleTimeout(d time.Duration) ssaconfig.Option {

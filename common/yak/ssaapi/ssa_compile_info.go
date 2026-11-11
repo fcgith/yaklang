@@ -3,13 +3,15 @@ package ssaapi
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/yaklang/javajive/classparser"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/filesys"
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
@@ -26,6 +28,7 @@ var (
 )
 
 func (c *Config) parseFSFromInfo() (fi.FileSystem, error) {
+	c.NormalizeCodeSourceKind()
 	c.Processf(0, "parse info: %s", c.GetCodeSourceKind())
 	defer func() {
 		c.Processf(0, "parse info finish")
@@ -42,14 +45,10 @@ func (c *Config) parseFSFromInfo() (fi.FileSystem, error) {
 			return nil, err
 		}
 	case ssaconfig.CodeSourceJar:
-		jarFS, err := getJarFS(c)
+		baseFS, err = c.openArchiveCodeSource()
 		if err != nil {
 			return nil, utils.Errorf("jar file error: %v", err)
 		}
-		unifiedFS := filesys.NewUnifiedFS(jarFS,
-			filesys.WithUnifiedFsExtMap(".class", ".java"),
-		)
-		baseFS = unifiedFS
 	case ssaconfig.CodeSourceGit:
 		baseFS, err = gitFs(c)
 		if err != nil {
@@ -64,6 +63,51 @@ func (c *Config) parseFSFromInfo() (fi.FileSystem, error) {
 	}
 
 	return baseFS, nil
+}
+
+// openArchiveCodeSource hands the archive to the language registry. The
+// pipeline never names a language: it only looks up the opener registered for
+// the language the project was classified as.
+func (c *Config) openArchiveCodeSource() (fi.FileSystem, error) {
+	local := c.GetCodeSourceLocalFile()
+	if local == "" {
+		if c.GetCodeSourceURL() == "" {
+			return nil, utils.Errorf("url is empty ")
+		}
+		downloaded, err := downloadCodeSourceToTemp(c.GetCodeSourceURL(), "yaklang-jar-*.jar")
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(downloaded)
+		local = downloaded
+	}
+	open, ok := archiveCodeSourceOpeners[c.GetLanguage()]
+	if !ok {
+		return nil, utils.Errorf("language %q cannot open an archive code source", c.GetLanguage())
+	}
+	return open(local, c.GetCodeSourceJarRecursiveParse())
+}
+
+// downloadCodeSourceToTemp fetches url into a temp file and returns its path.
+func downloadCodeSourceToTemp(url, pattern string) (string, error) {
+	resp, _, err := poc.DoGET(url)
+	if err != nil {
+		return "", err
+	}
+	if resp.GetStatusCode() != 200 {
+		return "", utils.Errorf("download file error: %v", resp.GetStatusCode())
+	}
+	tmpFile, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", utils.Errorf("create temp file error: %v", err)
+	}
+	if _, err := tmpFile.Write(resp.GetBody()); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", utils.Errorf("write temp file error: %v", err)
+	}
+	tmpFile.Close()
+	return tmpFile.Name(), nil
 }
 
 func getZipFile(codeSource *Config) (*filesys.ZipFS, error) {
@@ -85,39 +129,6 @@ func getZipFile(codeSource *Config) (*filesys.ZipFS, error) {
 
 	bytes.NewReader(resp.GetBody())
 	return filesys.NewZipFSRaw(bytes.NewReader(resp.GetBody()), int64(len(resp.GetBody())))
-}
-
-// getJarFS creates a javaclassparser.JarFS from either a local file or a
-// downloaded URL.
-func getJarFS(c *Config) (*javaclassparser.JarFS, error) {
-	// use local
-	if c.GetCodeSourceLocalFile() != "" {
-		return javaclassparser.NewJarFSFromLocalWithOptions(c.GetCodeSourceLocalFile(), c.GetCodeSourceJarRecursiveParse())
-	}
-	if c.GetCodeSourceURL() == "" {
-		return nil, utils.Errorf("url is empty ")
-	}
-	// download file
-	resp, _, err := poc.DoGET(c.GetCodeSourceURL())
-	if err != nil {
-		return nil, err
-	}
-	if resp.GetStatusCode() != 200 {
-		return nil, utils.Errorf("download file error: %v", resp.GetStatusCode())
-	}
-	// Write downloaded bytes to a temp file so we can use NewJarFSFromLocal
-	tmpFile, err := os.CreateTemp("", "yaklang-jar-*.jar")
-	if err != nil {
-		return nil, utils.Errorf("create temp file error: %v", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmpFile.Write(resp.GetBody()); err != nil {
-		tmpFile.Close()
-		return nil, utils.Errorf("write temp file error: %v", err)
-	}
-	tmpFile.Close()
-	return javaclassparser.NewJarFSFromLocalWithOptions(tmpPath, c.GetCodeSourceJarRecursiveParse())
 }
 
 func gitFs(codeSource *Config) (fi.FileSystem, error) {
@@ -239,6 +250,12 @@ func confinedExtractPath(dest, name string) (string, bool) {
 
 func cloneGitSourceDir(codeSource *Config) (string, error) {
 	process := codeSource.Processf
+	commit := strings.TrimSpace(codeSource.GetCodeSourceCommit())
+	if commit != "" {
+		if decoded, err := hex.DecodeString(commit); err != nil || len(decoded) != 20 {
+			return "", utils.Errorf("git commit must be a full 40-character SHA")
+		}
+	}
 	if codeSource.GetCodeSourceURL() == "" {
 		return "", utils.Errorf("git url is empty ")
 	}
@@ -270,6 +287,10 @@ func cloneGitSourceDir(codeSource *Config) (string, error) {
 		yakgit.WithRecuriveSubmodule(false),
 	)
 	opts = append(opts, shallowOpts...)
+	if commit != "" {
+		// A pinned revision may precede the branch tip, so its tree must be fetched.
+		opts = append(opts, yakgit.WithDepth(0))
+	}
 	if branch := strings.TrimSpace(codeSource.GetCodeSourceBranch()); branch != "" {
 		opts = append(opts, yakgit.WithBranch(branch))
 	}
@@ -291,6 +312,21 @@ func cloneGitSourceDir(codeSource *Config) (string, error) {
 		report,
 	); err != nil {
 		return "", ssagitworkdir.WrapCloneError(codeSource.GetContext(), local, err)
+	}
+
+	if commit != "" {
+		repository, err := git.PlainOpen(local)
+		if err != nil {
+			return "", utils.Errorf("open pinned git source: %v", err)
+		}
+		worktree, err := repository.Worktree()
+		if err != nil {
+			return "", utils.Errorf("open pinned git worktree: %v", err)
+		}
+		if err := worktree.Checkout(&git.CheckoutOptions{Hash: plumbing.NewHash(commit)}); err != nil {
+			return "", utils.Errorf("checkout requested git commit %s: %v", commit, err)
+		}
+		process(0, "checked out requested git commit %s", commit)
 	}
 
 	// DefaultConfig can fail after the clone but before ParseProject installs its

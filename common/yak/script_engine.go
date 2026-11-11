@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aihistory"
+	"github.com/yaklang/yaklang/common/ai/aiknowledge"
 	"github.com/yaklang/yaklang/common/ai/aimemory"
 	"github.com/yaklang/yaklang/common/aiengine"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/yaklang/yaklang/common/utils/yakgit/yakdiff"
 
 	"github.com/pkg/errors"
+	"github.com/yaklang/yaklang/common/mcp/mcpclient"
 	"github.com/yaklang/yaklang/common/mediautils"
 	"github.com/yaklang/yaklang/common/mimetype"
 	"github.com/yaklang/yaklang/common/minirehs"
@@ -70,6 +72,7 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/mutate"
 	"github.com/yaklang/yaklang/common/pcapx"
+	"github.com/yaklang/yaklang/common/pcapx/pcapdb"
 	"github.com/yaklang/yaklang/common/rpa"
 	"github.com/yaklang/yaklang/common/sca"
 	"github.com/yaklang/yaklang/common/simulator"
@@ -324,6 +327,7 @@ func initYaklangLib() {
 	// suricata
 	yaklang.Import("suricata", chaosmaker.ChaosMakerExports)
 	yaklang.Import("pcapx", pcapx.Exports)
+	yaklang.Import("pcapdb", pcapdb.Exports)
 
 	// ja3
 	yaklang.Import("ja3", ja3.Exports)
@@ -350,13 +354,16 @@ func initYaklangLib() {
 
 	aiExports := ai.Exports
 	aiExports["MockAIService"] = rag.MockAIService
+	aiExports["Detach"] = func() (string, error) { return "", fmt.Errorf("ai.Detach requires an AI tool invocation") }
 	yaklang.Import("ai", aiExports)
 
 	yaklang.Import("aiagent", AIAgentExport)
 
 	yaklang.Import("aim", aiengine.Exports)
+	yaklang.Import("mcp", mcpclient.Exports)
 	yaklang.Import("aimemory", aimemory.Exports)
 	yaklang.Import("aihistory", aihistory.Exports)
+	yaklang.Import("aiknowledge", aiknowledge.Exports)
 
 	yaklang.Import("liteforge", liteforgeapp.LiteForgeExport)
 	yaklang.Import("jsonschema", aitool.SchemaGeneratorExports)
@@ -615,6 +622,7 @@ func (e *ScriptEngine) exec(ctx context.Context, id string, code string, params 
 	vars["YAK_FILENAME"] = ""
 	vars["YAK_DIR"] = ""
 	vars["YAK_VERSION"] = consts.GetYakVersion()
+	vars["pcapdb"] = pcapdb.ExportsWithContext(ctx)
 
 	// 设置参数获取函数
 	paramGetter := func(key string) interface{} {
@@ -674,10 +682,20 @@ func (e *ScriptEngine) exec(ctx context.Context, id string, code string, params 
 	if e.client != nil {
 		client = e.client
 	} else {
-		yaklib.AutoInitYakit()
-		clientIns := *yaklib.GetYakitClientInstance()
-		client = &clientIns // 设置全局 client 的 log
+		// AOT builds skip the yaklib init that installs this client.
+		// AutoInitYakit returns nil when a client is already installed, so
+		// read the instance again after asking it to create one.
+		client = yaklib.GetYakitClientInstance()
+		if client == nil {
+			yaklib.AutoInitYakit()
+			client = yaklib.GetYakitClientInstance()
+		}
 	}
+	if client == nil {
+		return nil, utils.Error("yakit client is not initialized")
+	}
+	clientIns := *client
+	client = &clientIns // 设置全局 client 的 log
 	client.SetYakLog(*e.logger)
 	yaklib.BindEngineClient(engine, client)
 	vars["yakit"] = yaklib.GetExtYakitLibByClient(client)

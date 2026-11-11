@@ -88,34 +88,7 @@ func BuildCapabilityInventoryItems(cfg *Config, loop CapabilityInventoryLoopCont
 		})
 	}
 
-	// Skills (SemiDynamic if loaded, Dynamic if only meta suggested)
-	for _, s := range resolveCapabilityInventorySkills(cfg, loop) {
-		if strings.TrimSpace(s.Name) == "" {
-			continue
-		}
-		stage := CapabilityInventoryStageMetadata
-		if s.SkillLoadState == CapabilityInventorySkillLoadLoaded {
-			stage = CapabilityInventoryStageLoaded
-		}
-		pos := CapabilityInventoryPositionSemiDynamic
-		if stage == CapabilityInventoryStageMetadata {
-			// skills that exist only in registry can be treated as semi-dynamic still,
-			// but keep consistent UI expectations by tagging as SemiDynamic.
-			pos = CapabilityInventoryPositionSemiDynamic
-		}
-		items = append(items, CapabilityInventoryItem{
-			Name:        s.Name,
-			VerboseName: s.VerboseName,
-			Description: s.Description,
-			Type:        "skill",
-			Stage:       stage,
-			Position:    pos,
-			IsFixed:     false,
-			Data: map[string]any{
-				"skill_load_state": s.SkillLoadState,
-			},
-		})
-	}
+	items = append(items, BuildCapabilityInventorySkillItems(resolveCapabilityInventorySkills(cfg, loop))...)
 
 	// Forges (Dynamic)
 	for _, f := range loop.DynamicForges() {
@@ -133,5 +106,41 @@ func BuildCapabilityInventoryItems(cfg *Config, loop CapabilityInventoryLoopCont
 		})
 	}
 
+	return items
+}
+
+// BuildCapabilityInventorySkillItems converts skill inventory records to the
+// flattened shape used by session_snapshot and capability_inventory events.
+func BuildCapabilityInventorySkillItems(skills []CapabilityInventoryNamedItem) []CapabilityInventoryItem {
+	items := make([]CapabilityInventoryItem, 0, len(skills))
+	for _, s := range skills {
+		if strings.TrimSpace(s.Name) == "" {
+			continue
+		}
+		stage := CapabilityInventoryStageMetadata
+		if s.SkillLoadState == CapabilityInventorySkillLoadLoaded {
+			stage = CapabilityInventoryStageLoaded
+		}
+		pos := CapabilityInventoryPositionSemiDynamic
+		if stage == CapabilityInventoryStageMetadata {
+			// skills that exist only in registry can be treated as semi-dynamic still,
+			// but keep consistent UI expectations by tagging as SemiDynamic.
+			pos = CapabilityInventoryPositionSemiDynamic
+		}
+		data := map[string]any{"skill_load_state": s.SkillLoadState}
+		if stage == CapabilityInventoryStageLoaded {
+			data["token_count"] = s.TokenCount
+		}
+		items = append(items, CapabilityInventoryItem{
+			Name:        s.Name,
+			VerboseName: s.VerboseName,
+			Description: s.Description,
+			Type:        "skill",
+			Stage:       stage,
+			Position:    pos,
+			IsFixed:     false,
+			Data:        data,
+		})
+	}
 	return items
 }

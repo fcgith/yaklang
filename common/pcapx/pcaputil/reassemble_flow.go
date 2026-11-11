@@ -33,6 +33,19 @@ type TrafficFrame struct {
 	Done       bool
 }
 
+// PacketReferences identifies the source packets of an arrived frame. Reassembled
+// aggregate callbacks do not promise per-byte provenance; use arrived frames
+// when persisting ordered chunks with exact contributing packet references.
+func (f *TrafficFrame) PacketReferences() []PacketReference {
+	if len(f.evidence.refs) > 0 {
+		return append([]PacketReference(nil), f.evidence.refs...)
+	}
+	if f.evidence.Ref.Number == 0 {
+		return nil
+	}
+	return []PacketReference{f.evidence.Ref}
+}
+
 // TrafficFlow is a tcp flow
 // lifecycle is created -> data-feeding -> closed(fin/rst/timeout)
 // OnFrame: frame -> flow -> connection
@@ -40,6 +53,7 @@ type TrafficFrame struct {
 // OnCreated: flow created
 type TrafficFlow struct {
 	binState               *binFlow
+	opening                *tcpOpening
 	key                    flowKey
 	frameMu                sync.Mutex
 	httpStarted            sync.Once
@@ -62,10 +76,21 @@ type TrafficFlow struct {
 	frames                 []*TrafficFrame
 	streamCapacity         int
 	Index                  uint64
+	reassemblyIncomplete   bool
 	IsHalfOpen             bool
 	IsIpv6                 bool
 	IsEthernetLinkLayer    bool
 	IsIpv4                 bool
+}
+
+// CaptureDomain separates equal endpoint tuples on distinct capture interfaces
+// and encapsulations. The returned value does not retain the pooled flow.
+func (t *TrafficFlow) CaptureDomain() CaptureDomain { return t.key.domain }
+
+// HasPendingGaps reports undelivered out-of-order bytes/FIN/RST. Inspect this in
+// the close callback before pooled connections are released.
+func (t *TrafficFlow) HasPendingGaps() bool {
+	return t.reassemblyIncomplete || len(t.ClientConn.waitGroup) > 0 || len(t.ServerConn.waitGroup) > 0 || t.ClientConn.resetPending || t.ServerConn.resetPending
 }
 
 // Context cancellation is shared by the capture; individual flow/direction
@@ -160,10 +185,19 @@ func (t *TrafficFlow) onFrame(frame *TrafficFrame) {
 		}
 		if len(frame.evidence.refs) > 0 {
 			for _, ref := range frame.evidence.refs {
-				t.binState.contribute(direction, len(frame.Payload), ref)
+				t.binState.contributeCaptured(direction, len(frame.Payload), ref, frame.evidence)
 			}
 		} else {
-			t.binState.contribute(direction, len(frame.Payload), frame.evidence.Ref)
+			t.binState.contributeCaptured(direction, len(frame.Payload), frame.evidence.Ref, frame.evidence)
+		}
+		if frame.evidence.byteSourceKind != "" {
+			t.binState.byteSource = frame.evidence.byteSourceKind
+		}
+		if len(frame.evidence.carrierLayers) > 0 {
+			t.binState.captureCarriers = append([]string(nil), frame.evidence.carrierLayers...)
+		}
+		for _, parent := range frame.evidence.parents {
+			t.binState.contributeCaptured(direction, len(frame.Payload), PacketReference{}, frame.evidence, parent)
 		}
 		t.binState.feed(direction, frame.Payload, frame.Timestamp)
 	}
@@ -273,6 +307,11 @@ func (t *TrafficFlow) triggerCloseEvent(reason TrafficFlowCloseReason) {
 	if !t.closeNotified.CompareAndSwap(false, true) {
 		return
 	}
+	if reason == TrafficFlowCloseReason_RESOURCE_LIMIT {
+		// A refused future segment need not have entered the pending queue.
+		// Publish the loss before protocol and user close observers run.
+		t.reassemblyIncomplete = true
+	}
 	if t.binState != nil {
 		t.binState.close(reason)
 	}
@@ -291,6 +330,7 @@ func (t *TrafficFlow) triggerCloseEvent(reason TrafficFlowCloseReason) {
 }
 
 func (t *TrafficFlow) Release() {
+	t.discardOpening()
 	if t.binState != nil {
 		t.binState.close(TrafficFlowCloseReason_CTX_CANCEL)
 		t.binState = nil
@@ -312,6 +352,8 @@ func (t *TrafficFlow) Release() {
 	t.frames = make([]*TrafficFrame, 0)
 	t.Index = 0
 	t.streamCapacity = 0
+	t.reassemblyIncomplete = false
+	t.opening = nil
 	t.key = flowKey{}
 	t.httpStarted = sync.Once{}
 	t.IsHalfOpen, t.IsEthernetLinkLayer, t.IsIpv4, t.IsIpv6 = false, false, false, false

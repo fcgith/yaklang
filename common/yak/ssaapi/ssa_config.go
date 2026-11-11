@@ -3,7 +3,10 @@ package ssaapi
 import (
 	"context"
 	"fmt"
+	"sync"
 
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/diagnostics"
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
@@ -34,6 +37,10 @@ type Config struct {
 	databaseKind ssa.ProgramCacheKind
 	// process
 	process ProcessFunc
+	// processMu guards processLast. Progress is reported from unit workers,
+	// so the climb to 1.0 has to be serialized.
+	processMu   sync.Mutex
+	processLast float64
 
 	// for build
 	externLib               map[string]map[string]any
@@ -60,7 +67,10 @@ type Config struct {
 	// diagnostics configuration
 	diagnosticsEnabled  bool
 	diagnosticsRecorder *diagnostics.Recorder
-	structScan          *structScanRuntime
+	structScan          *structScanState
+	// onRisk is called with each risk this compile's struct rules produce.
+	// Empty means the compile is outside a scan and keeps its previous behavior.
+	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
 	// file performance recorder
 	filePerformanceRecorder *diagnostics.Recorder
 
@@ -69,6 +79,20 @@ type Config struct {
 	// 通过 GetEnableIncrementalCompile() 和 GetBaseProgramName() 方法访问
 	fileHashMap map[string]int // 文件哈希映射（运行时计算，不在 ssaconfig 中）
 	// baseFS 已移除：现在从 baseProgramName 自动构建文件系统，不再需要显式提供
+
+	// disableArchiveExpansion forbids archive expansion (jar/zip/war/...)
+	// in this compile's language preprocessing (swapLanguageFs). Set for
+	// every compile participating in an incremental sequence (the base
+	// full compile and each diff): expanded archive entries would flood the
+	// diff as thousands of additions/deletions and degrade the increment
+	// back into a full recompile. Non-incremental compiles keep the user's
+	// jar_recursive_parse setting.
+	disableArchiveExpansion bool
+	// preparedSources is the compile's prepared-source view: decompiled classes,
+	// translated pages and their template ranges. The frontend owns what
+	// preparation means; this field only ties one instance to the compile
+	// lifetime.
+	preparedSources ssa.PreparedProject
 }
 
 func (c *Config) CalcHash() string {
@@ -94,7 +118,14 @@ func CompileExcludeFunc(extraPatterns []string, basePath string) ExcludeFunc {
 	return ssaconfig.BuildCompileExcludeFunc(extraPatterns, basePath, true)
 }
 
+// Processf reports compile progress.
+//
+// The reported value is clamped so the bar never moves backwards. Phases map
+// onto fixed bands (prepare 0..0.06, plan 0.06..0.08, pre-handler 0.08..0.40),
+// and a nested compile or a per-file step that starts its own count at 0 would
+// otherwise reset the bar to the beginning of the phase.
 func (c *Config) Processf(process float64, format string, arg ...any) {
+	process = c.clampProcess(process)
 	msg := fmt.Sprintf(format, arg...)
 	if c.process != nil {
 		c.process(msg, process)
@@ -103,8 +134,22 @@ func (c *Config) Processf(process float64, format string, arg ...any) {
 	}
 }
 
-func WithASTOrder(sequence ssaconfig.ASTSequenceType) ssaconfig.Option {
-	return ssaconfig.WithCompileASTSequence(sequence)
+// clampProcess keeps the reported progress in [0, 1] and never below the last
+// value already reported.
+func (c *Config) clampProcess(process float64) float64 {
+	if process < 0 {
+		process = 0
+	}
+	if process > 1 {
+		process = 1
+	}
+	c.processMu.Lock()
+	defer c.processMu.Unlock()
+	if process < c.processLast {
+		process = c.processLast
+	}
+	c.processLast = process
+	return process
 }
 
 var WithLogLevel = ssaconfig.SetOption("ssa_compile/log_level", func(c *Config, v string) {
@@ -172,6 +217,9 @@ var WithRawLanguage = ssaconfig.WithProjectRawLanguage
 var WithLanguage = ssaconfig.WithProjectLanguage
 
 // WithFileSystemEntry 设置编译入口文件（导出名为 ssa.withEntryFile）
+// Yak 只将这些文件作为可执行根；其他源码保留在文件系统中，供 include 加载。
+// 不指定时，Yak 仍编译所有可处理的源码。其他语言的入口行为不变。
+// 路径按扫描名称精确匹配，优先相对文件系统根目录，其次相对 ProgramPath；统一斜杠但不折叠大小写。
 // 参数:
 //   - v: 一个或多个入口文件路径，支持逗号分隔
 //

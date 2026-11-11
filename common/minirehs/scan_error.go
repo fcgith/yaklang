@@ -1,0 +1,130 @@
+package minirehs
+
+import (
+	"errors"
+	"fmt"
+
+	pcrelite "github.com/VillanCh/go-pcre2-lite"
+)
+
+// ErrClosed is returned when a scan or scratch allocation uses a closed database.
+var ErrClosed = errors.New("minirehs: database is closed")
+
+func closedScanError() error {
+	return &ScanError{Record: -1, Stage: "state", Category: "closed", Incomplete: true, Err: ErrClosed}
+}
+
+// ScanError reports an incomplete scan. Callbacks observed before the failure
+// remain valid; callers must not interpret the returned prefix as a full result.
+// Record is -1 for Scan, or the zero-based record index for ScanBatch. HasRule
+// distinguishes an unknown rule from the valid PatternID zero. NativeCode is
+// nil when the backend does not expose a code. Unwrap preserves errors.Is/As.
+type ScanError struct {
+	RuleID     PatternID
+	HasRule    bool
+	Record     int
+	Stage      string
+	Category   string
+	NativeCode *int
+	Incomplete bool
+	Err        error
+}
+
+func verifierScanError(cp *compiledPattern, err error) error {
+	if err == nil {
+		return nil
+	}
+	backend := "pcre2"
+	if cp.v.exact() {
+		backend = "re2"
+	}
+	stage, category := "verify_"+backend, "execution"
+	var initialization *verifierCompileError
+	if errors.As(err, &initialization) {
+		stage, category = "compile_"+backend, "compile"
+	}
+	switch {
+	case errors.Is(err, pcrelite.ErrMatchLimit):
+		category = "match_limit"
+	case errors.Is(err, pcrelite.ErrDepthLimit):
+		category = "depth_limit"
+	case errors.Is(err, pcrelite.ErrBadUTF):
+		category = "bad_utf"
+	case errors.Is(err, pcrelite.ErrNoMemory):
+		category = "out_of_memory"
+	case errors.Is(err, pcrelite.ErrClosed):
+		category = "closed"
+	}
+	var nativeCode *int
+	var native *pcrelite.MatchError
+	if errors.As(err, &native) {
+		code := native.Code
+		nativeCode = &code
+	}
+	// The binding exposes common limit/UTF failures as sentinels without a
+	// raw code. Keep that field nil rather than inventing a numeric value.
+	return &ScanError{RuleID: cp.id, HasRule: true, Record: -1, Stage: stage,
+		Category: category, NativeCode: nativeCode, Incomplete: true, Err: err}
+}
+
+// IsExecutionLimit reports whether err means the backend gave up on a subject
+// because it exceeded its backtracking match or depth budget. The pattern could
+// not be evaluated on that subject, but that says nothing about other patterns
+// or other files; callers aggregating many patterns per file may skip this one
+// instead of failing the whole scan.
+func IsExecutionLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, pcrelite.ErrMatchLimit) || errors.Is(err, pcrelite.ErrDepthLimit) {
+		return true
+	}
+	var scanErr *ScanError
+	if errors.As(err, &scanErr) {
+		return scanErr.Category == "match_limit" || scanErr.Category == "depth_limit"
+	}
+	return false
+}
+
+func (e *ScanError) Error() string {
+	context := e.Stage
+	if e.HasRule {
+		context += fmt.Sprintf(" rule=%d", e.RuleID)
+	}
+	if e.Record >= 0 {
+		context += fmt.Sprintf(" record=%d", e.Record)
+	}
+	if e.NativeCode != nil {
+		context += fmt.Sprintf(" code=%d", *e.NativeCode)
+	}
+	return fmt.Sprintf("minirehs: incomplete scan (%s): %v", context, e.Err)
+}
+
+func (e *ScanError) Unwrap() error { return e.Err }
+
+func scanError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *ScanError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &ScanError{Record: -1, Stage: "scan", Category: "execution", Incomplete: true, Err: err}
+}
+
+func scanErrorAtRecord(err error, record int) error {
+	if err == nil {
+		return nil
+	}
+	var existing *ScanError
+	if errors.As(scanError(err), &existing) {
+		copy := *existing
+		copy.Record = record
+		if err != existing {
+			copy.Err = err // retain context added by an outer wrapper
+		}
+		return &copy
+	}
+	return err
+}

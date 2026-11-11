@@ -16,9 +16,18 @@ var (
 	// plus the bare `"p"` lines inside a multi-line `import ( ... )` block (the
 	// `import` keyword only appears on the block opener, so each member line has
 	// none). `(?m)` makes `^` match each line, so multi-line import blocks work.
-	goImportRe = regexp.MustCompile(`(?m)^\s*(?:import\s+)?(?:(?:[A-Za-z_][A-Za-z0-9_]*|\.)\s+)?\"([^\"]+)\"`)
-	goModuleRe = regexp.MustCompile(`(?m)^\s*module\s+(\S+)`)
+	goImportRe  = regexp.MustCompile(`(?m)^\s*(?:import\s+)?(?:(?:[A-Za-z_][A-Za-z0-9_]*|\.)\s+)?\"([^\"]+)\"`)
+	goModuleRe  = regexp.MustCompile(`(?m)^\s*module\s+(\S+)`)
+	goPackageRe = regexp.MustCompile(`(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b`)
 )
+
+func (*SSABuilder) SupportsConcurrentUnitBuild() bool { return true }
+
+func (*SSABuilder) DeferMethodBuildOnLookup() bool { return true }
+
+// Go's package declaration touches shared application globals during the
+// pre-handler. Only the subsequent package-library body build is parallel.
+func (*SSABuilder) SupportsConcurrentUnitPreHandler() bool { return false }
 
 type goModuleRoot struct {
 	dir    string
@@ -57,8 +66,67 @@ func (*SSABuilder) PartitionCompileUnits(fs filesys_interface.FileSystem, files 
 	}
 	for _, unit := range order {
 		sort.Strings(unit.Files)
+		if strings.HasPrefix(unit.Key, "dir:") {
+			unit.DeclaredLibrary = true
+			names := goUnitPackageNames(fs, unit.Files)
+			if len(names) == 1 {
+				unit.LibraryName = names[0]
+			} else if len(names) > 1 {
+				// foo and foo_test share the directory. Both libraries must be
+				// drained in this unit; leaving LibraryName empty used to skip
+				// every function body until the final Finish.
+				unit.LibraryNames = names
+			}
+		}
 	}
 	return order
+}
+
+func goUnitPackageName(fs filesys_interface.FileSystem, files []string) string {
+	names := goUnitPackageNames(fs, files)
+	if len(names) == 1 {
+		return names[0]
+	}
+	return ""
+}
+
+// goUnitPackageNames returns every distinct non-empty package clause in the
+// directory. Non-test names sort before "*_test" so the implementation library
+// is built before the external test package that imports it.
+func goUnitPackageNames(fs filesys_interface.FileSystem, files []string) []string {
+	seen := map[string]struct{}{}
+	var names []string
+	for _, file := range files {
+		if !strings.EqualFold(fs.Ext(file), ".go") {
+			continue
+		}
+		name := scanGoPackageName(ssa.ReadUnitSource(fs, file))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.SliceStable(names, func(i, j int) bool {
+		iTest := strings.HasSuffix(names[i], "_test")
+		jTest := strings.HasSuffix(names[j], "_test")
+		if iTest != jTest {
+			return !iTest
+		}
+		return names[i] < names[j]
+	})
+	return names
+}
+
+func scanGoPackageName(src string) string {
+	match := goPackageRe.FindStringSubmatch(src)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
 }
 
 // CompileUnitDependencies extracts Go import edges by resolving each import path

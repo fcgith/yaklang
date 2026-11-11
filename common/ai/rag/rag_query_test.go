@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/ai/rag/enhancesearch"
+	"github.com/yaklang/yaklang/common/ai/rag/hnsw"
 	"github.com/yaklang/yaklang/common/ai/rag/vectorstore"
 
 	"github.com/stretchr/testify/assert"
@@ -380,14 +382,49 @@ func TestMUSTPASS_RAGQuery(t *testing.T) {
 		test 2：相似度阈值设置为0.6，确保只有Hypothetical Answer和Generalize Query生成的文本能命中。预期 应得到 两个集合的两个文档
 		test 3：相似度阈值设置为0.8，确保只有Hypothetical Answer生成的文本能命中。预期 应得到 一个集合的一个文档
 	*/
-	mockEmbedding := vectorstore.NewDefaultMockEmbedding()
+	// Preserve the 1024-dimensional mock backend while making the three
+	// document axes orthogonal. Random overlapping documents can make the
+	// old bounded rejection sampler unable to meet its cross-score limit.
+	vocabulary := []string{"alpha", "bravo", "charlie", "padding"}
+	for len(vocabulary) < 1024 {
+		vocabulary = append(vocabulary, fmt.Sprintf("unused-rag-token-%d", len(vocabulary)))
+	}
+	mockEmbedding, err := vectorstore.NewMockEmbedding(vocabulary)
+	require.NoError(t, err)
 	HighSimilarThresh := 0.8
 	MidSimilarThresh := 0.6
 	LowSimilarThresh := 0.4
 
-	contentHypotheticalAnswer := mockEmbedding.GenerateRandomText(40)
-	contentGeneralizeQuery := mockEmbedding.GenerateRandomText(40)
-	contentSplitQuery := mockEmbedding.GenerateRandomText(40)
+	contentHypotheticalAnswer := "alpha"
+	contentGeneralizeQuery := "bravo"
+	contentSplitQuery := "charlie"
+
+	// Cosines are 2/sqrt(5), 1/sqrt(2), and 3/sqrt(34). Qualify
+	// actual mock embeddings before testing the unchanged 0.4/0.6/0.8 filters.
+	highText := "alpha alpha padding"
+	midText := "bravo padding"
+	lowText := "charlie charlie charlie padding padding padding padding padding"
+	documents := []string{contentHypotheticalAnswer, contentGeneralizeQuery, contentSplitQuery}
+	for i, c := range []struct {
+		text      string
+		low, high float64
+	}{{highText, 0.85, 0.99}, {midText, 0.65, 0.75}, {lowText, 0.45, 0.55}} {
+		query, err := mockEmbedding.Embedding(c.text)
+		require.NoError(t, err)
+		require.Len(t, query, 1024)
+		for j, document := range documents {
+			vector, err := mockEmbedding.Embedding(document)
+			require.NoError(t, err)
+			similarity, err := hnsw.CosineSimilarity(vector, query)
+			require.NoError(t, err)
+			if i == j {
+				require.GreaterOrEqual(t, similarity, c.low)
+				require.Less(t, similarity, c.high)
+			} else {
+				require.InDelta(t, 0, similarity, 1e-9)
+			}
+		}
+	}
 
 	uuidHypotheticalAnswer := uuid.NewString()
 	uuidGeneralizeQuery := uuid.NewString()
@@ -396,27 +433,15 @@ func TestMUSTPASS_RAGQuery(t *testing.T) {
 	enhanceHandler := enhancesearch.NewMockSearchHandler()
 
 	enhanceHandler.SetHypotheticalAnswerFunc(func(ctx context.Context, query string) (string, error) {
-		return mockEmbedding.GenerateSimilarText(contentHypotheticalAnswer, HighSimilarThresh)
+		return highText, nil
 	})
 
 	enhanceHandler.SetGeneralizeQueryFunc(func(ctx context.Context, query string) ([]string, error) {
-		result, err := mockEmbedding.GenerateSimilarText(contentGeneralizeQuery, MidSimilarThresh)
-		if err != nil {
-			return nil, err
-		}
-		return []string{
-			result,
-		}, nil
+		return []string{midText}, nil
 	})
 
 	enhanceHandler.SetSplitQueryFunc(func(ctx context.Context, query string) ([]string, error) {
-		result, err := mockEmbedding.GenerateSimilarText(contentSplitQuery, LowSimilarThresh)
-		if err != nil {
-			return nil, err
-		}
-		return []string{
-			result,
-		}, nil
+		return []string{lowText}, nil
 	})
 
 	// 定义三个不同领域的集合
@@ -497,9 +522,9 @@ func TestMUSTPASS_RAGQuery(t *testing.T) {
 			WithRAGSimilarityThreshold(LowSimilarThresh))
 		require.NoError(t, err)
 		require.Len(t, results, 3)
-		require.Contains(t, lo.Map(results, func(item *vectorstore.SearchResult, index int) string {
+		require.ElementsMatch(t, []string{uuidHypotheticalAnswer, uuidGeneralizeQuery, uuidSplitQuery}, lo.Map(results, func(item *vectorstore.SearchResult, index int) string {
 			return item.Document.ID
-		}), uuidHypotheticalAnswer, uuidGeneralizeQuery, uuidSplitQuery)
+		}))
 	})
 
 	t.Run("test_mid", func(t *testing.T) {
@@ -510,9 +535,9 @@ func TestMUSTPASS_RAGQuery(t *testing.T) {
 			WithRAGSimilarityThreshold(MidSimilarThresh))
 		require.NoError(t, err)
 		require.Len(t, results, 2)
-		require.Contains(t, lo.Map(results, func(item *vectorstore.SearchResult, index int) string {
+		require.ElementsMatch(t, []string{uuidHypotheticalAnswer, uuidGeneralizeQuery}, lo.Map(results, func(item *vectorstore.SearchResult, index int) string {
 			return item.Document.ID
-		}), uuidHypotheticalAnswer, uuidGeneralizeQuery)
+		}))
 	})
 
 	t.Run("test_high", func(t *testing.T) {

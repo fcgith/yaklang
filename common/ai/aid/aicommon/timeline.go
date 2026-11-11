@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -31,9 +32,10 @@ type Timeline struct {
 	// Serializes runtime cache updates and their journal deltas across shared configs.
 	toolCacheMu sync.Mutex
 
-	extraMetaInfo func() string // extra meta info for timeline, like runtime id, etc.
-	config        AICallerConfigIf
-	ai            AICaller
+	extraMetaInfo    func() string // extra meta info for timeline, like runtime id, etc.
+	config           AICallerConfigIf
+	trajectoryConfig *Config // original persistent owner, never rebound to nested helpers
+	ai               AICaller
 
 	idToTs           *omap.OrderedMap[int64, int64]
 	tsToTimelineItem *omap.OrderedMap[int64, *TimelineItem]
@@ -64,14 +66,9 @@ type Timeline struct {
 	// 关键词: bucketSizer, 动态桶大小, 主动缓存调优
 	bucketSizer BucketSizer
 
-	compressing            bool                         // guarded by mu; reserved before freezing or starting a reducer
-	compressionSnapshot    *timelineCompressionSnapshot // explicit one-shot transaction; never persisted or forked
-	compressionDone        chan struct{}
-	compressionLastFailure string
-	compressionRetryAfter  time.Time
-	branchTimeline         bool
-	memoryCoveredState     string // internal extraction watermark; never rendered into prompts
-	memoryFinalizePending  bool   // normal completion or interruption still requires memory processing
+	branchTimeline        atomic.Bool
+	memoryCoveredState    string // internal extraction watermark; never rendered into prompts
+	memoryFinalizePending bool   // normal completion or interruption still requires memory processing
 }
 
 func (m *Timeline) OrderInsertId(id int64, item *TimelineItem) {
@@ -202,6 +199,7 @@ func (m *Timeline) retireTimelineItemLocked(id int64) {
 func (m *Timeline) ClearRuntimeConfig() {
 	m.ai = nil
 	m.config = nil
+	m.trajectoryConfig = nil
 }
 
 func (m *Timeline) SetAICaller(ai AICaller) {
@@ -239,8 +237,8 @@ func (m *Timeline) CopyReducibleTimelineWithMemory() *Timeline {
 		totalDumpContentLimit: m.totalDumpContentLimit,
 		bucketByteSize:        m.bucketByteSize,
 		bucketSizer:           m.bucketSizer,
-		branchTimeline:        m.branchTimeline,
 	}
+	tl.branchTimeline.Store(m.branchTimeline.Load())
 	return tl
 }
 
@@ -300,7 +298,7 @@ func (m *Timeline) IsBranchTimeline() bool {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.branchTimeline
+	return m.branchTimeline.Load()
 }
 
 func (m *Timeline) markBranchTimeline(branch bool) {
@@ -309,13 +307,16 @@ func (m *Timeline) markBranchTimeline(branch bool) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.branchTimeline = branch
+	m.branchTimeline.Store(branch)
 }
 
 func (m *Timeline) SoftBindConfig(config AICallerConfigIf, aiCaller AICaller) {
 	m.mu.Lock()
 	if config != nil {
 		m.config = config
+		if owner, ok := config.(*Config); ok && m.trajectoryConfig == nil && !m.branchTimeline.Load() && !owner.DisableCreateDBRuntime && owner.PersistentSessionId != "" {
+			m.trajectoryConfig = owner
+		}
 	}
 	if utils.IsNil(m.ai) && !utils.IsNil(aiCaller) {
 		m.setAICaller(aiCaller)
@@ -336,7 +337,6 @@ func NewTimeline(ai AICaller, extraMetaInfo func() string) *Timeline {
 		promotedState:        newTimelinePromotedState(),
 		freezeState:          &TimelineFreezeState{},
 		userInputBoundaryKey: newUserInputBoundaryKey(),
-		branchTimeline:       false,
 	}
 	tl.sessionMemory = newTimelineSessionMemory(tl, nil)
 	return tl
@@ -347,6 +347,13 @@ func NewTimeline(ai AICaller, extraMetaInfo func() string) *Timeline {
 func NewPrivateTimeline(ai AICaller, extraMetaInfo func() string) *Timeline {
 	tl := NewTimeline(ai, extraMetaInfo)
 	tl.markBranchTimeline(true)
+	// Private worker history is still part of the persistent session. Reuse
+	// its original owner even when the worker cannot create a DB runtime.
+	if parent, ok := ai.(*Config); ok && parent != nil && parent.Timeline != nil {
+		parent.Timeline.mu.RLock()
+		tl.trajectoryConfig = parent.Timeline.trajectoryConfig
+		parent.Timeline.mu.RUnlock()
+	}
 	return tl
 }
 
@@ -364,6 +371,17 @@ func (m *Timeline) SetTimelineContentLimit(contentSize int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.totalDumpContentLimit = contentSize
+}
+
+// GetTimelineContentLimit returns the threshold used by the pre-prompt
+// compression measurement.
+func (m *Timeline) GetTimelineContentLimit() int64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.totalDumpContentLimit
 }
 
 // SetTimelineBucketByteSize 设置 GroupByMinutes 在同一时间桶内的字节子桶预算。

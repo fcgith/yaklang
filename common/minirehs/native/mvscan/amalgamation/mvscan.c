@@ -178,6 +178,7 @@ typedef struct {
     int32_t *cuts;             /* [nsym+1] */
     int32_t *asciiSym;         /* [128] */
     int32_t *posPat;           /* [npos] */
+    void *baseArena;           /* Owns the nine base arrays above; extensions own theirs. */
 
     /* ---- LimEx 多字扩展 (v3 blob, merged NFA). ---- */
     int       hasLimEx;
@@ -220,7 +221,7 @@ typedef struct {
     uint8_t  startByteMask[256];
 
     /* ---- DFA 转换 (小规模 NFA 的确定性化). 当 hasDFA=1 时用 dfa_run 替代 nfa_run. ---- */
-    int      hasDFA;
+    int      hasDFA;     /* 0 absent, 1 canonical blob4, 2 legacy blob3 (NFA fallback) */
     int32_t  dfaNstates;
     int32_t *dfaNext;    /* [nstates*256] 转移表: next[state*256 + byte] (-1=死) */
     uint8_t *dfaAccept;  /* [nstates] 接受状态标记 */
@@ -435,7 +436,7 @@ static int NFA_RUN_NAME(const mvs_nfa *a, const uint8_t *data, size_t len, int m
     } else {
         prev = (uint64_t *)calloc((size_t)nword, sizeof(uint64_t));
         cand = (uint64_t *)malloc((size_t)nword * sizeof(uint64_t));
-        if (!prev || !cand) { free(prev); free(cand); return 0; }
+        if (!prev || !cand) { free(prev); free(cand); return MVS_ERR_NOMEM; }
     }
 
     int total = 0;
@@ -569,7 +570,7 @@ static int NFA_RUN_NAME(const mvs_nfa *a, const uint8_t *data, size_t len, int m
     } else {
         prev = (uint64_t *)calloc((size_t)nword, sizeof(uint64_t));
         cand = (uint64_t *)malloc((size_t)nword * sizeof(uint64_t));
-        if (!prev || !cand) { free(prev); free(cand); return 0; }
+        if (!prev || !cand) { free(prev); free(cand); return MVS_ERR_NOMEM; }
     }
 
     int total = 0;
@@ -982,10 +983,13 @@ void mvscan_compute_boundaries(const uint8_t *data, size_t len, uint8_t *buf) {
     buf[len] = b;
 }
 
-/* dfa_run: DFA 存在性扫描 — 每字节一次查表 (O(1)), 比 NFA 位递推快 O(npos) 倍.
+/* dfa_run: DFA 存在性扫描 — 每字节一次查表 (O(1)); 总收益按实际消费者测量.
  * 仅处理纯 ASCII 输入 (byte < 128); 非 ASCII 字节回退到 NFA.
- * 返回 1 命中 / 0 不命中 / -1 需回退 NFA (非 ASCII 数据). */
+ * 返回 1 命中 / 0 不命中 / -1 需回退 NFA (旧初态表或非 ASCII 数据). */
 static int dfa_run(const mvs_nfa *a, const uint8_t *data, size_t len) {
+    /* v3 used first as an already-consumed state, so its DFA can match a
+     * missing first character. The authoritative NFA is safe for old plans. */
+    if (a->hasDFA != 1) return -1;
     const int32_t *next = a->dfaNext;
     const uint8_t *acc = a->dfaAccept;
     /* 快速检查: 是否纯 ASCII? 若有非 ASCII 字节, 回退 NFA. */
@@ -998,10 +1002,9 @@ static int dfa_run(const mvs_nfa *a, const uint8_t *data, size_t len) {
         uint8_t b = data[i];
         state = next[state * 256 + b];
         if (state < 0) {
-            /* 死状态: 从初始重新开始 (无锚 NFA 每步注入 first).
-             * DFA 状态 0 已含 first 注入, 故直接用 next[0*256+b]. */
-            state = next[0 * 256 + b];
-            if (state < 0) state = 0;
+            /* This transition already injected first. State 0 is the empty
+             * consumed set; the same input byte must not be consumed again. */
+            state = 0;
         }
         if (acc[state]) return 1;
     }
@@ -1122,7 +1125,7 @@ static int nfa_run_assert_mw(const mvs_nfa *a, const uint8_t *data, size_t len,
     } else {
         prev = (uint64_t *)calloc((size_t)nword, sizeof(uint64_t));
         cand = (uint64_t *)malloc((size_t)nword * sizeof(uint64_t));
-        if (!prev || !cand) { free(prev); free(cand); return 0; }
+        if (!prev || !cand) { free(prev); free(cand); return MVS_ERR_NOMEM; }
     }
 
     size_t i = 0;
@@ -1210,7 +1213,7 @@ static int nfa_run_assert_mw_online(const mvs_nfa *a, const uint8_t *data, size_
     } else {
         prev = (uint64_t *)calloc((size_t)nword, sizeof(uint64_t));
         cand = (uint64_t *)malloc((size_t)nword * sizeof(uint64_t));
-        if (!prev || !cand) { free(prev); free(cand); return 0; }
+        if (!prev || !cand) { free(prev); free(cand); return MVS_ERR_NOMEM; }
     }
     size_t i = 0;
     int32_t curRune;
@@ -1324,7 +1327,7 @@ static int NFA_RUN_ANCHORED_NAME(const mvs_nfa *a, const uint8_t *data, size_t l
     } else {
         prev = (uint64_t *)calloc((size_t)nword, sizeof(uint64_t));
         cand = (uint64_t *)malloc((size_t)nword * sizeof(uint64_t));
-        if (!prev || !cand) { free(prev); free(cand); return 0; }
+        if (!prev || !cand) { free(prev); free(cand); return MVS_ERR_NOMEM; }
     }
 
     int found = 0;
@@ -1447,7 +1450,7 @@ static int NFA_RUN_ANCHORED_NAME(const mvs_nfa *a, const uint8_t *data, size_t l
     } else {
         prev = (uint64_t *)calloc((size_t)nword, sizeof(uint64_t));
         cand = (uint64_t *)malloc((size_t)nword * sizeof(uint64_t));
-        if (!prev || !cand) { free(prev); free(cand); return 0; }
+        if (!prev || !cand) { free(prev); free(cand); return MVS_ERR_NOMEM; }
     }
 
     int found = 0;
@@ -1644,43 +1647,61 @@ static inline int nfa_run(const mvs_nfa *a, const uint8_t *data, size_t len, int
  *   u64[npos*nword] follow; u64[nsym*nword] reach;
  *   i32[nsym+1] cuts; i32[128] asciiSym; i32[npos] posPat.
  * ==================================================================== */
+static int unit_size_add(size_t a, size_t b, size_t *out) {
+    if (b > SIZE_MAX - a) return 0;
+    *out = a + b;
+    return 1;
+}
+
+static int unit_size_mul(size_t a, size_t b, size_t *out) {
+    if (a && b > SIZE_MAX / a) return 0;
+    *out = a * b;
+    return 1;
+}
+
 static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t unitLen, mvs_nfa *out) {
     memset(out, 0, sizeof(*out));
-    if (off + 16 > blobLen) return -1;
+    if (off > blobLen || unitLen > blobLen - off || unitLen < 16) return -1;
     const uint8_t *p = blob + off;
     int32_t npos = (int32_t)le_u32(p + 0);
     int32_t nword = (int32_t)le_u32(p + 4);
     int32_t nsym = (int32_t)le_u32(p + 8);
     uint32_t flags = le_u32(p + 12);
-    if (npos <= 0 || nword <= 0 || nsym <= 0) return -1;
+    if (npos <= 0 || npos > INT32_MAX - 63 || nword != (npos + 63) / 64 ||
+        nsym <= 0 || nsym > 0x110000 || (flags & ~15u)) return -1;
 
     out->npos = npos;
     out->nword = nword;
     out->nsym = nsym;
     out->hasAnchored = (flags & 1u) ? 1 : 0;
 
-    size_t u64FirstBlocks = 4;                              /* 4 个 [nword] 向量 */
-    size_t nU64 = u64FirstBlocks * (size_t)nword +
-                  (size_t)npos * nword + (size_t)nsym * nword;
-    size_t nI32 = (size_t)(nsym + 1) + 128 + (size_t)npos;
-    size_t need = 16 + nU64 * 8 + nI32 * 4;
-    if (off + need > blobLen) return -1;
+    size_t rows, nU64, nI32, u64Bytes, i32Bytes, arenaBytes, need;
+    if (!unit_size_add((size_t)npos, (size_t)nsym, &rows) ||
+        !unit_size_add(rows, 4, &rows) ||
+        !unit_size_mul(rows, (size_t)nword, &nU64) ||
+        !unit_size_add((size_t)nsym, 129, &nI32) ||
+        !unit_size_add(nI32, (size_t)npos, &nI32) ||
+        !unit_size_mul(nU64, 8, &u64Bytes) ||
+        !unit_size_mul(nI32, 4, &i32Bytes) ||
+        !unit_size_add(u64Bytes, i32Bytes, &arenaBytes) ||
+        !unit_size_add(16, arenaBytes, &need) || need > unitLen) return -1;
 
     size_t cur = off + 16;
-    out->firstUnanchored = (uint64_t *)malloc((size_t)nword * 8);
-    out->firstAnchored = (uint64_t *)malloc((size_t)nword * 8);
-    out->lastAny = (uint64_t *)malloc((size_t)nword * 8);
-    out->lastEnd = (uint64_t *)malloc((size_t)nword * 8);
-    out->follow = (uint64_t *)malloc((size_t)npos * nword * 8);
-    out->reach = (uint64_t *)malloc((size_t)nsym * nword * 8);
-    out->cuts = (int32_t *)malloc((size_t)(nsym + 1) * 4);
-    out->asciiSym = (int32_t *)malloc(128 * 4);
-    out->posPat = (int32_t *)malloc((size_t)npos * 4);
-    if (!out->firstUnanchored || !out->firstAnchored || !out->lastAny ||
-        !out->lastEnd || !out->follow || !out->reach || !out->cuts ||
-        !out->asciiSym || !out->posPat) {
-        return -1;
-    }
+    out->baseArena = malloc(arenaBytes);
+    if (!out->baseArena) return -1;
+    /* malloc aligns the u64 area; all i32 tables follow its multiple-of-eight
+     * size. C owns this block; never retain or alias the caller's Go bytes. */
+    uint64_t *words = (uint64_t *)out->baseArena;
+    out->firstUnanchored = words; words += nword;
+    out->firstAnchored = words; words += nword;
+    out->lastAny = words; words += nword;
+    out->lastEnd = words; words += nword;
+    out->follow = words; words += (size_t)npos * nword;
+    out->reach = words;
+    int32_t *ints = (int32_t *)((uint8_t *)out->baseArena + u64Bytes);
+    out->cuts = ints; ints += (size_t)nsym + 1;
+    out->asciiSym = ints; ints += 128;
+    out->posPat = ints;
 
 #define MVS_RD_U64(dst, count)                                     \
     do {                                                           \
@@ -1731,6 +1752,7 @@ static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t un
      * 仅 nword==1 的断言 NFA 才有序列化 (Go 侧保证). */
     out->hasAssert = (flags & 0x2u) ? 1 : 0;
     if (out->hasAssert) {
+        if (nword == 1 && npos > 64) return -1;
         /* 计算剩余所需字节数. */
         size_t assertU64 = 3 + (size_t)npos; /* chainTarget1, excMask1, condFollowMask1 + excFollow1Flat[npos] */
         /* 先读固定头部 (chainTarget1, excMask1, excFollow1Flat, condFollowMask1) */
@@ -1761,6 +1783,8 @@ static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t un
         /* condFollow (扁平三元组: pos, guard, bits[nword]) */
         if (cur + 4 > blobLen) return -1;
         out->nCondFollow = (int32_t)le_i32(blob + cur); cur += 4;
+        if (out->nCondFollow < 0) return -1;
+        uint64_t conditionalSources1 = 0;
         if (out->nCondFollow > 0) {
             size_t posBytes = (size_t)out->nCondFollow * 4;
             size_t guardBytes = (size_t)out->nCondFollow;
@@ -1770,13 +1794,21 @@ static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t un
             out->condFollowGuard = (uint8_t *)malloc(guardBytes);
             out->condFollowBits = (uint64_t *)malloc(bitsBytes);
             if (!out->condFollowPos || !out->condFollowGuard || !out->condFollowBits) return -1;
-            for (int _i = 0; _i < out->nCondFollow; _i++) { out->condFollowPos[_i] = le_i32(blob + cur + (size_t)_i * 4); }
+            for (int _i = 0; _i < out->nCondFollow; _i++) {
+                int32_t pos = le_i32(blob + cur + (size_t)_i * 4);
+                if (pos < 0 || pos >= npos) return -1;
+                out->condFollowPos[_i] = pos;
+                if (nword == 1) conditionalSources1 |= UINT64_C(1) << pos;
+            }
             cur += posBytes;
             for (int _i = 0; _i < out->nCondFollow; _i++) { out->condFollowGuard[_i] = blob[cur + _i]; }
             cur += guardBytes;
             for (int _i = 0; _i < out->nCondFollow * nword; _i++) { out->condFollowBits[_i] = le_u64(blob + cur + (size_t)_i * 8); }
             cur += bitsBytes;
         }
+        /* Every reader indexes the derived table only through this mask.
+         * Validate the complete source set, not just the zero-count case. */
+        if (nword == 1 && out->condFollowMask1 != conditionalSources1) return -1;
 
         /* condAccept: 每个 guard 条目的 bits 为 nword 个 uint64 */
         if (cur + 4 > blobLen) return -1;
@@ -1803,9 +1835,13 @@ static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t un
 
         if (nword == 1) {
             out->condFirstEval = (uint64_t *)calloc(64, sizeof(uint64_t));
-            out->condFollowEval = (uint64_t *)calloc((size_t)64 * npos, sizeof(uint64_t));
+            /* A validated empty mask means all three single-word readers
+             * skip this table. Retain first/accept, which are always read. */
+            if (out->nCondFollow > 0)
+                out->condFollowEval = (uint64_t *)calloc((size_t)64 * npos, sizeof(uint64_t));
             out->condAcceptEval = (uint64_t *)calloc(64, sizeof(uint64_t));
-            if (!out->condFirstEval || !out->condFollowEval || !out->condAcceptEval) return -1;
+            if (!out->condFirstEval || !out->condAcceptEval ||
+                (out->nCondFollow > 0 && !out->condFollowEval)) return -1;
             for (int B = 0; B < 64; B++) {
                 for (int k = 0; k < out->nCondFirst; k++) {
                     if ((out->condFirstGuard[k] & B) == out->condFirstGuard[k])
@@ -1839,7 +1875,12 @@ static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t un
             int sym = (int)out->asciiSym[b];
             const uint64_t *rc = out->reach + (size_t)sym * nword;
             uint64_t overlap = 0;
-            for (int w = 0; w < nword; w++) overlap |= (rc[w] & out->firstUnanchored[w]);
+            /* This mask also guards the entire merged record, including
+             * anchored members at offset zero. Omitting firstAnchored can
+             * reject their matches when no unanchored member can start. */
+            for (int w = 0; w < nword; w++) {
+                overlap |= rc[w] & (out->firstUnanchored[w] | out->firstAnchored[w]);
+            }
             if (overlap) { out->startByteMask[b] = 1; anyStart = 1; }
         }
         out->hasStartByteMask = anyStart ? 1 : 0;
@@ -1871,15 +1912,7 @@ static int parse_unit(const uint8_t *blob, size_t blobLen, size_t off, size_t un
 }
 
 static void free_unit(mvs_nfa *u) {
-    free(u->firstUnanchored);
-    free(u->firstAnchored);
-    free(u->lastAny);
-    free(u->lastEnd);
-    free(u->follow);
-    free(u->reach);
-    free(u->cuts);
-    free(u->asciiSym);
-    free(u->posPat);
+    free(u->baseArena);
     free(u->chainTarget);
     free(u->excMask);
     free(u->excFollow);
@@ -1906,17 +1939,21 @@ mvscan_db *mvscan_db_open(const uint8_t *blob, size_t len) {
     if (!blob || len < 20) return NULL;
     if (blob[0] != 'M' || blob[1] != 'V' || blob[2] != 'S' || blob[3] != '1') return NULL;
     uint32_t version = le_u32(blob + 4);
-    if (version != 3) return NULL;
+    if (version != 3 && version != 4) return NULL;
     int32_t npat = (int32_t)le_u32(blob + 8);
     int32_t mergedUnit = (int32_t)le_u32(blob + 12);
     int32_t nUnits = (int32_t)le_u32(blob + 16);
     if (npat < 0 || nUnits < 0) return NULL;
 
     size_t headFixed = 20;
-    size_t slotBytes = (size_t)npat * 4;
-    size_t offBytes = (size_t)nUnits * 4;
-    size_t lenBytes = (size_t)nUnits * 4;
-    if (headFixed + slotBytes + offBytes + lenBytes > len) return NULL;
+    size_t slotBytes, offBytes, lenBytes, headerBytes, unitsBytes;
+    if (!unit_size_mul((size_t)npat, 4, &slotBytes) ||
+        !unit_size_mul((size_t)nUnits, 4, &offBytes) ||
+        !unit_size_add(headFixed, slotBytes, &headerBytes) ||
+        !unit_size_add(headerBytes, offBytes, &headerBytes) ||
+        !unit_size_add(headerBytes, offBytes, &headerBytes) || headerBytes > len ||
+        !unit_size_mul((size_t)nUnits, sizeof(mvs_nfa), &unitsBytes)) return NULL;
+    lenBytes = offBytes;
 
     mvscan_db *db = (mvscan_db *)calloc(1, sizeof(mvscan_db));
     if (!db) return NULL;
@@ -1924,7 +1961,7 @@ mvscan_db *mvscan_db_open(const uint8_t *blob, size_t len) {
     db->nUnits = nUnits;
     db->mergedUnit = mergedUnit;
     db->slotUnit = (int32_t *)malloc(slotBytes > 0 ? slotBytes : 1);
-    db->units = nUnits > 0 ? (mvs_nfa *)calloc((size_t)nUnits, sizeof(mvs_nfa)) : NULL;
+    db->units = nUnits > 0 ? (mvs_nfa *)calloc(1, unitsBytes) : NULL;
     if (!db->slotUnit || (nUnits > 0 && !db->units)) { mvscan_db_close(db); return NULL; }
 
     size_t cur = headFixed;
@@ -1934,11 +1971,12 @@ mvscan_db *mvscan_db_open(const uint8_t *blob, size_t len) {
     for (int i = 0; i < nUnits; i++) {
         uint32_t uoff = le_u32(offTab + (size_t)i * 4);
         uint32_t ulen = le_u32(lenTab + (size_t)i * 4);
-        if ((size_t)uoff + (size_t)ulen > len ||
+        if ((size_t)uoff > len || (size_t)ulen > len - (size_t)uoff ||
             parse_unit(blob, len, uoff, ulen, &db->units[i]) != 0) {
             mvscan_db_close(db);
             return NULL;
         }
+        if (version == 3 && db->units[i].hasDFA) db->units[i].hasDFA = 2;
     }
     return db;
 }
@@ -2008,7 +2046,7 @@ int32_t mvscan_db_nfa_find_all(const mvscan_db *db, int32_t idx,
     int32_t *prevStart = (int32_t *)malloc((size_t)a->npos * sizeof(int32_t));
     if (!prev || !cand || !candStart || !prevStart) {
         free(prev); free(cand); free(candStart); free(prevStart);
-        return -1;
+        return MVS_ERR_NOMEM;
     }
     int32_t total = 0;
     size_t pos = 0;
@@ -2030,13 +2068,13 @@ void mvscan_db_nfa_exists_many(const mvscan_db *db,
                                uint8_t *out) {
     if (!out) return;
     for (int32_t i = 0; i < nidx; i++) {
-        uint8_t r = 0;
+        uint8_t r = (uint8_t)MVS_ERR_INVALID;
         if (db && idxs) {
             int32_t idx = idxs[i];
             if (idx >= 0 && idx < db->npat) {
                 int32_t u = db->slotUnit[idx];
                 if (u >= 0 && u < db->nUnits) {
-                    r = (uint8_t)(nfa_run(&db->units[u], data, len, 0, NULL, 0, NULL, 0, NULL) == 1);
+                    r = (uint8_t)nfa_run(&db->units[u], data, len, 0, NULL, 0, NULL, 0, NULL);
                 }
             }
         }
@@ -2048,7 +2086,8 @@ int32_t mvscan_db_merged_scan(const mvscan_db *db,
                               const uint8_t *data, size_t len,
                               uint8_t *seen, int32_t seenLen,
                               int32_t *out, int32_t cap) {
-    if (!db || db->mergedUnit < 0 || db->mergedUnit >= db->nUnits) return 0;
+    if (!db || (!data && len > 0) || !seen || seenLen < db->npat || cap < 0 || (!out && cap > 0)) return MVS_ERR_INVALID;
+    if (db->mergedUnit < 0 || db->mergedUnit >= db->nUnits) return 0;
     /* Rose-lite 必要条件预检: 数据不含任何能开始匹配的字节 => 跳过整段扫描. */
     mvs_nfa *mu = &db->units[db->mergedUnit];
     if (mu->hasStartByteMask) {
@@ -2065,7 +2104,8 @@ int32_t mvscan_db_merged_scan(const mvscan_db *db,
         if (!anyStart && !hasNonASCII) return 0;
     }
     int32_t total = 0;
-    nfa_run(mu, data, len, 1, seen, seenLen, out, cap, &total);
+    int status = nfa_run(mu, data, len, 1, seen, seenLen, out, cap, &total);
+    if (status < 0) return status;
     return total;
 }
 
@@ -2075,15 +2115,36 @@ int32_t mvscan_db_merged_scan_batch(const mvscan_db *db,
                                     const uint8_t *data, size_t totalLen,
                                     const int32_t *recOff, int32_t nrec,
                                     int32_t *out, int32_t capPairs) {
-    if (!db || db->mergedUnit < 0 || db->mergedUnit >= db->nUnits) return 0;
-    if (!data || !recOff || nrec <= 0 || !out) return 0;
+    if (!db || db->mergedUnit < 0 || db->mergedUnit >= db->nUnits) return -1;
+    if (nrec < 0 || capPairs < 0 || (!out && capPairs > 0) ||
+        (!data && totalLen > 0) || !recOff) return -1;
+    if (nrec == 0) return 0;
+    for (int32_t r = 0; r < nrec; r++) {
+        if (recOff[r] < 0 || recOff[r + 1] < recOff[r] ||
+            (size_t)recOff[r + 1] > totalLen) return -1;
+    }
     mvs_nfa *mu = &db->units[db->mergedUnit];
     int32_t total = 0;
     /* seen 缓冲: 每条记录重置 (per-record dedup). 用栈缓冲 (npat 通常 < 1024). */
     uint8_t stackSeen[1024];
     uint8_t *seen = (db->npat <= 1024) ? stackSeen : (uint8_t *)malloc((size_t)db->npat);
-    if (!seen) return 0;
-    int32_t stackOut[256]; /* 每条记录的临时输出 (通常命中数 < 5) */
+    if (!seen) return MVS_ERR_NOMEM;
+    int32_t stackOut[256];
+    /* A record can match every member. Retain the small stack fast path but
+     * allocate full member capacity when needed; caller capacity only limits
+     * writes, never the returned total required capacity. */
+    int32_t *recordOut = stackOut;
+    if (db->npat > 256) {
+        if ((size_t)db->npat > SIZE_MAX / sizeof(*recordOut)) {
+            if (seen != stackSeen) free(seen);
+            return MVS_ERR_OVERFLOW;
+        }
+        recordOut = (int32_t *)malloc((size_t)db->npat * sizeof(*recordOut));
+        if (!recordOut) {
+            if (seen != stackSeen) free(seen);
+            return MVS_ERR_NOMEM;
+        }
+    }
     for (int32_t r = 0; r < nrec; r++) {
         size_t off0 = (size_t)recOff[r];
         size_t off1 = (size_t)recOff[r + 1];
@@ -2107,16 +2168,27 @@ int32_t mvscan_db_merged_scan_batch(const mvscan_db *db,
         /* 重置 seen */
         memset(seen, 0, (size_t)db->npat);
         int32_t recTotal = 0;
-        nfa_run(mu, rdata, rlen, 1, seen, db->npat, stackOut, 256, &recTotal);
+        int status = nfa_run(mu, rdata, rlen, 1, seen, db->npat, recordOut, db->npat, &recTotal);
+        if (status < 0) {
+            if (recordOut != stackOut) free(recordOut);
+            if (seen != stackSeen) free(seen);
+            return status;
+        }
         /* 输出 (recIdx, memberIdx) 对 */
-        for (int32_t k = 0; k < recTotal && k < 256; k++) {
+        for (int32_t k = 0; k < recTotal; k++) {
+            if (total == INT32_MAX) {
+                if (recordOut != stackOut) free(recordOut);
+                if (seen != stackSeen) free(seen);
+                return -2;
+            }
             if (total < capPairs) {
-                out[total * 2] = r;           /* recIdx */
-                out[total * 2 + 1] = stackOut[k]; /* memberIdx */
+                out[(size_t)total * 2] = r;
+                out[(size_t)total * 2 + 1] = recordOut[k];
             }
             total++;
         }
     }
+    if (recordOut != stackOut) free(recordOut);
     if (seen != stackSeen) free(seen);
     return total;
 }
@@ -2162,24 +2234,30 @@ void mvscan_db_nfa_exists_anchored_many(const mvscan_db *db,
                                          int32_t totalSpans,
                                          uint8_t *out) {
     if (!out) return;
-    if (!db || !idxs || !patSpanOff || !spansLo || !spansHi) {
-        for (int32_t i = 0; i < npat; i++) out[i] = 0;
+    if (!db || !idxs || !patSpanOff || totalSpans < 0 ||
+        (totalSpans > 0 && (!spansLo || !spansHi)) || (!data && len > 0)) {
+        for (int32_t i = 0; i < npat; i++) out[i] = (uint8_t)MVS_ERR_INVALID;
         return;
     }
-    (void)totalSpans;
     for (int32_t i = 0; i < npat; i++) {
         int32_t idx = idxs[i];
-        uint8_t r = 0;
+        uint8_t r = (uint8_t)MVS_ERR_INVALID;
         if (idx >= 0 && idx < db->npat) {
             int32_t u = db->slotUnit[idx];
             if (u >= 0 && u < db->nUnits) {
                 int32_t off0 = patSpanOff[i];
                 int32_t off1 = patSpanOff[i + 1];
+                if (off0 < 0 || off1 < off0 || off1 > totalSpans) {
+                    out[i] = (uint8_t)MVS_ERR_INVALID;
+                    continue;
+                }
                 int32_t nspan = off1 - off0;
                 if (nspan > 0) {
                     const int32_t *lo = spansLo + off0;
                     const int32_t *hi = spansHi + off0;
-                    r = (uint8_t)(nfa_run_anchored_dispatch(&db->units[u], data, len, lo, hi, nspan, 0) == 1);
+                    r = (uint8_t)nfa_run_anchored_dispatch(&db->units[u], data, len, lo, hi, nspan, 0);
+                } else if (nspan == 0) {
+                    r = 0;
                 }
             }
         }
@@ -2191,9 +2269,11 @@ int32_t mvscan_db_merged_scan_scalar(const mvscan_db *db,
                                      const uint8_t *data, size_t len,
                                      uint8_t *seen, int32_t seenLen,
                                      int32_t *out, int32_t cap) {
-    if (!db || db->mergedUnit < 0 || db->mergedUnit >= db->nUnits) return 0;
+    if (!db || (!data && len > 0) || !seen || seenLen < db->npat || cap < 0 || (!out && cap > 0)) return MVS_ERR_INVALID;
+    if (db->mergedUnit < 0 || db->mergedUnit >= db->nUnits) return 0;
     int32_t total = 0;
-    nfa_run_dispatch(&db->units[db->mergedUnit], data, len, 1, seen, seenLen, out, cap, &total, 1);
+    int status = nfa_run_dispatch(&db->units[db->mergedUnit], data, len, 1, seen, seenLen, out, cap, &total, 1);
+    if (status < 0) return status;
     return total;
 }
 
@@ -2218,7 +2298,11 @@ int32_t mvscan_db_combined_scan(const mvscan_db *db,
                                 const int32_t *assertIdxs, int32_t nAssert,
                                 uint8_t *boundBuf,
                                 int32_t *assertOut, int32_t assertCap) {
-    if (!db || !data || len == 0) return 0;
+    if (mergedTotalOut) *mergedTotalOut = 0;
+    if (!db || (!data && len > 0) || nAssert < 0 || (nAssert > 0 && !assertIdxs) ||
+        mergedCap < 0 || assertCap < 0 || (!mergedOut && mergedCap > 0) ||
+        (!assertOut && assertCap > 0) || !mergedSeen || mergedSeenLen < db->npat) return MVS_ERR_INVALID;
+    if (len == 0) return 0;
 
     /* 获取 assert NFA 单元 */
     mvs_nfa *stackAssertNFAs[16];
@@ -2232,14 +2316,14 @@ int32_t mvscan_db_combined_scan(const mvscan_db *db,
             assertNFAs = (mvs_nfa **)malloc((size_t)nAssert * sizeof(mvs_nfa *));
             assertNFAsHeap = 1;
         }
-        if (!assertNFAs) return 0;
+        if (!assertNFAs) return MVS_ERR_NOMEM;
         for (int32_t i = 0; i < nAssert; i++) {
             int32_t idx = assertIdxs[i];
-            if (idx < 0 || idx >= db->npat) { assertNFAs[i] = NULL; continue; }
+            if (idx < 0 || idx >= db->npat) { if (assertNFAsHeap) free(assertNFAs); return MVS_ERR_INVALID; }
             int32_t u = db->slotUnit[idx];
-            if (u < 0 || u >= db->nUnits) { assertNFAs[i] = NULL; continue; }
+            if (u < 0 || u >= db->nUnits) { if (assertNFAsHeap) free(assertNFAs); return MVS_ERR_INVALID; }
             mvs_nfa *a = &db->units[u];
-            if (!a->hasAssert) { assertNFAs[i] = NULL; continue; }
+            if (!a->hasAssert || a->nword != 1) { if (assertNFAsHeap) free(assertNFAs); return MVS_ERR_INVALID; }
             assertNFAs[i] = a;
             nAssertReal++;
         }
@@ -2288,6 +2372,13 @@ int32_t mvscan_db_combined_scan(const mvscan_db *db,
     if (nAssertReal > 0) {
         if (nAssert <= 16) { aPrev = stackAPrev; aDone = stackADone; memset(aPrev, 0, (size_t)nAssert * 8); memset(aDone, 0, (size_t)nAssert); }
         else { aPrev = (uint64_t *)calloc((size_t)nAssert, sizeof(uint64_t)); aDone = (uint8_t *)calloc((size_t)nAssert, 1); }
+    }
+
+    if ((mu && (!mPrev || !mCand)) || (nAssertReal > 0 && (!aPrev || !aDone))) {
+        if (mu && mw > 8) { free(mPrev); free(mCand); }
+        if (nAssertReal > 0 && nAssert > 16) { free(aPrev); free(aDone); }
+        if (assertNFAsHeap) free(assertNFAs);
+        return MVS_ERR_NOMEM;
     }
 
     int32_t mergedTotal = 0;
@@ -2446,7 +2537,11 @@ void mvscan_db_nfa_exists_assert_online_many(const mvscan_db *db,
                                              uint8_t *out) {
     if (!out || nidx <= 0) return;
     memset(out, 0, (size_t)nidx);
-    if (!db || !data || len == 0 || !idxs) return;
+    if (!db || (!data && len > 0) || !idxs) {
+        memset(out, (uint8_t)MVS_ERR_INVALID, (size_t)nidx);
+        return;
+    }
+    if (len == 0) return;
 
     mvs_nfa *stackNFAs[16];
     uint64_t stackPrev[16];
@@ -2458,6 +2553,7 @@ void mvscan_db_nfa_exists_assert_online_many(const mvscan_db *db,
         if (!nfas || !prev) {
             free(nfas);
             free(prev);
+            memset(out, (uint8_t)MVS_ERR_NOMEM, (size_t)nidx);
             return;
         }
     }
@@ -2468,23 +2564,23 @@ void mvscan_db_nfa_exists_assert_online_many(const mvscan_db *db,
     int needBoundFallback = 0;
     for (int32_t k = 0; k < nidx; k++) {
         int32_t idx = idxs[k];
-        if (idx < 0 || idx >= db->npat) continue;
+        if (idx < 0 || idx >= db->npat) { out[k] = (uint8_t)MVS_ERR_INVALID; continue; }
         int32_t u = db->slotUnit[idx];
-        if (u < 0 || u >= db->nUnits) continue;
+        if (u < 0 || u >= db->nUnits) { out[k] = (uint8_t)MVS_ERR_INVALID; continue; }
         mvs_nfa *a = &db->units[u];
-        if (!a->hasAssert) continue;
+        if (!a->hasAssert) { out[k] = (uint8_t)MVS_ERR_INVALID; continue; }
         if (a->nword == 1 && a->hasLimEx) {
             nfas[k] = a;
             activeCount++;
         } else if (a->nword > 1) {
-            out[k] = (uint8_t)(nfa_run_assert_mw_online(a, data, len) == 1);
+            out[k] = (uint8_t)nfa_run_assert_mw_online(a, data, len);
         } else {
             needBoundFallback = 1;
         }
     }
 
     if (needBoundFallback) {
-        uint8_t *bound = (uint8_t *)malloc(len + 1);
+        uint8_t *bound = len < SIZE_MAX ? (uint8_t *)malloc(len + 1) : NULL;
         if (bound) {
             mvscan_compute_boundaries(data, len, bound);
             for (int32_t k = 0; k < nidx; k++) {
@@ -2494,9 +2590,19 @@ void mvscan_db_nfa_exists_assert_online_many(const mvscan_db *db,
                 if (u < 0 || u >= db->nUnits) continue;
                 mvs_nfa *a = &db->units[u];
                 if (a->hasAssert && a->nword == 1 && !a->hasLimEx)
-                    out[k] = (uint8_t)(nfa_run_assert_1(a, data, len, bound) == 1);
+                    out[k] = (uint8_t)nfa_run_assert_1(a, data, len, bound);
             }
             free(bound);
+        } else {
+            for (int32_t k = 0; k < nidx; k++) {
+                int32_t idx = idxs[k];
+                if (idx < 0 || idx >= db->npat) continue;
+                int32_t u = db->slotUnit[idx];
+                if (u < 0 || u >= db->nUnits) continue;
+                mvs_nfa *a = &db->units[u];
+                if (a->hasAssert && a->nword == 1 && !a->hasLimEx)
+                    out[k] = (uint8_t)MVS_ERR_NOMEM;
+            }
         }
     }
 
@@ -2576,6 +2682,7 @@ int32_t mvscan_db_dfa_scan_batch(const mvscan_db *db,
             /* 非 ASCII 回退 NFA */
             r = nfa_run_dispatch(a, data, len, 0, NULL, 0, NULL, 0, NULL, 0);
         }
+        if (r < 0) return r;
         if (r == 1) {
             if (total < cap) out[total] = idx;
             total++;
@@ -2657,7 +2764,7 @@ void mvscan_db_nfa_exists_assert_many(const mvscan_db *db,
         boundBuf[0] = MVS_COND_BEGIN_TEXT | MVS_COND_END_TEXT | MVS_COND_BEGIN_LINE | MVS_COND_END_LINE | MVS_COND_NO_WORD_BOUND;
     }
     for (int32_t i = 0; i < nidx; i++) {
-        uint8_t r = 0;
+        uint8_t r = (uint8_t)MVS_ERR_INVALID;
         if (db && idxs && boundBuf) {
             int32_t idx = idxs[i];
             if (idx >= 0 && idx < db->npat) {
@@ -2665,7 +2772,7 @@ void mvscan_db_nfa_exists_assert_many(const mvscan_db *db,
                 if (u >= 0 && u < db->nUnits) {
                     mvs_nfa *a = &db->units[u];
                     if (a->hasAssert && a->nword == 1) {
-                        r = (uint8_t)(nfa_run_assert_1(a, data, len, boundBuf) == 1);
+                        r = (uint8_t)nfa_run_assert_1(a, data, len, boundBuf);
                     }
                 }
             }

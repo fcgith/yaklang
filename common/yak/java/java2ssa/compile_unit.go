@@ -3,7 +3,9 @@ package java2ssa
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"text/scanner"
 
 	"github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/yak/ssa"
@@ -17,6 +19,18 @@ var (
 )
 
 var javaTemplateExtensions = []string{".jsp", ".jspx", ".ftl", ".ftlh", ".ftlx", ".vm", ".vtl", ".html", ".htm"}
+
+func (*SSABuilder) SupportsConcurrentUnitBuild() bool { return true }
+
+func (*SSABuilder) DeferMethodBuildOnLookup() bool { return true }
+
+// javaMaxFilesPerUnit caps how many files one directory-backed unit holds. A jar
+// of obfuscated classes carries no package declaration, so every one of its
+// classes lands in a single dir: unit — and one unit is one worker, because the
+// unit's files share a builder. coremail's webinst.jar put 390 classes in one
+// unit and compiled them serially while the other workers sat idle. Package
+// units are not sharded: their classes reference each other directly.
+const javaMaxFilesPerUnit = 64
 
 // PartitionCompileUnits groups .java files by their declared package, and
 // non-.java resources (templates, etc.) by directory under a "resource:" key.
@@ -33,6 +47,25 @@ func (*SSABuilder) PartitionCompileUnits(fs filesys_interface.FileSystem, files 
 			unit = &ssa.CompileUnit{Key: key, Path: unitPath, Language: ssaconfig.JAVA}
 			units[key] = unit
 			order = append(order, unit)
+		}
+		if len(unit.Files) >= javaMaxFilesPerUnit && isShardableUnitKey(key) {
+			// Overflow into a shard so one huge directory cannot serialize the
+			// whole batch. The suffix is a path segment, which keeps the library
+			// name derived from the key (libraryNameFromCompileUnitKey) a legal
+			// dotted name.
+			for shard := 2; ; shard++ {
+				shardKey := key + "/__shard" + strconv.Itoa(shard)
+				next := units[shardKey]
+				if next == nil {
+					next = &ssa.CompileUnit{Key: shardKey, Path: unitPath, Language: ssaconfig.JAVA}
+					units[shardKey] = next
+					order = append(order, next)
+				}
+				unit = next
+				if len(unit.Files) < javaMaxFilesPerUnit {
+					break
+				}
+			}
 		}
 		unit.Files = append(unit.Files, file)
 		if info, err := fs.Stat(file); err == nil && info != nil {
@@ -58,6 +91,14 @@ func (*SSABuilder) PartitionCompileUnits(fs filesys_interface.FileSystem, files 
 	return order
 }
 
+// isShardableUnitKey reports whether a unit may be split across workers. Only
+// directory-backed units are: a package unit's classes are bound by the
+// language's own package semantics, and a resource unit is not compiled on its
+// own.
+func isShardableUnitKey(key string) bool {
+	return strings.HasPrefix(key, "dir:") || strings.HasPrefix(key, "unit:")
+}
+
 // CompileUnitDependencies extracts Java import edges plus template-resource
 // edges (template files referenced from .java string literals).
 func (*SSABuilder) CompileUnitDependencies(fs filesys_interface.FileSystem, units []*ssa.CompileUnit) []ssa.UnitRef {
@@ -79,6 +120,14 @@ func (*SSABuilder) CompileUnitDependencies(fs filesys_interface.FileSystem, unit
 				raw := match[1]
 				if to := resolveJavaImport(packageToKey, raw); to != "" && to != unit.Key {
 					edges = append(edges, ssa.UnitRef{From: unit.Key, To: to, Kind: "import", Raw: raw})
+				}
+			}
+			// Imports are not the only dependency: fully qualified type and
+			// static-member references need no import declaration. Treat these
+			// as edges before scheduling packages concurrently.
+			for _, raw := range javaQualifiedReferences(src) {
+				if to := resolveJavaImport(packageToKey, raw); to != "" && to != unit.Key {
+					edges = append(edges, ssa.UnitRef{From: unit.Key, To: to, Kind: "qualified", Raw: raw})
 				}
 			}
 			for _, match := range javaStringRe.FindAllStringSubmatch(src, -1) {
@@ -105,19 +154,56 @@ func scanJavaPackage(fs filesys_interface.FileSystem, file string) string {
 }
 
 func resolveJavaImport(packageToKey map[string]string, raw string) string {
-	if key := packageToKey[raw]; key != "" {
-		return key
+	for raw != "" {
+		if key := packageToKey[raw]; key != "" {
+			return key
+		}
+		end := strings.LastIndexByte(raw, '.')
+		if end < 0 {
+			break
+		}
+		raw = raw[:end]
 	}
-	bestPkg := ""
-	for pkg := range packageToKey {
-		if strings.HasPrefix(raw, pkg+".") && len(pkg) > len(bestPkg) {
-			bestPkg = pkg
+	return ""
+}
+
+// Scan identifiers rather than matching arbitrary source text, so comments,
+// string literals and character literals cannot invent package dependencies.
+// This is a conservative graph pass; the Java frontend remains the parser.
+func javaQualifiedReferences(source string) []string {
+	var lex scanner.Scanner
+	lex.Init(strings.NewReader(source))
+	lex.Mode = scanner.ScanIdents | scanner.ScanStrings | scanner.ScanChars | scanner.ScanComments | scanner.SkipComments
+	lex.Error = func(*scanner.Scanner, string) {} // Java escapes are validated by the frontend.
+	var refs []string
+	var name strings.Builder
+	expectIdent := true
+	qualified := false
+	flush := func() {
+		if qualified {
+			refs = append(refs, strings.TrimSuffix(name.String(), "."))
+		}
+		name.Reset()
+		expectIdent = true
+		qualified = false
+	}
+	for tok := lex.Scan(); tok != scanner.EOF; tok = lex.Scan() {
+		if tok == scanner.Ident {
+			if !expectIdent {
+				flush()
+			}
+			name.WriteString(lex.TokenText())
+			expectIdent = false
+		} else if tok == '.' && !expectIdent {
+			name.WriteByte('.')
+			expectIdent = true
+			qualified = true
+		} else {
+			flush()
 		}
 	}
-	if bestPkg == "" {
-		return ""
-	}
-	return packageToKey[bestPkg]
+	flush()
+	return refs
 }
 
 func javaTemplateResourceIndexes(fs filesys_interface.FileSystem, units []*ssa.CompileUnit) (map[string]string, map[string]string) {

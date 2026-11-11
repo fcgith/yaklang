@@ -43,7 +43,20 @@ type FunctionSideEffect struct {
 	*parameterMemberInner
 }
 
+// FunctionSideEffectSite is the scope-free form of one recorded side effect.
+// It carries the same fields the AOT compiler needs to find the capture cell
+// and the value to store, but holds no *Variable, so it can outlive the maps
+// that Finish releases.
+type FunctionSideEffectSite struct {
+	Name         string
+	VerboseName  string
+	Modify       int64
+	Kind         SideEffectKind
+	VariableName string
+}
+
 func (f *Function) AddForceSideEffect(variable *Variable, value Value, index int, kind SideEffectKind) {
+	defer f.markPersistenceDirty()
 	if variable.IsMemberCall() {
 		if para, ok := ToParameter(variable.object); ok {
 			f.SideEffects = append(f.SideEffects, &FunctionSideEffect{
@@ -83,13 +96,16 @@ func (f *Function) AddForceSideEffect(variable *Variable, value Value, index int
 }
 
 func (f *Function) AddSideEffect(variable *Variable, v Value) {
+	defer f.markPersistenceDirty()
 	var bind *Variable = variable
 
 	// f.builder is nil for functions rebuilt from DB (compile-unit spill +
 	// lazy reload) or extern functions; the parent-scope walk is compiler-only
 	// bookkeeping, so just keep the original variable as bind.
 	if f.builder != nil {
-		for p := f.builder.parentBuilder; p != nil; p = p.builder.parentBuilder {
+		// FunctionBuilder.parentBuilder stays valid after the parent's
+		// Function.builder is cleared by a release; follow that link.
+		for p := f.builder.parentBuilder; p != nil; p = p.parentBuilder {
 			parentScope := p.CurrentBlock.ScopeTable
 			if find := ReadVariableFromScopeAndParent(parentScope, variable.GetName()); find != nil {
 				bind = find
@@ -114,12 +130,15 @@ func (f *Function) AddSideEffect(variable *Variable, v Value) {
 }
 
 func (f *FunctionBuilder) CheckMemberSideEffect(variable *Variable, v Value) {
+	defer f.Function.markPersistenceDirty()
 	var bind *Variable = variable
 
 	if f.builder == nil {
 		return
 	}
-	for p := f.builder.parentBuilder; p != nil; p = p.builder.parentBuilder {
+	// FunctionBuilder.parentBuilder stays valid after this function's
+	// Function.builder is cleared by a release; follow that link.
+	for p := f.parentBuilder; p != nil; p = p.parentBuilder {
 		parentScope := p.CurrentBlock.ScopeTable
 		if find := ReadVariableFromScopeAndParent(parentScope, variable.GetName()); find != nil {
 			bind = find
@@ -243,6 +262,7 @@ func shouldBindSideEffectInCurrentScope(se *FunctionSideEffect, lexicalVar, bind
 }
 
 func handleSideEffect(c *Call, funcTyp *FunctionType, buildPointer bool) {
+	defer c.markPersistenceDirty()
 	currentScope := c.GetBlock().ScopeTable
 	function := c.GetFunc()
 	builder := function.builder
@@ -423,7 +443,7 @@ func handleSideEffect(c *Call, funcTyp *FunctionType, buildPointer bool) {
 			continue
 		}
 		if variable == nil {
-			log.Warnf("[ssa.handleSideEffectBind] skip side effect %s: variable creation failed", se.Name)
+			log.Debugf("[ssa.handleSideEffectBind] skip side effect %s: variable creation failed", se.Name)
 			continue
 		}
 		if se.Kind == PointerSideEffect && se.MemberCallKind == CallMemberCall {
@@ -473,6 +493,7 @@ func handleSideEffect(c *Call, funcTyp *FunctionType, buildPointer bool) {
 }
 
 func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
+	defer c.markPersistenceDirty()
 	currentScope := c.GetBlock().ScopeTable
 	function := c.GetFunc()
 	builder := function.builder
@@ -493,7 +514,7 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 			continue
 		}
 		if modify.GetBlock() == nil || modify.GetBlock().ScopeTable == nil {
-			log.Warnf("[ssa.handleSideEffectBind] skip side effect %s: modify value missing block scope", se.Name)
+			log.Debugf("[ssa.handleSideEffectBind] skip side effect %s: modify value missing block scope", se.Name)
 			continue
 		}
 		var variable, bindVariable *Variable
@@ -520,14 +541,14 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 		case ParameterCall:
 			v, exists := se.GetActualParam(c)
 			if !exists || utils.IsNil(v) {
-				log.Warnf("[ssa.handleSideEffectBind] skip parameter side effect %s: actual param missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip parameter side effect %s: actual param missing", se.Name)
 				continue
 			}
 			if utils.IsNil(modify) {
 				modify = v
 			}
 			if modify.GetBlock() == nil || modify.GetBlock().ScopeTable == nil {
-				log.Warnf("[ssa.handleSideEffectBind] skip parameter side effect %s: modify value missing block", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip parameter side effect %s: modify value missing block", se.Name)
 				continue
 			}
 			if v.GetType() != nil && v.GetType().GetTypeKind() == PointerKind {
@@ -548,14 +569,14 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 		case ParameterMemberCall:
 			obj, ok := se.GetActualParam(c)
 			if !ok {
-				log.Warnf("[ssa.handleSideEffectBind] skip parameter member %s: object missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip parameter member %s: object missing", se.Name)
 				continue
 			}
 			if utils.IsNil(modify) {
 				modify = obj
 			}
 			if modify.GetBlock() == nil || modify.GetBlock().ScopeTable == nil {
-				log.Warnf("[ssa.handleSideEffectBind] skip parameter member %s: modify value missing block", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip parameter member %s: modify value missing block", se.Name)
 				continue
 			}
 			if obj.GetType() != nil && obj.GetType().GetTypeKind() == PointerKind {
@@ -566,20 +587,20 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 				actualKey := getActualKeyFromCall(c, key)
 				variable = builder.CreateMemberCallVariable(obj, actualKey)
 			} else {
-				log.Warnf("[ssa.handleSideEffectBind] skip parameter member %s: key missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip parameter member %s: key missing", se.Name)
 				continue
 			}
 		case CallMemberCall:
 			obj, ok := se.GetActualParam(c)
 			if !ok {
-				log.Warnf("[ssa.handleSideEffectBind] skip call member %s: object missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip call member %s: object missing", se.Name)
 				continue
 			}
 			if utils.IsNil(modify) {
 				modify = obj
 			}
 			if modify.GetBlock() == nil || modify.GetBlock().ScopeTable == nil {
-				log.Warnf("[ssa.handleSideEffectBind] skip call member %s: modify value missing block", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip call member %s: modify value missing block", se.Name)
 				continue
 			}
 			if obj.GetType() != nil && obj.GetType().GetTypeKind() == PointerKind {
@@ -590,7 +611,7 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 				actualKey := getActualKeyFromCall(c, key)
 				variable = builder.CreateMemberCallVariable(obj, actualKey)
 			} else {
-				log.Warnf("[ssa.handleSideEffectBind] skip call member %s: key missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip call member %s: key missing", se.Name)
 				continue
 			}
 			if p, ok := ToParameter(modify); ok {
@@ -603,14 +624,14 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 		default:
 			obj, ok := se.GetActualParam(c)
 			if !ok {
-				log.Warnf("[ssa.handleSideEffectBind] skip default member %s: object missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip default member %s: object missing", se.Name)
 				continue
 			}
 			if utils.IsNil(modify) {
 				modify = obj
 			}
 			if modify.GetBlock() == nil || modify.GetBlock().ScopeTable == nil {
-				log.Warnf("[ssa.handleSideEffectBind] skip default member %s: modify value missing block", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip default member %s: modify value missing block", se.Name)
 				continue
 			}
 			if obj.GetType() != nil && obj.GetType().GetTypeKind() == PointerKind {
@@ -622,7 +643,7 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 				actualKey := getActualKeyFromCall(c, key)
 				variable = builder.CreateMemberCallVariable(obj, actualKey)
 			} else {
-				log.Warnf("[ssa.handleSideEffectBind] skip default member %s: key missing", se.Name)
+				log.Debugf("[ssa.handleSideEffectBind] skip default member %s: key missing", se.Name)
 				continue
 			}
 		}
@@ -631,6 +652,7 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 			if builder.SupportClosure {
 				if parentValue, ok := builder.getParentFunctionVariable(se.Name); ok && se.Variable != nil {
 					// the ret variable should be FreeValue
+					noteCapturedByClosure(parentValue, se.Name)
 					para := builder.BuildFreeValueByVariable(se.Variable)
 					para.SetDefault(parentValue)
 					para.SetType(parentValue.GetType())
@@ -668,6 +690,7 @@ func handleSideEffectBind(c *Call, funcTyp *FunctionType) {
 				currentScope.SetCapturedSideEffect(actualVerboseName, variable, se.Variable)
 
 				function.SideEffects = append(function.SideEffects, se)
+				function.markPersistenceDirty()
 			}
 
 			applySideEffectByScope := func(find *Variable) {
@@ -833,11 +856,108 @@ func isParameterCalledInFunction(calleeFunc *Function, paramIndex int) bool {
 // 1. If an argument is a function with side effects
 // 2. If the corresponding parameter is actually called inside the callee
 // 3. If both conditions are met, create SideEffect instructions at the call site
-func handleArgumentFunctionSideEffect(c *Call, calleeFuncTyp *FunctionType) {
-	if calleeFuncTyp == nil {
-		return
+// splitMemberVerboseName splits `params.file_count` into its object name and
+// field. A side effect created for a captured object member already carries the
+// object variable and the field in its verbose name.
+func splitMemberVerboseName(se *FunctionSideEffect) (objName, field string) {
+	if se == nil || se.Variable == nil {
+		return "", ""
 	}
+	objName = se.Variable.GetName()
+	// Only `obj.field` names qualify. An already-materialized member such as
+	// `#242.lang` is not an object name: binding it again would create the
+	// double member `#242.lang.lang`.
+	if objName == "" || strings.ContainsAny(objName, ".#") {
+		return "", ""
+	}
+	if !strings.HasPrefix(se.VerboseName, objName+".") {
+		return "", ""
+	}
+	field = strings.TrimPrefix(se.VerboseName, objName+".")
+	if field == "" || strings.Contains(field, ".") {
+		return "", ""
+	}
+	return objName, field
+}
 
+func propagateOpaqueCallbackSideEffects(c *Call, builder *FunctionBuilder, currentScope ScopeIF) {
+	for _, argId := range c.Args {
+		argValue, ok := c.GetValueById(argId)
+		if !ok || utils.IsNil(argValue) {
+			continue
+		}
+		argFunc, isFunc := ToFunction(argValue)
+		if !isFunc || argFunc.Type == nil {
+			continue
+		}
+		// Only closures carry captures a Go callback can write through.
+		// A plain named function passed as a callback has no free values, so
+		// its side effects belong to its own call sites, not to this one.
+		if len(argFunc.FreeValues) == 0 {
+			continue
+		}
+		recoverBuilder := builder.SetCurrent(c)
+		for _, se := range argFunc.Type.SideEffects {
+			if se == nil || se.Kind != NormalSideEffect {
+				continue
+			}
+			modify, ok := c.GetValueById(se.Modify)
+			if !ok || utils.IsNil(modify) {
+				modify, ok = argFunc.GetValueById(se.Modify)
+				if !ok || utils.IsNil(modify) {
+					continue
+				}
+			}
+			// Only the closure's own writes belong to this call site. A write the
+			// closure inherited from a callee inside its body already reached the
+			// closure's own member/variable cell, and reporting it here would
+			// overwrite an unrelated variable of the same name in the caller. Such
+			// entries point at a SideEffect value rather than at a real value the
+			// closure computed (a local write, a call result, or a literal).
+			if modify.IsSideEffect() {
+				continue
+			}
+			varName := se.Name
+			if se.Variable != nil && se.Variable.GetName() != "" {
+				varName = se.Variable.GetName()
+			}
+			sideEffect := builder.EmitSideEffect(se.Name, c, modify)
+			if sideEffect == nil {
+				continue
+			}
+			sideEffect.SetVerboseName(se.VerboseName)
+			// Bind the write to the object's member, not to the object itself.
+			// An object-named side effect (`[params]`) makes later reads of any
+			// field resolve to this value, so `params.language` would read the
+			// count. A member variable keeps the write on its own field.
+			if objName, field := splitMemberVerboseName(se); objName != "" && field != "" {
+				if objVariable := ReadVariableFromScopeAndParent(currentScope, objName); objVariable != nil {
+					if objValue := objVariable.GetValue(); !utils.IsNil(objValue) {
+						key := builder.EmitConstInst(field)
+						if memberVariable := builder.CreateMemberCallVariable(objValue, key); memberVariable != nil {
+							builder.AssignVariable(memberVariable, sideEffect)
+							recoverBuilder()
+							continue
+						}
+					}
+				}
+			}
+			variable := builder.CreateVariableForce(varName)
+			if variable == nil {
+				recoverBuilder()
+				continue
+			}
+			if v := ReadVariableFromScopeAndParent(currentScope, se.Name); v != nil {
+				variable.SetCaptured(v)
+			}
+			builder.AssignVariable(variable, sideEffect)
+		}
+		recoverBuilder()
+	}
+}
+
+func handleArgumentFunctionSideEffect(c *Call, calleeFuncTyp *FunctionType) {
+	defer c.markPersistenceDirty()
 	function := c.GetFunc()
 	if function == nil {
 		return
@@ -852,6 +972,14 @@ func handleArgumentFunctionSideEffect(c *Call, calleeFuncTyp *FunctionType) {
 		return
 	}
 
+	// A callee with no SSA type is an extern/yaklib function. When one of its
+	// arguments is a closure, the Go side may invoke it (`filesys.onFileStat`),
+	// so the closure's captured writes have to surface at this call site.
+	if calleeFuncTyp == nil {
+		propagateOpaqueCallbackSideEffects(c, builder, currentScope)
+		return
+	}
+
 	// Get the callee function (not just its type) to analyze parameter usage
 	method, ok := c.GetValueById(c.Method)
 	if !ok || utils.IsNil(method) {
@@ -859,7 +987,17 @@ func handleArgumentFunctionSideEffect(c *Call, calleeFuncTyp *FunctionType) {
 	}
 	calleeFunc, isCalleeFunc := ToFunction(method)
 	if !isCalleeFunc {
-		// Cannot analyze parameter usage without function implementation
+		// filesys.onFileStat(func...) has no SSA body, but the callback runs
+		// and its captured writes must reach the caller.
+		propagateOpaqueCallbackSideEffects(c, builder, currentScope)
+		return
+	}
+	if len(calleeFunc.Blocks) == 0 {
+		// A yaklib/Go-implemented callee has a type but no SSA body, so
+		// isParameterCalledInFunction cannot observe the indirect call. The Go
+		// side may still invoke the closure (filesys.onFileStat), so the
+		// captured writes have to surface at this call site.
+		propagateOpaqueCallbackSideEffects(c, builder, currentScope)
 		return
 	}
 
@@ -906,8 +1044,40 @@ func handleArgumentFunctionSideEffect(c *Call, calleeFuncTyp *FunctionType) {
 				}
 			}
 
-			// Create side effect at call site
-			variable := builder.CreateVariableForce(se.Name)
+			// The write targets a member of a captured free variable
+			// (`params.file_count` inside a callback that the holder received). The
+			// caller reads the member cell `#<objectID>.<field>`, so resolve the
+			// caller's object through the call binding and bind the effect there.
+			// Binding a plain variable named after the object would both miss that
+			// read and replace the object with the field's value, which makes every
+			// other field read return this one.
+			if se.MemberCallKind == FreeValueMemberCall {
+				if obj, ok := se.GetActualParam(c); ok && !utils.IsNil(obj) {
+					if key, keyOK := c.GetValueById(se.MemberCallKey); keyOK && key != nil {
+						if memberVariable := builder.CreateMemberCallVariable(obj, key); memberVariable != nil {
+							if sideEffect := builder.EmitSideEffect(se.Name, c, modify); sideEffect != nil {
+								builder.AssignVariable(memberVariable, sideEffect)
+								sideEffect.SetVerboseName(se.VerboseName)
+								if c.SideEffectValue == nil {
+									c.SideEffectValue = make(map[string]int64)
+								}
+								c.SideEffectValue[se.VerboseName] = sideEffect.GetId()
+								continue
+							}
+						}
+					}
+				}
+			}
+
+			// Create side effect at call site. A member write inside the closure
+			// (`m.n++`) is recorded under the field name (`#18.n`); the variable it
+			// updates in the caller is the captured object (`m`). Bind the side
+			// effect to that variable so a later read of `m.n` sees the update.
+			varName := se.Name
+			if se.Variable != nil && se.Variable.GetName() != "" {
+				varName = se.Variable.GetName()
+			}
+			variable := builder.CreateVariableForce(varName)
 			if variable == nil {
 				continue
 			}

@@ -55,6 +55,17 @@ func GetLatestObject(member Value) Value {
 }
 
 func GetLatestKey(member Value) Value {
+	if utils.IsNil(member) {
+		return nil
+	}
+	// Fast path: resolve only the newest owner pair's key. GetObjectKeyPairs
+	// resolves every pair — each miss is an instruction-cache lookup that can
+	// fall through to the database — and allocates a fresh slice, so this
+	// constant-time lookup used to scan a member's whole history. It sits on
+	// the member-replacement hot path, where it dominated the profile.
+	if key := latestObjectKeyDirect(member); !utils.IsNil(key) {
+		return key
+	}
 	pair, ok := GetLatestObjectKeyPair(member)
 	if !ok {
 		return nil
@@ -62,32 +73,59 @@ func GetLatestKey(member Value) Value {
 	return pair.Key
 }
 
+func latestObjectKeyDirect(member Value) Value {
+	if utils.IsNil(member) {
+		return nil
+	}
+	value := member.getAnValue()
+	if value == nil {
+		return nil
+	}
+	pairs := value.snapshotOwnerPairs()
+	for index := len(pairs) - 1; index >= 0; index-- {
+		pair := pairs[index]
+		if pair.key <= 0 {
+			continue
+		}
+		if key, ok := value.resolveLinkedValue(pair.key); ok {
+			return key
+		}
+	}
+	return nil
+}
+
 func SetObjectKeyPairs(member Value, pairs []ObjectKeyPair) {
 	if utils.IsNil(member) {
 		return
 	}
-	anValue := member.getAnValue()
-	anValue.ownerPairs = anValue.ownerPairs[:0]
+	var replacement anValue
 	for _, pair := range pairs {
 		if utils.IsNil(pair.Object) || utils.IsNil(pair.Key) {
 			continue
 		}
-		anValue.appendOwnerPairIDs(pair.Object.GetId(), pair.Key.GetId())
+		replacement.appendOwnerPairIDs(pair.Object.GetId(), pair.Key.GetId())
 	}
+	value := member.getAnValue()
+	value.relationsMu.Lock()
+	value.ownerPairs = replacement.ownerPairs
+	value.relationsMu.Unlock()
 }
 
 func SetMemberPairs(object Value, pairs []MemberPair) {
 	if utils.IsNil(object) {
 		return
 	}
-	anValue := object.getAnValue()
-	anValue.memberPairs = anValue.memberPairs[:0]
+	var replacement anValue
 	for _, pair := range pairs {
 		if utils.IsNil(pair.Key) || utils.IsNil(pair.Member) {
 			continue
 		}
-		anValue.appendMemberPairIDs(pair.Key.GetId(), pair.Member.GetId())
+		replacement.appendMemberPairIDs(pair.Key.GetId(), pair.Member.GetId())
 	}
+	value := object.getAnValue()
+	value.relationsMu.Lock()
+	value.memberPairs = replacement.memberPairs
+	value.relationsMu.Unlock()
 }
 
 func GetMemberPairs(object Value) []MemberPair {
@@ -111,6 +149,18 @@ func GetMembersByKey(object, key Value) []Value {
 }
 
 func GetLatestMemberByKey(object, key Value) (Value, bool) {
+	if utils.IsNil(object) || utils.IsNil(key) {
+		return nil, false
+	}
+	// Newest match only. GetMembersByKey resolves every historical pair and
+	// allocates the full list; replacement looks this up several times per pair,
+	// so the scan was quadratic in how many members a value had ever had.
+	if value := object.getAnValue(); value != nil {
+		if member, ok := value.latestMemberByKey(key); ok {
+			return member, true
+		}
+		return nil, false
+	}
 	members := GetMembersByKey(object, key)
 	if len(members) == 0 {
 		return nil, false
@@ -156,4 +206,20 @@ func memberKeySignature(key Value) string {
 		return "const:" + fmt.Sprint(lit.value)
 	}
 	return fmt.Sprintf("id:%d", key.GetId())
+}
+
+// BindMemberRelation records one object/member relation in both directions
+// using a single key identity. The forward and reverse relations describe the
+// same relationship, so they must not be built from separately emitted keys
+// that merely share a string. Repeating the bind for a relation that already
+// exists is a no-op, so a binding phase can be re-run without duplicating it.
+func BindMemberRelation(object, member Value, key Value) {
+	if utils.IsNil(object) || utils.IsNil(member) || utils.IsNil(key) {
+		return
+	}
+	if bound, ok := GetLatestMemberByKeyString(object, GetKeyString(key)); ok && !utils.IsNil(bound) && bound.GetId() == member.GetId() {
+		return
+	}
+	object.AddMember(key, member)
+	member.AddObjectKeyPair(object, key)
 }

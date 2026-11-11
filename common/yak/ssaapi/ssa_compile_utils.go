@@ -33,6 +33,8 @@ const (
 	minAutoASTMemoryBudget      = int64(2 * 1024 * 1024 * 1024)
 	defaultASTSlotCost          = int64(1024 * 1024 * 1024)
 	defaultLargeProjectGC       = 100
+	minCompileGCTuneBytes       = 256 * 1024
+	minCompileGCUsableMemory    = int64(4 * 1024 * 1024 * 1024)
 )
 
 var (
@@ -44,9 +46,68 @@ var (
 	antlrCacheResetEveryBytesCached int64
 )
 
+// GC percent is process-wide. Overlapping SSA compiles must not restore the
+// CLI's pre-compile value until the last compile has finished.
+var compileGCScopes struct {
+	mu       sync.Mutex
+	next     uint64
+	baseline int
+	current  int
+	active   map[uint64]int
+}
+
+func beginCompileGCPercent(percent int) (int, func()) {
+	compileGCScopes.mu.Lock()
+	if compileGCScopes.active == nil {
+		compileGCScopes.active = make(map[uint64]int)
+	}
+	previous := compileGCScopes.current
+	if len(compileGCScopes.active) == 0 {
+		previous = debug.SetGCPercent(percent)
+		compileGCScopes.baseline = previous
+		compileGCScopes.current = percent
+	} else if percent > compileGCScopes.current {
+		debug.SetGCPercent(percent)
+		compileGCScopes.current = percent
+	}
+	compileGCScopes.next++
+	id := compileGCScopes.next
+	compileGCScopes.active[id] = percent
+	compileGCScopes.mu.Unlock()
+
+	var once sync.Once
+	return previous, func() {
+		once.Do(func() {
+			compileGCScopes.mu.Lock()
+			delete(compileGCScopes.active, id)
+			target := compileGCScopes.baseline
+			if len(compileGCScopes.active) != 0 {
+				target = 0
+				for _, requested := range compileGCScopes.active {
+					if requested > target {
+						target = requested
+					}
+				}
+			}
+			if target != compileGCScopes.current {
+				debug.SetGCPercent(target)
+				compileGCScopes.current = target
+			}
+			compileGCScopes.mu.Unlock()
+		})
+	}
+}
+
 func antlrCacheResetEveryFiles() int {
 	antlrCacheResetEveryFilesOnce.Do(func() {
-		antlrCacheResetEveryFilesCached = 25
+		// Resetting on a fixed file count throws away a DFA the worker just
+		// paid to learn, and the next files rebuild it from scratch. That
+		// dominated allocation on projects below the large-project threshold
+		// (37GB of ATN prediction objects on a 13MB tree). The cache is now
+		// kept for the worker's lifetime and only dropped when it grows past
+		// the byte budget below. YAK_ANTLR_CACHE_RESET_FILES still forces the
+		// old periodic reset.
+		antlrCacheResetEveryFilesCached = 0
 		if raw := strings.TrimSpace(os.Getenv("YAK_ANTLR_CACHE_RESET_FILES")); raw != "" {
 			if v, err := strconv.Atoi(raw); err == nil {
 				antlrCacheResetEveryFilesCached = v
@@ -61,7 +122,10 @@ func antlrCacheResetEveryFiles() int {
 
 func antlrCacheResetEveryBytes() int64 {
 	antlrCacheResetEveryBytesOnce.Do(func() {
-		antlrCacheResetEveryBytesCached = 8 * 1024 * 1024
+		// Upper bound on how much source one worker parses before its DFA and
+		// prediction-context cache are dropped. This caps cache memory without
+		// the periodic rebuild the old 8MB default caused.
+		antlrCacheResetEveryBytesCached = 64 * 1024 * 1024
 		if raw := strings.TrimSpace(os.Getenv("YAK_ANTLR_CACHE_RESET_BYTES")); raw != "" {
 			switch strings.ToLower(raw) {
 			case "0", "false", "no", "off", "disable", "disabled":
@@ -91,9 +155,10 @@ type astBuildWindowDecision struct {
 	budgetSource     string
 }
 
-type largeProjectGCDecision struct {
+type compileProjectGCDecision struct {
 	percent        int
 	manualOverride bool
+	eligible       bool
 	largeProject   bool
 	source         string
 }
@@ -205,26 +270,36 @@ func parseGCPercentEnv(raw string) (int, bool) {
 	return v, true
 }
 
-func (c *Config) resolveLargeProjectGCPercent() largeProjectGCDecision {
-	decision := largeProjectGCDecision{
-		largeProject: c != nil && c.GetCompileProjectBytes() >= largeProjectByteCap,
-	}
-	if !decision.largeProject || c == nil {
+func (c *Config) resolveCompileProjectGCPercent(totalMemory int64) compileProjectGCDecision {
+	decision := compileProjectGCDecision{}
+	if c == nil || c.GetCompileProjectBytes() < minCompileGCTuneBytes {
 		return decision
 	}
+	decision.largeProject = c.GetCompileProjectBytes() >= largeProjectByteCap
 	create, ok := LanguageBuilderCreater[c.GetLanguage()]
 	if !ok || !create().UsesDeferredFileBuild() {
 		return decision
 	}
+	decision.eligible = true
 	if raw := strings.TrimSpace(os.Getenv("GOGC")); raw != "" {
 		decision.manualOverride = true
 		decision.source = "env:GOGC"
 		return decision
 	}
+	if envFlagEnabled(ssaCompileAdaptiveGCEnv) {
+		decision.manualOverride = true
+		decision.source = "env:YAK_SSA_COMPILE_ADAPTIVE_GC"
+		return decision
+	}
+	if strings.TrimSpace(os.Getenv(ssaCompileGOGCEnv)) != "" {
+		decision.manualOverride = true
+		decision.source = "env:YAK_SSA_COMPILE_GOGC"
+		return decision
+	}
 	if raw := strings.TrimSpace(os.Getenv("YAK_SSA_GC_PERCENT")); raw != "" {
 		percent, ok := parseGCPercentEnv(raw)
 		if !ok {
-			log.Warnf("invalid YAK_SSA_GC_PERCENT=%q, using %d for large SSA project", raw, defaultLargeProjectGC)
+			log.Warnf("invalid YAK_SSA_GC_PERCENT=%q, using %d for SSA compilation", raw, defaultLargeProjectGC)
 		} else if percent <= 0 {
 			decision.manualOverride = true
 			decision.source = "env:YAK_SSA_GC_PERCENT"
@@ -235,33 +310,44 @@ func (c *Config) resolveLargeProjectGCPercent() largeProjectGCDecision {
 			return decision
 		}
 	}
+	if !decision.largeProject {
+		// yak's CLI uses GOGC=8 by default. That keeps memory low but makes
+		// ANTLR-heavy compiles spend most CPU time scanning the heap. Restore
+		// the ordinary 100% policy only when the configured usable memory
+		// budget has room for the measured increase in peak RSS.
+		limit, enabled := c.resolveCompileMemoryLimit(totalMemory)
+		if !enabled || limit < minCompileGCUsableMemory {
+			decision.eligible = false
+			return decision
+		}
+		decision.source = "auto:ssa-compile"
+	} else {
+		decision.source = "auto:large-project"
+	}
 	decision.percent = defaultLargeProjectGC
-	decision.source = "auto:large-project"
 	return decision
 }
 
-func (c *Config) applyLargeProjectGCPercent() func() {
-	decision := c.resolveLargeProjectGCPercent()
-	if !decision.largeProject {
+func (c *Config) applyCompileProjectGCPercent() func() {
+	decision := c.resolveCompileProjectGCPercent(systemMemoryTotalBytes())
+	if !decision.eligible {
 		return nil
 	}
 	if decision.manualOverride {
-		log.Infof("[ssa-compile] large project GC percent controlled by %s", decision.source)
+		log.Infof("[ssa-compile] GC percent controlled by %s", decision.source)
 		return nil
 	}
 	if decision.percent <= 0 {
 		return nil
 	}
-	previous := debug.SetGCPercent(decision.percent)
+	previous, restore := beginCompileGCPercent(decision.percent)
 	log.Infof(
-		"[ssa-compile] large project GC percent=%d (previous=%d source=%s), restore after compile",
+		"[ssa-compile] GC percent=%d (previous=%d source=%s), restore after compile",
 		decision.percent,
 		previous,
 		decision.source,
 	)
-	return func() {
-		debug.SetGCPercent(previous)
-	}
+	return restore
 }
 
 type antlrWorkerState struct {
@@ -284,11 +370,17 @@ func newAntlrASTParseWorker(c *Config) *antlrASTParseWorker {
 	resetEveryFiles := antlrCacheResetEveryFiles()
 	resetEveryBytes := antlrCacheResetEveryBytes()
 	if c.GetCompileProjectBytes() >= largeProjectByteCap {
+		// A batch used to keep one DFA for every file. Go's prehandler is
+		// serial, so that one worker cache parsed the whole batch and the
+		// DFA reached about 1.4GiB (NewATNConfig) on the yaklang self-scan.
+		// Reset by bytes instead of by file: the DFA stays warm across a
+		// few files, then drops. YAK_ANTLR_CACHE_RESET_FILES / _BYTES still
+		// override this.
 		if _, ok := os.LookupEnv("YAK_ANTLR_CACHE_RESET_FILES"); !ok {
-			resetEveryFiles = 1
+			resetEveryFiles = 0
 		}
 		if _, ok := os.LookupEnv("YAK_ANTLR_CACHE_RESET_BYTES"); !ok {
-			resetEveryBytes = 2 * 1024 * 1024
+			resetEveryBytes = 8 * 1024 * 1024
 		}
 	}
 	return &antlrASTParseWorker{
@@ -371,7 +463,13 @@ func (c *Config) GetFileHandler(
 	parse := func(path string, content []byte, store *utils.SafeMap[any]) (ssa.FrontAST, error) {
 		start := time.Now()
 		defer func() {
-			log.Debugf("pre-handler cost:%v parse ast: %s; size(%s)", time.Since(start), path, formatFileSize(len(content)))
+			elapsed := time.Since(start)
+			if elapsed > slowPreHandlerFileThreshold {
+				// The batch log prints only after every file in it is parsed, so one
+				// pathologically slow parse leaves the run looking hung with no clue.
+				log.Warnf("[ssa-compile] slow ast parse %s took %v size(%s)", path, elapsed, formatFileSize(len(content)))
+			}
+			log.Debugf("pre-handler cost:%v parse ast: %s; size(%s)", elapsed, path, formatFileSize(len(content)))
 		}()
 
 		defer func() {
@@ -401,9 +499,9 @@ func (c *Config) GetFileHandler(
 		// Use sync.Once to avoid setting/logging 98 times (once per concurrent worker).
 		gomeMemLimitOnce.Do(func() {
 			totalMem := systemMemoryTotalBytes()
-			if memLimit, enabled := automaticSSACompileMemoryLimit(totalMem); enabled {
+			if memLimit, enabled := c.resolveCompileMemoryLimit(totalMem); enabled {
 				debug.SetMemoryLimit(memLimit)
-				log.Infof("[ssa-compile] large project: set GOMEMLIMIT=%s (80%% of %s system memory)",
+				log.Infof("[ssa-compile] large project: set GOMEMLIMIT=%s (usable of %s system memory, compile_memory_limit)",
 					formatFileSize(int(memLimit)), formatFileSize(int(totalMem)))
 			}
 		})
@@ -443,7 +541,6 @@ func (c *Config) GetFileHandler(
 	return ssareducer.FilesHandler(
 		c.ctx, filesystem, preHandlerFiles,
 		parse, initWorker,
-		c.GetCompileASTSequence(),
 		concurrency,
 		astBuildWindow.window,
 	)
@@ -496,13 +593,34 @@ type ScanConfig struct {
 	Context         context.Context
 }
 
-// ScanProjectFiles scans the project directory and returns the files to be processed
+// skipCompileDir reports whether a directory is pruned (SkipDir) during a
+// compile walk: it matched a compile exclude pattern. Shared by
+// ScanProjectFiles and the incremental diff walks so a diff sees exactly the
+// directory tree a full compile scans.
+func skipCompileDir(exclude ssaconfig.CompileExcludeFunc, path string) bool {
+	return exclude != nil && exclude(path)
+}
+
+// skipCompileFile reports whether a file never enters compilation: empty
+// files and exclude-pattern matches are ignored by the compile scan. Shared
+// by ScanProjectFiles and the incremental diff walks so a diff never reports
+// such files as added/modified.
+func skipCompileFile(exclude ssaconfig.CompileExcludeFunc, path string, info fs.FileInfo) bool {
+	if info.Size() == 0 {
+		return true
+	}
+	return exclude != nil && exclude(path)
+}
+
+// ScanProjectFiles scans the project directory and returns the files to be processed.
+// Entry files select frontend roots, not scan inputs; retain non-entry files
+// for preprocessing and source lookup.
 func ScanProjectFiles(cfg ScanConfig) (*ScanResult, error) {
 	result := &ScanResult{
-		HandlerFiles:     make([]string, 0),
-		PreHandlerFiles:  make([]string, 0),
+		HandlerFiles:      make([]string, 0),
+		PreHandlerFiles:   make([]string, 0),
 		PreHandlerFileSet: make(map[string]struct{}),
-		Folders:          make([][]string, 0),
+		Folders:           make([][]string, 0),
 	}
 	exclude := cfg.ExcludeFunc
 

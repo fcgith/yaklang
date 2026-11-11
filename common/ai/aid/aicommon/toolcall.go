@@ -2,11 +2,13 @@ package aicommon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -140,6 +142,11 @@ type ToolCaller struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	detachHandler func() (string, error)
+	onDetach      func()
+	detachOnce    sync.Once
+	detached      atomic.Bool
+
 	m               *sync.Mutex
 	onCallToolStart func(callToolId string)
 	onCallToolEnd   func(callToolId string)
@@ -175,6 +182,16 @@ type ToolCaller struct {
 	batchIndex            int
 	statsSource           string
 	checkpointReplayed    bool
+
+	// Inspector reads these original invocation buffers and the frozen final
+	// result. No event subscription or second output stream is involved.
+	inspectionMu            sync.RWMutex
+	inspectionStdout        *toolOutputBuffer
+	inspectionStderr        *toolOutputBuffer
+	inspectionResult        json.RawMessage
+	inspectionError         error
+	waitForCallbackOnCancel bool
+	asyncResourceBound      bool // guarded by m; one resource owns this caller
 }
 
 // ToolCallerGate bounds one phase of a tool call. The returned release
@@ -833,6 +850,7 @@ func SanitizeTaskName(name string) string {
 // CallToolWithExistedParams validates, reviews and executes an explicit parameter
 // object. It never asks an auxiliary model to create or repair tool arguments.
 func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams aitool.InvokeParams) (result *aitool.ToolResult, directlyAnswer bool, err error) {
+	defer func() { t.publishInspectionResult(result) }()
 	// Metadata extraction, parameter augmentation and plugins must not mutate
 	// the caller's payload. Preserve nil so missing explicit arguments still fail.
 	if invokeParams != nil {
@@ -1062,11 +1080,6 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams a
 			return nil, false, reviewErr
 		}
 
-		// 审批前快照原始提议参数 (original_value), 供价值评估比对是否被改动.
-		originalReviewParams := make(aitool.InvokeParams, len(invokeParams))
-		for k, v := range invokeParams {
-			originalReviewParams[k] = v
-		}
 		reviewQuestion := fmt.Sprintf("determite tool[%v]'s params is proper? what should I do?", tool.Name)
 
 		var params aitool.InvokeParams
@@ -1114,10 +1127,6 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams a
 		// acquire the same gate without deadlocking.
 		releaseReview()
 		if params == nil {
-			// 价值评估: 用户取消工具审批 (空响应释放) 是高价值的人工否决信号, 不能漏采.
-			if cfg, ok := config.(*Config); ok {
-				cfg.SubmitToolReviewValueFeedback(ep, reviewQuestion, originalReviewParams, nil)
-			}
 			t.emitter.EmitError("tool use [%v] review params is nil, user may cancel the review", tool.Name)
 			handleError(fmt.Sprintf("tool use [%v] review params is nil, user may cancel the review", tool.Name))
 			return nil, false, fmt.Errorf("tool use [%v] review params is nil", tool.Name)
@@ -1129,25 +1138,11 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams a
 		)
 		if err != nil {
 			var reconsider *ToolReviewReconsiderError
-			if errors.As(err, &reconsider) {
-				if !reviewReplayed {
-					if cfg, ok := config.(*Config); ok {
-						cfg.SubmitToolReviewValueFeedback(ep, reviewQuestion, originalReviewParams, nil)
-					}
-				}
-			} else {
+			if !errors.As(err, &reconsider) {
 				t.emitter.EmitError("error handling tool use review: %v", err)
 				handleError(fmt.Sprintf("error handling tool use review: %v", err))
 			}
 			return nil, false, err
-		}
-
-		// 价值评估 (review_decision): 记录审批事实 (original/final 参数 + 运行时来源),
-		// invokeParams 此时已是 review 应用后的最终参数. 非阻塞, 绝不影响主流程.
-		if !reviewReplayed {
-			if cfg, ok := config.(*Config); ok {
-				cfg.SubmitToolReviewValueFeedback(ep, reviewQuestion, originalReviewParams, invokeParams)
-			}
 		}
 
 		switch next {
@@ -1193,6 +1188,7 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams a
 	// Create buffers to capture stdout and stderr for interval review and file saving.
 	stdoutBuffer := &toolOutputBuffer{}
 	stderrBuffer := &toolOutputBuffer{}
+	t.bindInspectionOutput(stdoutBuffer, stderrBuffer)
 
 	artifactBundle := t.newToolCallArtifactBundle(tool, callToolId, destinationIdentifier)
 	// finalize marks successful and ordinary failed calls as durable bundles.
@@ -1254,8 +1250,22 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams a
 		handleError(ctxErr)
 		return nil, false, ctxErr
 	}
+	// Watchers/review can request cancellation while the callback is still
+	// cleaning up. Defer terminal UI events until both output streams are flushed.
+	var outcomeMu sync.Mutex
+	var cancellationReason, invocationError any
 	toolResult, err = t.invoke(
-		tool, invokeParams, handleUserCancel, handleError,
+		tool, invokeParams,
+		func(reason any) {
+			outcomeMu.Lock()
+			cancellationReason = reason
+			outcomeMu.Unlock()
+		},
+		func(err any) {
+			outcomeMu.Lock()
+			invocationError = err
+			outcomeMu.Unlock()
+		},
 		stdoutMultiWriter, stderrMultiWriter,
 		stdoutBuffer, stderrBuffer,
 		func(result *aitool.ToolResult) error {
@@ -1309,6 +1319,20 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, invokeParams a
 	t.emitter.EmitInfo("start to generate and feedback tool[%v] result in task: %#v", tool.Name, t.task.GetName())
 	if toolResult != nil && toolResult.Data != nil {
 		t.emitter.EmitToolCallResult(callToolId, toolResult.Data)
+	}
+
+	outcomeMu.Lock()
+	cancelReason, reportedError := cancellationReason, invocationError
+	outcomeMu.Unlock()
+	if cancelReason != nil || errors.Is(err, context.Canceled) {
+		if cancelReason == nil {
+			cancelReason = err
+		}
+		handleUserCancel(cancelReason)
+	} else if err != nil {
+		handleError(err)
+	} else if reportedError != nil {
+		handleError(reportedError)
 	}
 
 	if !t.checkpointReplayed && (t.ctx == nil || t.ctx.Err() == nil) {
