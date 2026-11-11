@@ -1,7 +1,6 @@
 package ssa
 
 import (
-	"bytes"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/gorm"
@@ -375,7 +374,19 @@ func TestSaveToDatabaseFlushesInstructionSaverBeforeTypes(t *testing.T) {
 	cfg, err := ssaconfig.New(ssaconfig.ModeSSACompile, ssaconfig.WithSetProgramName(programName))
 	require.NoError(t, err)
 
+	// Pin the level before the saver workers exist. SetLevel writes the global
+	// logger while those workers call Debugf, which -race reports. step0/step1
+	// are Info lines, so the level still has to be Info before any flush log.
+	var logBuf flushLogBuffer
+	yaklog.SetOutput(&logBuf)
+	yaklog.SetLevel(yaklog.InfoLevel)
+	defer func() {
+		yaklog.SetOutput(os.Stdout)
+		yaklog.SetLevel(yaklog.InfoLevel)
+	}()
+
 	prog := NewProgram(cfg, ProgramCacheDBWrite, Application, nil, "", 1)
+	defer prog.Cache.CloseWithoutSave()
 
 	builder := prog.GetAndCreateFunctionBuilder("testFunc", string(MainFunctionName))
 	builder.EmitUndefined("testInst")
@@ -383,15 +394,6 @@ func TestSaveToDatabaseFlushesInstructionSaverBeforeTypes(t *testing.T) {
 	builder.Finish()
 
 	prog.Cache.FlushCompileUnit("unit-a")
-
-	// Capture log output
-	var logBuf bytes.Buffer
-	yaklog.SetOutput(&logBuf)
-	yaklog.SetLevel(yaklog.InfoLevel)
-	defer func() {
-		yaklog.SetOutput(os.Stdout)
-		yaklog.SetLevel(yaklog.InfoLevel)
-	}()
 
 	err = prog.Cache.SaveToDatabase()
 	require.NoError(t, err)
@@ -517,8 +519,8 @@ func TestResidentLifecycle_PreserveQueryAfterSaveToDatabase(t *testing.T) {
 }
 
 // TestResidentLifecycle_DirtyCountSeparateFromResidentCount proves that the
-// remaining_dirty accounting is computed as max(0, resident - unique_persisted),
-// NOT as the raw resident count. After SaveToDatabase, all resident items
+// remaining_dirty accounting checks each resident ID against persisted IDs,
+// NOT the raw resident count. After SaveToDatabase, all resident items
 // have been persisted, so remaining_dirty=0 even though resident count > 0.
 func TestResidentLifecycle_DirtyCountSeparateFromResidentCount(t *testing.T) {
 	programName := uuid.NewString()
@@ -570,7 +572,7 @@ func TestRunDeferredBuildsForUnitsWithUnitCallback(t *testing.T) {
 	// Register deferred builds for two units: "unit-a" has 3 tasks, "unit-b" has 2.
 	// Tasks are registered in interleaved order to test that afterUnit fires
 	// only when a unit's remaining count hits zero.
-	// BeginCompileUnit sets currentCompileUnit, which RegisterDeferredBuild uses.
+	// BeginCompileUnit records this goroutine's unit, which RegisterDeferredBuild uses.
 
 	prog.BeginCompileUnit("unit-a")
 	prog.RegisterDeferredBuild(DeferredBuildKindHelper, "a1", func() {})

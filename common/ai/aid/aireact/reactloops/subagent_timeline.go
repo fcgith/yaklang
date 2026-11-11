@@ -294,6 +294,11 @@ func snapshotSubAgentConfig(parent *aicommon.Config, contextMode ...string) []ai
 // 不得继承 plan / goal mode / dispatch / increase iteration。
 func buildSubAgentStrategyOptions() []aicommon.ConfigOption {
 	return []aicommon.ConfigOption{
+		aicommon.WithAllowRequireForUserInteract(false),
+		func(c *aicommon.Config) error {
+			c.SetClarificationPolicy(func() (bool, bool, int64) { return false, false, 0 })
+			return nil
+		},
 		aicommon.WithEnablePlanAndExec(false),
 		aicommon.WithEnableGoalMode(false),
 		aicommon.WithPreferDispatchSubReactAgents(false),
@@ -483,13 +488,7 @@ func PrepareForkedSubAgent(
 
 // buildForkUserInput 拼接 fork 子 Agent 的用户输入：Goal + 可选的 ResultContract。
 func buildForkUserInput(job SubAgentJob) string {
-	var sb strings.Builder
-	sb.WriteString(strings.TrimSpace(job.Goal))
-	if contract := strings.TrimSpace(job.ResultContract); contract != "" {
-		sb.WriteString("\n\n## Result Contract\n\n")
-		sb.WriteString(contract)
-	}
-	return sb.String()
+	return buildUserInput(job.Goal, job.ResultContract)
 }
 
 // forkedChild 把 PrepareForkedSubAgent 的返回值打包，并接管 jobCancel 的释放。

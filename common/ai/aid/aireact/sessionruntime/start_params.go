@@ -19,7 +19,8 @@ func ConvertStartParamsToReActConfig(i *ypb.AIStartParams) []aicommon.ConfigOpti
 	if i == nil {
 		return opts
 	}
-	opts = append(opts, aicommon.WithSingleAIModelMode(i.GetSingleModelMode()))
+	opts = append(opts, aicommon.WithSingleAIModelMode(i.GetSingleModelMode()), aicommon.WithNetworkDebug(i.GetNetworkDebug()))
+	opts = append(opts, aicommon.WithClientUI(i.GetClientUI()))
 	enableMultiAgent, goalModeEnabled, goalMinIterations, maxSubAgents := resolveAIExecutionStrategy(i)
 	if i.DisallowRequireForUserPrompt {
 		opts = append(opts, aicommon.WithAllowRequireForUserInteract(false))
@@ -47,12 +48,14 @@ func ConvertStartParamsToReActConfig(i *ypb.AIStartParams) []aicommon.ConfigOpti
 		opts = append(opts, aicommon.WithMaxIterationCount(maxIterations))
 	}
 
-	if i.GetTimelineContentSizeLimit() > 0 {
-		opts = append(opts, aicommon.WithTimelineContentLimit(int(i.GetTimelineContentSizeLimit())))
+	// 运行时上下文阈值: 旧字段会被前端默认值占用, 无法表达“使用服务端默认值”。
+	if i.GetRuntimeContextSizeLimit() > 0 {
+		opts = append(opts, aicommon.WithTimelineContentLimit(int(i.GetRuntimeContextSizeLimit())))
 	}
 
+	opts = append(opts, aicommon.WithAllowPlanUserInteract(i.AllowPlanUserInteract), aicommon.WithPlanUserInteractMaxCount(i.PlanUserInteractMaxCount))
 	if i.UserInteractLimit > 0 {
-		opts = append(opts, aicommon.WithPlanUserInteractMaxCount(i.UserInteractLimit))
+		opts = append(opts, aicommon.WithPerTaskUserInteractiveLimitedTimes(i.UserInteractLimit))
 	}
 
 	if i.GetDisableToolUse() {

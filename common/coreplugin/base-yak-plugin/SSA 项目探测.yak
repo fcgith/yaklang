@@ -3,11 +3,11 @@ yakit.AutoInitYakit()
 // 支持的语言注册表（单一数据源）：新增语言只需在 langOrder 增加一项，并补全
 // langExts / langMarkers / langManifests 即可，扩展名映射、标记/清单计分都会自动
 // 跟进，无需再分散修改多处。CLI 的语言选项仍保持手写，与注册表独立。
-langOrder = ["java", "php", "go", "python", "js", "ts", "yak", "c"]
+langOrder = ["java", "php", "go", "python", "js", "ts", "yak", "c", "csharp"]
 
 // 源码扩展名 -> 语言（一个语言可对应多个扩展名）
 langExts = {
-    "java":   ["java"],
+    "java":   ["java", "jsp", "jspx"],
     "php":    ["php"],
     "go":     ["go"],
     "python": ["py", "pyi", "pyw"],
@@ -15,6 +15,7 @@ langExts = {
     "ts":     ["ts", "tsx"],
     "yak":    ["yak"],
     "c":      ["c", "h"],
+    "csharp": ["cs"],
 }
 
 // 通用标记文件（小写文件名）-> 语言；命中累计 markerWeight（弱信号）
@@ -27,6 +28,7 @@ langMarkers = {
     "ts":     [],
     "yak":    [],
     "c":      ["makefile", "makefile.am", "makefile.in", "configure.ac", "configure.in", "configure"],
+    "csharp": ["web.config", "global.asax"],
 }
 
 // 高权重构建/依赖清单（小写文件名）-> 语言；命中累计 manifestWeight（强信号）
@@ -39,6 +41,7 @@ langManifests = {
     "ts":     [],
     "yak":    [],
     "c":      ["cmakelists.txt"],
+    "csharp": ["packages.config", "global.json", "nuget.config", "directory.build.props"],
 }
 
 // 扩展名 -> 语言，由 langExts 反向构建
@@ -53,6 +56,11 @@ for _, lang := range langOrder {
 var scoreMap = map[string]int{}
 var markerMap = map[string]int{}
 var manifestMap = map[string]int{}
+// javaArchiveCount 统计 jar/war 个数，只在没有任何语言得分时作为兜底判据。
+// 归档存在不等于项目正文就是 Java：webapp 里可能有成千上万个 .js，所以它
+// 不能压过源码计分。但一个只有 jar 的目录里，Java 是唯一能读这些文件的
+// 语言，此时归档就是仅有的证据。
+var javaArchiveCount = 0
 for _, lang := range langOrder {
     scoreMap[lang] = 0
     markerMap[lang] = 0
@@ -102,6 +110,7 @@ languages = cli.StringSlice(
     cli.setSelectOption("Golang", "go"), 
     cli.setSelectOption("C", "c"), 
     cli.setSelectOption("Python", "python"), 
+    cli.setSelectOption("C#", "csharp"), 
 )
 
 compile_immediately := cli.Bool(
@@ -244,21 +253,22 @@ excludeFile := cli.String(
 filePerformanceLog := cli.Bool("filePerformanceLog", cli.setDefault(false), cli.setVerboseName("文件性能日志"), cli.setHelp("启用文件级别编译性能日志"), cli.setCliGroup("compile"))
 
 // 增量编译选项
+// 基础程序名称默认由编译自动以项目上一次编译的程序解析；用户可通过 base-program-name 显式指定
 enableIncrementalCompile := cli.Bool(
-    "incremental-compile", 
-    cli.setDefault(false), 
-    cli.setVerboseName("启用增量编译"), 
-    cli.setHelp("启用增量编译模式。首次编译时作为基础程序；后续编译时基于基础程序进行差量编译，只编译变更的文件，提高编译速度。"), 
-    cli.setCliGroup("compile"), 
+    "incremental-compile",
+    cli.setDefault(false),
+    cli.setVerboseName("启用增量编译"),
+    cli.setHelp("启用增量编译模式。首次编译时作为基础程序；后续编译时基于基础程序进行差量编译，只编译变更的文件，提高编译速度。"),
+    cli.setCliGroup("compile"),
 )
 baseProgramName := cli.String(
-    "base-program-name", 
-    cli.setVerboseName("基础程序名称"), 
-    cli.setHelp("增量编译的基础程序名称。必须已存在于数据库中。如果不提供，当前编译将作为基础程序（首次增量编译）。"), 
-    cli.setCliGroup("compile"), 
+    "base-program-name",
+    cli.setVerboseName("基础程序名称"),
+    cli.setHelp("增量编译的基础程序名称。可选；不提供时自动以项目上一次编译的程序作为基础程序（首次增量编译则当前编译即基础程序）。"),
+    cli.setCliGroup("compile"),
 )
 
-jarRecursiveParse := cli.Bool("jar-recursive-parse", cli.setDefault(true), cli.setVerboseName("Jar递归解析"), cli.setHelp("是否递归解析Jar文件中的嵌套Jar。默认开启，项目太大时可关闭以提高性能。"), cli.setCliGroup("compile"))
+jarRecursiveParse := cli.Bool("jar-recursive-parse", cli.setDefault(true), cli.setVerboseName("Jar解析"), cli.setHelp("是否解析Jar文件。开启时Jar/War等归档展开为目录并反编译class；关闭时基础文件系统直接跳过归档文件。"), cli.setCliGroup("compile"))
 
 // {{ compile option
 entry := cli.FileNames("entry", cli.setVerboseName("项目入口文件"), cli.setCliGroup("compile"))
@@ -460,6 +470,10 @@ func AutoParseLanguage() {
 
     if bestScore != 0 {
         setLanguage(best)
+    } else if javaArchiveCount > 0 {
+        // 没有任何源码/标记/清单可识别，但目录里有 jar/war：Java 是唯一能
+        // 读取这些归档的语言，否则整个 classes 树都不可见。
+        setLanguage("java")
     } else {
         newLanguageNeedSelectException(f`${params.info.kind} 无法自动检测项目的语言，请手动指定语言。`)
     }
@@ -482,6 +496,10 @@ func getZipinfo(basePath) {
             if !info.IsDir() {
                 params.file_count++
                 addLanguageScore(path)
+                ext = file.GetExt(path).Lower()
+                if ext == ".jar" || ext == ".war" {
+                    javaArchiveCount = javaArchiveCount + 1
+                }
                 if params.language == "" && !shouldSkipPath(path) {
                     addFileMarkers(info.Name().Lower())
                 }
@@ -529,6 +547,10 @@ func getLocalInfo(localFile) {
             filesys.onFileStat(func(path, info) {
                 params.file_count++
                 addLanguageScore(path)
+                ext = file.GetExt(path).Lower()
+                if ext == ".jar" || ext == ".war" {
+                    javaArchiveCount = javaArchiveCount + 1
+                }
                 if params.language == "" && !shouldSkipPath(path) {
                     addFileMarkers(info.Name().Lower())
                 }
@@ -773,16 +795,15 @@ if authConfig != nil && authConfig != undefined {
     }
 }
 
-// 添加增量编译配置
+// 添加增量编译配置（基础程序默认自动按上一次编译的程序解析；显式指定 base-program-name 时以用户为准）
+// re_compile 仅随配置静默透传，不影响增量编译
 if enableIncrementalCompile {
-    // 启用增量编译时，JSON 中勾选重新编译（与 SSA 项目编译 逻辑一致）
-    options = append(options, ssa.withEnableIncrementalCompile(true), ssa.withReCompile(true))
-    // 如果提供了基础程序名称，设置基础程序名称
+    options = append(options, ssa.withEnableIncrementalCompile(true))
     if baseProgramName != "" {
         options = append(options, ssa.withBaseProgramName(baseProgramName))
         yakit.Info("已启用增量编译，基础程序: %s", baseProgramName)
     } else {
-        yakit.Info("已启用增量编译（第一次编译，将作为基础程序）")
+        yakit.Info("已启用增量编译（基础程序将自动按上一次编译的程序解析）")
     }
 }
 

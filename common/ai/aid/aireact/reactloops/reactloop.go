@@ -12,6 +12,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiskillloader"
+	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops/asyncexecmanager"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/schema"
@@ -62,6 +63,8 @@ type ActionRecord struct {
 }
 
 type ReActLoop struct {
+	actionRegistrationErr error
+
 	// planStatusProvider reads owner-managed PLAN state for Timeline Open.
 	planStatusProvider func() string
 	invoker            aicommon.AIInvokeRuntime
@@ -87,7 +90,6 @@ type ReActLoop struct {
 	allowAIForge       func() bool
 	allowPlanAndExec   func() bool
 	planExecActionType string
-	allowRAG           func() bool
 	allowToolCall      func() bool
 	allowUserInteract  func() bool
 
@@ -111,6 +113,25 @@ type ReActLoop struct {
 	// execution state
 	taskMutex   *sync.Mutex
 	currentTask aicommon.AIStatefulTask
+	// promptMode is the prompt mode of the current iteration. It is set when the
+	// prompt is built and stays until the next prompt replaces it.
+	promptMode               aicommon.LoopPromptMode
+	requestTimelineThroughID *int64
+	requestTimelineItemIDs   []int64
+	// lastFittingTimelineThroughID is the boundary of the latest prompt the
+	// provider accepted. Overflow compression rebuilds only through this ID.
+	lastFittingTimelineThroughID *int64
+
+	// Task-local model projection. Never persist full UI definitions in history.
+	uiComponentsMu sync.Mutex
+	uiComponents   *uiComponentView
+
+	// Lazily bound to the owning task; guarded by onReleaseMutex.
+	// Direct calls and individual batch children can dispatch asynchronously.
+	asyncExecutionManager      *asyncexecmanager.Manager
+	asyncDirectAnswer          chan struct{}
+	asyncDirectAnswerRequested bool
+	asyncDirectAnswerHandled   bool
 
 	// memory management
 	memorySizeLimit        int
@@ -152,6 +173,10 @@ type ReActLoop struct {
 	// Invocation-local verifier results belong to the loop, never Action data.
 	actionExecutionMu     sync.Mutex
 	actionExecutionValues map[*aicommon.Action]map[string]any
+
+	// recoverableFailureMu 保护模型输出错误或 Action 执行错误的自愈预算。
+	recoverableFailureMu sync.Mutex
+	recoverableFailures  map[string]int
 
 	// modelThinkingBuf holds reason-stream deltas for the in-flight AI transaction;
 	// flushed into the timeline iteration line above the action summary.
@@ -219,7 +244,7 @@ type ReActLoop struct {
 	observationInflight sync.WaitGroup
 
 	// Init handler action constraints
-	// These are set by the init handler and cleared after first iteration
+	// These remain active through rendering, retries and compression until a business action is dispatched.
 	initActionMustUse  []string // Actions that MUST be used (set by init)
 	initActionDisabled []string // Actions that are DISABLED (set by init)
 	initActionApplied  bool     // Whether the init constraints have been applied
@@ -270,11 +295,15 @@ type ReActLoop struct {
 	subAgentShutdown         sync.Once
 	// Parent-loop-thread-only delivery/decision cursors.
 	subAgentModelSeen         uint64
+	subAgentEvidenceSeen      uint64
 	subAgentCommitted         uint64
 	subAgentAnswerSeen        uint64
 	subAgentControlRounds     int
 	subAgentControlIterations int
 	subAgentControlRevision   uint64
+	// Only the explicit save_evidence action invokes this publisher. Private
+	// evidence mutations and child Timeline entries retain their isolation.
+	saveEvidencePublisher func(aicommon.EvidenceOperation) error
 
 	// functionCallMode selects per-action function-call schema tags when
 	// generateLoopPrompt assembles the prompt. Provider projection and response
@@ -323,6 +352,7 @@ func (r *ReActLoop) Release() {
 	if r == nil {
 		return
 	}
+	r.clearUIComponents()
 	r.shutdownSubAgents()
 	r.onReleaseMutex.Lock()
 	if r.released {
@@ -330,8 +360,12 @@ func (r *ReActLoop) Release() {
 		return
 	}
 	r.released = true
+	manager := r.asyncExecutionManager
 	hooks := append([]func(){}, r.onRelease...)
 	r.onReleaseMutex.Unlock()
+	if manager != nil {
+		manager.Close()
+	}
 	defer func() {
 		r.actionExecutionMu.Lock()
 		defer r.actionExecutionMu.Unlock()
@@ -352,7 +386,7 @@ func (r *ReActLoop) Release() {
 
 // WaitForInflightObservation 等待所有异步 prompt observation 构建 goroutine
 // 完成. 主循环不应调用 (会破坏 fire-and-forget 语义); 仅用于测试在
-// generateLoopPrompt 返回后断言 observation 字段.
+// publishPromptObservation 提交后断言 observation 字段.
 // 关键词: 异步 observation join, 测试可观测
 func (r *ReActLoop) WaitForInflightObservation() {
 	if r == nil {
@@ -366,8 +400,6 @@ func (r *ReActLoop) PushSatisfactionRecord(satisfactory bool, reason string) {
 		Satisfactory: satisfactory,
 		Reason:       reason,
 	})
-	// 价值评估额外触发: verification 满意度裁决是关键的客观结局信号.
-	r.submitValueFeedbackSignal(aicommon.ValueFeedbackTriggerVerification)
 }
 
 // PushSatisfactionRecordWithCompletedTaskIndex records verification output;
@@ -383,8 +415,6 @@ func (r *ReActLoop) PushSatisfactionRecordWithCompletedTaskIndex(satisfactory bo
 		record.EvidenceOps = evidenceOps[0]
 	}
 	r.historySatisfactionReasons = append(r.historySatisfactionReasons, record)
-	// 价值评估额外触发: verification 满意度裁决是关键的客观结局信号.
-	r.submitValueFeedbackSignal(aicommon.ValueFeedbackTriggerVerification)
 }
 
 func (r *ReActLoop) GetLastSatisfactionRecord() (bool, string) {
@@ -444,12 +474,16 @@ func (r *ReActLoop) getRenderValues() (string, map[string]any, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	if r.allowUserInteract != nil && r.allowUserInteract() {
-		info["AllowAskForClarification"] = true
-	} else {
-		info["AllowAskForClarification"] = false
+	info["AllowAskForClarification"] = r.CheckClarificationAllowed(false) == nil
+	info["AllowBlockingClarification"] = r.CheckClarificationAllowed(true) == nil
+	if cfg, ok := r.GetConfig().(*aicommon.Config); ok {
+		info["StructuredQuestions"] = cfg.UIQuestionsEnabled()
+		info["AllowAskForClarification"] = r.CheckClarificationAllowed(true) == nil || (cfg.UIQuestionsEnabled() && r.CheckClarificationAllowed(false) == nil)
+		info["AskForClarificationCurrentTime"], info["AskForClarificationMaxTimes"] = cfg.ClarificationUsage(r.clarificationTaskID())
+		if catalog := cfg.UICatalog(); len(catalog.Components) > 0 {
+			info["UIComponentIndex"] = catalog.PromptIndex()
+		}
 	}
-	info["AskForClarificationCurrentTime"] = r.GetInt("ask_for_clarification_call_count")
 
 	allowPlanRaw, ok := info["AllowPlan"]
 	if ok && utils.InterfaceToBoolean(allowPlanRaw) {
@@ -463,11 +497,7 @@ func (r *ReActLoop) getRenderValues() (string, map[string]any, error) {
 		}
 	}
 
-	if r.allowRAG != nil && r.allowRAG() {
-		info["AllowKnowledgeEnhanceAnswer"] = true
-	} else {
-		info["AllowKnowledgeEnhanceAnswer"] = false
-	}
+	info["AllowKnowledgeEnhanceAnswer"] = true // Legacy template key; retrieval uses Skill-guided tools.
 
 	if r.allowToolCall != nil && !r.allowToolCall() { // default allow tool call
 		info["AllowToolCall"] = false
@@ -515,6 +545,9 @@ func (r *ReActLoop) SetCurrentTask(t aicommon.AIStatefulTask) {
 	r.ensureTaskMutex()
 	r.taskMutex.Lock()
 	defer r.taskMutex.Unlock()
+	if r.currentTask == nil || r.currentTask.GetId() != t.GetId() {
+		r.clearUIComponents()
+	}
 	r.currentTask = t
 	t.SetReActLoop(r)
 	// Also set on invoker to keep task state centralized
@@ -666,6 +699,8 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 	config := invoker.GetConfig()
 
 	r := &ReActLoop{
+		useFunctionCallActionVariants: true,
+
 		invoker:                      invoker,
 		loopName:                     name,
 		config:                       config,
@@ -695,6 +730,8 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		loopAction_DirectlyAnswer,
 		loopAction_Finish,
 		loopAction_SaveEvidence,
+		loopAction_CompressContext,
+		loopAction_ManageAsyncExecutionRuntime,
 	} {
 		r.actions.Set(action.ActionType, withNativeActionDescription(action))
 	}
@@ -717,18 +754,15 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 	for _, opt := range options {
 		opt(r)
 	}
+	if r.actionRegistrationErr != nil {
+		return nil, r.actionRegistrationErr
+	}
 	if r.functionCallMode {
 		if r.actions.Have(nativeAdjustTodolistActionName) || r.loopActions.Have(nativeAdjustTodolistActionName) {
 			return nil, utils.Errorf("native action %q conflicts with an existing loop action", nativeAdjustTodolistActionName)
 		}
 		r.actions.Set(nativeAdjustTodolistActionName, loopAction_AdjustTodolistNative)
 	}
-
-	// 自动注入价值评估埋点 (默认开启, 暂无关闭开关). 该钩子在每轮结束
-	// (iteration_end) 与整循环结束 (loop_end) 组装 ValueFeedbackRecord 并经
-	// aicommon 注册缝交给 aive; 全程非阻塞 + recover, 不影响主循环.
-	// 关键词: 价值评估埋点注入, onPostIteration, SubmitValueFeedback
-	r.onPostIteration = append(r.onPostIteration, buildValueFeedbackPostIteration())
 
 	// Config-level perception disable (e.g. test environments via WithDisablePerception)
 	if config.GetConfigBool("DisablePerception") {
@@ -737,6 +771,16 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 
 	// Auto-register perception context provider (nil-safe, skips if perception disabled)
 	r.RegisterPerceptionContextProvider()
+
+	// Options 提供的 manager 先绑定, 再由初始化入口明确执行默认加载。
+	if r.skillsContextManager != nil {
+		if realConfig, ok := config.(*aicommon.Config); ok {
+			bindSkillsManagerToTimeline(r.skillsContextManager, realConfig)
+			if !realConfig.InitStatus.IsPersistentSessionRestored() {
+				r.skillsContextManager.LoadDefaultSkills()
+			}
+		}
+	}
 
 	// Auto-apply skillLoader from config if not already set via options
 	// This allows users to configure skills via aicommon.WithSkillsLocalDir etc.
@@ -751,6 +795,11 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 				r.allowSkillViewOffset = func() bool {
 					return mgr.HasTruncatedViews()
 				}
+				// 绑定只接入当前 Timeline; 默认加载是独立的初始化操作。
+				bindSkillsManagerToTimeline(mgr, realConfig)
+				if !realConfig.InitStatus.IsPersistentSessionRestored() {
+					mgr.LoadDefaultSkills()
+				}
 
 				// Restore previously loaded skills from persistent session
 				if realConfig.InitStatus.IsPersistentSessionRestored() {
@@ -760,8 +809,8 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 				}
 
 				// Load user-specified skills from EnabledCapabilities (AIStartParams).
-				// 这些是用户主动指定的, 作为「用户强制加载」走 frozen_block 顶部 (满内容, 最高优先级),
-				// 与 persistent session 恢复 (走 SKILLS_CONTEXT) 区分开.
+				// 这些是用户主动指定的, 只把加载来源标记为 user-forced;
+				// 展示位置与其它来源一致 (冻结后进入同一个技能块).
 				if names := realConfig.GetEnabledSkillNames(); len(names) > 0 {
 					loadConfiguredForcedSkills(mgr, names, "enabled capabilities")
 				}
@@ -808,19 +857,16 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		}
 	}
 
+	if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_SEARCH_CAPABILITIES); !ok {
+		if searchCap := optionalRegisteredLoopAction(schema.AI_REACT_LOOP_ACTION_SEARCH_CAPABILITIES, "optional capability discovery"); searchCap != nil {
+			r.actions.Set(searchCap.ActionType, searchCap)
+		}
+	}
+
 	if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_LOAD_CAPABILITY); !ok {
 		if loadCap := optionalRegisteredLoopAction(schema.AI_REACT_LOOP_ACTION_LOAD_CAPABILITY, "optional capability discovery"); loadCap != nil {
 			r.actions.Set(loadCap.ActionType, loadCap)
 		}
-	}
-
-	if r.allowRAG == nil || r.allowRAG() {
-		// allow tool call, must have tools
-		ins, err := requireRegisteredLoopAction(schema.AI_REACT_LOOP_ACTION_KNOWLEDGE_ENHANCE, "knowledge enhancement enabled")
-		if err != nil {
-			return nil, err
-		}
-		r.actions.Set(ins.ActionType, ins)
 	}
 
 	if r.allowAIForge == nil || r.allowAIForge() {
@@ -848,10 +894,30 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		if err != nil {
 			return nil, err
 		}
+		if cfg, ok := r.GetConfig().(*aicommon.Config); ok && cfg.UIQuestionsEnabled() {
+			if ac.ClientQuestionsAction != nil {
+				ac = ac.ClientQuestionsAction
+			}
+			async, err := requireRegisteredLoopAction("ask_for_clarification_async", "structured user interaction enabled")
+			if err != nil {
+				return nil, err
+			}
+			r.actions.Set(async.ActionType, async)
+		}
 		r.actions.Set(ac.ActionType, ac)
 	}
 
-	// Register skills actions conditionally
+	// UI schemas are loaded on demand; the complete catalog remains in Config.
+	if cfg, ok := r.GetConfig().(*aicommon.Config); ok && len(cfg.UICatalog().Components) > 0 {
+		for _, name := range []string{"load_ui_components", "search_ui_components", "render_ui"} {
+			action, err := requireRegisteredLoopAction(name, "client UI catalog available")
+			if err != nil {
+				return nil, err
+			}
+			r.actions.Set(action.ActionType, action)
+		}
+	}
+
 	if r.skillsContextManager != nil {
 		if r.allowSkillLoading == nil || r.allowSkillLoading() {
 			loadSkill, err := requireRegisteredLoopAction(schema.AI_REACT_LOOP_ACTION_LOADING_SKILLS, "registered skills are available")
@@ -874,28 +940,24 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		}
 	}
 
-	if IsMCPServersAllowed(invoker) {
-		if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_SERVERS); !ok {
-			queryMCPServers, err := requireRegisteredLoopAction(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_SERVERS, "MCP servers enabled")
-			if err != nil {
-				return nil, err
-			}
-			r.actions.Set(queryMCPServers.ActionType, queryMCPServers)
-		}
-		if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_TOOLS); !ok {
-			queryMCPTools, err := requireRegisteredLoopAction(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_TOOLS, "MCP servers enabled")
-			if err != nil {
-				return nil, err
-			}
-			r.actions.Set(queryMCPTools.ActionType, queryMCPTools)
-		}
-	}
+	// MCP discovery and management use require_tool and embedded Yak tools.
 
 	if r.emitter == nil {
 		return nil, utils.Error("loop's emitter is nil in ReActLoop")
 	}
 
 	return r, nil
+}
+
+// bindSkillsManagerToTimeline 把 SkillsContextManager 绑定到 config 的 Timeline。
+// 只切换绑定, 不向目标 Timeline 导入 manager 的本地缓存。
+func bindSkillsManagerToTimeline(mgr *aiskillloader.SkillsContextManager, config *aicommon.Config) {
+	if mgr == nil || config == nil || config.GetTimeline() == nil {
+		return
+	}
+	if sink := aicommon.NewSkillContentTimelineAdapter(config.GetTimeline(), config.AcquireId); sink != nil {
+		mgr.BindTimelineSink(sink)
+	}
 }
 
 func (r *ReActLoop) Delete(key string) {
@@ -942,8 +1004,8 @@ func (r *ReActLoop) GetInt(k string) int {
 
 // SubAgentDepthLoopVar is the loop variable recording how deep the current
 // ReAct loop is in the sub-agent dispatch tree. The top-level loop leaves it
-// unset (depth 0); every forked sub agent sets it to 1 (see
-// loopinfra.buildSubReactLoopOptions). It is read by IsSubAgent and the
+// unset (depth 0); the common child pipeline sets it even for custom builders.
+// It is read by IsSubAgent, evidence publication and the
 // goal-mode gate to ensure top-level-only strategies never apply to sub agents.
 const SubAgentDepthLoopVar = "sub_agent_depth"
 
@@ -988,7 +1050,7 @@ func (r *ReActLoop) FinishAsyncTask(t aicommon.AIStatefulTask, err error) {
 }
 
 func (r *ReActLoop) GetActionHandler(actionName string) (*LoopAction, error) {
-	if !aicommon.IsReActActionAllowed(r.GetConfig(), r.loopName, actionName) {
+	if !r.actionAllowed(actionName) {
 		return nil, utils.Errorf("action[%s] denied by runtime policy", actionName)
 	}
 	ac, ok := r.actions.Get(actionName)
@@ -1009,12 +1071,12 @@ func (r *ReActLoop) GetActionHandler(actionName string) (*LoopAction, error) {
 func (r *ReActLoop) GetAllActionNames() []string {
 	var actionNames []string
 	for _, name := range r.actions.Keys() {
-		if aicommon.IsReActActionAllowed(r.GetConfig(), r.loopName, name) {
+		if r.actionAllowed(name) {
 			actionNames = append(actionNames, name)
 		}
 	}
 	for _, actionName := range r.loopActions.Keys() {
-		if !r.actions.Have(actionName) && aicommon.IsReActActionAllowed(r.GetConfig(), r.loopName, actionName) {
+		if !r.actions.Have(actionName) && r.actionAllowed(actionName) {
 			actionNames = append(actionNames, actionName)
 		}
 	}
@@ -1028,12 +1090,12 @@ func (r *ReActLoop) NoActions() bool {
 func (r *ReActLoop) GetAllActions() []*LoopAction {
 	var actions []*LoopAction
 	for _, action := range r.actions.Values() {
-		if aicommon.IsReActActionAllowed(r.GetConfig(), r.loopName, action.ActionType) {
+		if r.actionAllowed(action.ActionType) {
 			actions = append(actions, r.actionForProtocol(action))
 		}
 	}
 	for _, actionName := range r.loopActions.Keys() {
-		if r.actions.Have(actionName) || !aicommon.IsReActActionAllowed(r.GetConfig(), r.loopName, actionName) {
+		if r.actions.Have(actionName) || !r.actionAllowed(actionName) {
 			continue
 		}
 		actionFac, ok := r.loopActions.Get(actionName)
@@ -1152,6 +1214,22 @@ func loadConfiguredSkills(mgr *aiskillloader.SkillsContextManager, names []strin
 	if mgr == nil || len(names) == 0 {
 		return
 	}
+	// 持久会话恢复的是一份技能名单, 不是正文。若本 Timeline 已经记录过该技能
+	// (例如正文已被显式移除), 不能按旧名单把它重新完整展开; 只有真正没有
+	// 历史记录的技能才允许导入。
+	if source == "persistent session" {
+		filtered := make([]string, 0, len(names))
+		for _, name := range names {
+			if mgr.HasSkillContentHistory(name) {
+				continue
+			}
+			filtered = append(filtered, name)
+		}
+		names = filtered
+		if len(names) == 0 {
+			return
+		}
+	}
 	results := mgr.LoadSkills(names)
 	var loaded, failed []string
 	for name, err := range results {
@@ -1170,11 +1248,11 @@ func loadConfiguredSkills(mgr *aiskillloader.SkillsContextManager, names []strin
 	}
 }
 
-// loadConfiguredForcedSkills 把用户 EnabledCapabilities 来源的 skill 作为「用户强制加载」
-// 走 LoadForcedSkill (满内容 → frozen_block 顶部, 最高优先级). 这与 persistent session
-// 恢复 (走 LoadSkill → SKILLS_CONTEXT) 区分开, 是「用户主动指定」语义.
+// loadConfiguredForcedSkills 把用户 EnabledCapabilities 来源的 skill 走
+// LoadForcedSkill, 只把加载来源标记为 user-forced (供压缩提示与观测使用);
+// 正文展示位置与其它来源一致, 冻结后进入同一个技能块.
 //
-// 关键词: loadConfiguredForcedSkills, EnabledCapabilities → forced, frozen_block
+// 关键词: loadConfiguredForcedSkills, EnabledCapabilities → user-forced 来源
 func loadConfiguredForcedSkills(mgr *aiskillloader.SkillsContextManager, names []string, source string) {
 	if mgr == nil || len(names) == 0 {
 		return

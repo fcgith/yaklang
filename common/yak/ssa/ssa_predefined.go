@@ -9,15 +9,16 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/utils/omap"
-	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
-	"golang.org/x/exp/slices"
 )
 
 type anInstruction struct {
-	fun   *Function
-	prog  *Program
-	block *BasicBlock
-	R     *memedit.Range
+	// The concrete owner lets a mutation requeue an instruction even after its
+	// clean cache entry was released. This self-cycle is collectible by GC.
+	persistState any
+	fun          *Function
+	prog         *Program
+	block        *BasicBlock
+	R            *memedit.Range
 	// scope *Scope
 
 	name        string
@@ -32,6 +33,14 @@ type anInstruction struct {
 	isAnnotation bool
 	isExtern     bool
 	isFromDB     bool
+
+	// Set by EmitDefer. The AOT compiler arms a stack slot at this program
+	// point and runs the deferred instruction only when the slot is set.
+	// An SSA value cannot record that the surrounding block actually ran:
+	// a constant is folded, and the defer block does not see a phi for it.
+	deferGuarded    bool
+	deferGuardBlock int64
+	deferGuardAfter int64
 
 	// str               string
 	// readableName      string
@@ -69,6 +78,26 @@ func (v *anInstruction) GetSourceCodeContext(n int) string {
 		return ""
 	}
 	return r.GetTextContext(n)
+}
+
+// MarkDeferGuard records the block that executed the defer statement and the
+// instruction already in that block after which the defer becomes active.
+// afterInst is 0 when the defer is the first instruction of the block.
+func (i *anInstruction) MarkDeferGuard(blockID, afterInst int64) {
+	if i == nil || blockID <= 0 {
+		return
+	}
+	i.deferGuarded = true
+	i.deferGuardBlock = blockID
+	i.deferGuardAfter = afterInst
+}
+
+// DeferGuard reports where a deferred instruction was registered.
+func (i *anInstruction) DeferGuard() (blockID, afterInst int64, ok bool) {
+	if i == nil || !i.deferGuarded || i.deferGuardBlock <= 0 {
+		return 0, 0, false
+	}
+	return i.deferGuardBlock, i.deferGuardAfter, true
 }
 
 func (i *anInstruction) IsUndefined() bool {
@@ -145,6 +174,7 @@ func (i *anInstruction) GetShortVerboseName() string {
 }
 
 func (i *anInstruction) SetVerboseName(verbose string) {
+	defer i.markPersistenceDirty()
 	i.verboseName = verbose
 }
 
@@ -156,6 +186,7 @@ func NewInstruction() *anInstruction {
 
 // ssa function and block
 func (a *anInstruction) SetFunc(f *Function) {
+	defer a.markPersistenceDirty()
 	a.fun = f
 	if f != nil {
 		a.prog = f.GetProgram()
@@ -229,6 +260,7 @@ func (a *anInstruction) SetProgram(prog *Program) {
 }
 
 func (a *anInstruction) SetIsAnnotation(b bool) {
+	defer a.markPersistenceDirty()
 	a.isAnnotation = b
 }
 func (v *anInstruction) IsSupportConstMethod() bool {
@@ -244,6 +276,7 @@ func (a *anInstruction) IsAnnotation() bool {
 }
 
 func (a *anInstruction) SetBlock(block *BasicBlock) {
+	defer a.markPersistenceDirty()
 	a.block = block
 	if block != nil {
 		a.setLocationIDs(a.funcId, block.GetId())
@@ -289,6 +322,7 @@ func (c *anInstruction) GetRange() *memedit.Range {
 }
 
 func (c *anInstruction) SetRange(pos *memedit.Range) {
+	defer c.markPersistenceDirty()
 	// if c.Pos == nil {
 	c.R = pos
 	// }
@@ -301,8 +335,11 @@ func (c *anInstruction) SetRange(pos *memedit.Range) {
 // 	}
 // }
 
-func (c *anInstruction) IsExtern() bool   { return c.isExtern }
-func (c *anInstruction) SetExtern(b bool) { c.isExtern = b }
+func (c *anInstruction) IsExtern() bool { return c.isExtern }
+func (c *anInstruction) SetExtern(b bool) {
+	c.isExtern = b
+	c.markPersistenceDirty()
+}
 
 // error logger
 func (c *anInstruction) NewError(kind ErrorKind, tag ErrorTag, msg string) {
@@ -315,6 +352,7 @@ func (c *anInstruction) NewError(kind ErrorKind, tag ErrorTag, msg string) {
 
 // variable
 func (a *anInstruction) SetName(v string) {
+	defer a.markPersistenceDirty()
 	if utils.IsNil(a) {
 		return
 	}
@@ -363,10 +401,13 @@ type ownerPairRecord struct {
 }
 
 type anValue struct {
-	*anInstruction
+	// Own the base state in the same allocation. Values must not be copied
+	// after use (relationsMu and sync.Once fields already prohibit copying).
+	anInstruction
 
-	typId    int64
-	userList []int64
+	typId       int64
+	relationsMu sync.Mutex
+	userList    []int64
 
 	memberPairs []memberPairRecord
 	ownerPairs  []ownerPairRecord
@@ -384,6 +425,12 @@ type anValue struct {
 
 	occultation []int64
 
+	// capturedByClosure is set while compiling, when this value is the
+	// current value of a variable a nested function captures. Const folding
+	// reads it so a later callback can still update the variable. It is not
+	// stored: folding happens before the instruction is saved.
+	capturedByClosure bool
+
 	lazySaveType func()
 }
 
@@ -391,230 +438,14 @@ var defaultAnyType = CreateAnyType()
 
 func NewValue() *anValue {
 	ret := &anValue{
-		anInstruction: NewInstruction(),
+		anInstruction: anInstruction{id: -1},
 		typId:         -1,
 	}
 	ret.SetType(defaultAnyType)
 	return ret
 }
 
-func (n *anValue) appendMemberPairIDs(keyID, memberID int64) {
-	if keyID <= 0 || memberID <= 0 {
-		return
-	}
-	pair := memberPairRecord{key: keyID, member: memberID}
-	if len(n.memberPairs) > 0 && n.memberPairs[len(n.memberPairs)-1] == pair {
-		return
-	}
-	n.memberPairs = append(n.memberPairs, pair)
-}
-
-func (n *anValue) appendOwnerPairIDs(objectID, keyID int64) {
-	if objectID <= 0 || keyID <= 0 {
-		return
-	}
-	pair := ownerPairRecord{object: objectID, key: keyID}
-	if len(n.ownerPairs) > 0 && n.ownerPairs[len(n.ownerPairs)-1] == pair {
-		return
-	}
-	for _, existed := range n.ownerPairs {
-		if existed == pair {
-			return
-		}
-	}
-	n.ownerPairs = append(n.ownerPairs, pair)
-}
-
-func (n *anValue) memberPairMatchesKey(pair memberPairRecord, key Value) bool {
-	if key == nil {
-		return false
-	}
-	if pair.key == key.GetId() {
-		return true
-	}
-	pairKey, ok := n.GetValueById(pair.key)
-	if !ok {
-		return false
-	}
-	return sameConstKeyValue(pairKey, key)
-}
-
-func (n *anValue) IsMember() bool {
-	return len(n.ownerPairs) > 0
-}
-
-func (n *anValue) IsObject() bool {
-	return len(n.memberPairs) > 0
-}
-
-func (n *anValue) AddMember(k, v Value) {
-	if k == nil || v == nil {
-		return
-	}
-	n.appendMemberPairIDs(k.GetId(), v.GetId())
-}
-
-func (n *anValue) DeleteMember(k Value) {
-	if k == nil {
-		return
-	}
-	n.memberPairs = slices.DeleteFunc(n.memberPairs, func(pair memberPairRecord) bool {
-		return n.memberPairMatchesKey(pair, k)
-	})
-}
-
-func sameConstKeyValue(lhs, rhs Value) bool {
-	if lhs == nil || rhs == nil {
-		return false
-	}
-	leftConst, leftOK := ToConstInst(lhs)
-	rightConst, rightOK := ToConstInst(rhs)
-	if !leftOK || !rightOK {
-		return false
-	}
-	return fmt.Sprint(leftConst.value) == fmt.Sprint(rightConst.value)
-}
-
-func (n *anValue) AddObjectKeyPair(obj, key Value) {
-	if obj == nil || key == nil {
-		return
-	}
-	n.appendOwnerPairIDs(obj.GetId(), key.GetId())
-}
-
-func (n *anValue) resolveLinkedValue(id int64) (Value, bool) {
-	if id <= 0 {
-		return nil, false
-	}
-	if val, ok := n.GetValueById(id); ok {
-		return val, true
-	}
-	prog := n.GetProgram()
-	if prog == nil {
-		return nil, false
-	}
-	app := prog.GetApplication()
-	if app == nil {
-		app = prog
-	}
-	progName := applicationProgramName(prog)
-	if progName != "" {
-		ir := ssadb.GetIrCodeByIdFast(ssadb.GetDB(), progName, id)
-		if ir != nil && ir.Opcode == int64(SSAOpcodeConstInst) && ir.String != "" {
-			return NewConst(ir.String), true
-		}
-	}
-	cache := n.getProgramCache()
-	if cache != nil {
-		if loaded := cache.GetInstruction(id); loaded != nil {
-			if val, ok := ToValue(loaded); ok {
-				return val, true
-			}
-		}
-	}
-	if inst, err := NewLazyInstruction(app, id); err == nil && inst != nil {
-		if val, ok := ToValue(inst); ok {
-			return val, true
-		}
-	}
-	return nil, false
-}
-
-func (n *anValue) GetObjectKeyPairs() []ObjectKeyPair {
-	ret := make([]ObjectKeyPair, 0, len(n.ownerPairs))
-	for _, pair := range n.ownerPairs {
-		if pair.object <= 0 || pair.key <= 0 {
-			continue
-		}
-		obj, ok1 := n.resolveLinkedValue(pair.object)
-		key, ok2 := n.resolveLinkedValue(pair.key)
-		if !ok1 || !ok2 {
-			continue
-		}
-		ret = append(ret, ObjectKeyPair{Object: obj, Key: key})
-	}
-	return ret
-}
-
-func (n *anValue) GetMembersByExactKey(key Value) []Value {
-	if key == nil {
-		return nil
-	}
-	ret := make([]Value, 0)
-	for index := len(n.memberPairs) - 1; index >= 0; index-- {
-		pair := n.memberPairs[index]
-		if !n.memberPairMatchesKey(pair, key) {
-			continue
-		}
-		member, ok := n.resolveLinkedValue(pair.member)
-		if ok {
-			ret = append(ret, member)
-		}
-	}
-	return ret
-}
-
-func (n *anValue) GetMembersByKeyString(key string) []Value {
-	if key == "" {
-		return nil
-	}
-	ret := make([]Value, 0)
-	for index := len(n.memberPairs) - 1; index >= 0; index-- {
-		pair := n.memberPairs[index]
-		keyVal, ok1 := n.resolveLinkedValue(pair.key)
-		member, ok2 := n.resolveLinkedValue(pair.member)
-		if !ok1 || !ok2 {
-			continue
-		}
-		lit, ok := ToConstInst(keyVal)
-		if !ok || fmt.Sprint(lit.value) != key {
-			continue
-		}
-		ret = append(ret, member)
-	}
-	return ret
-}
-
-func (n *anValue) GetMemberPairs() []MemberPair {
-	ret := make([]MemberPair, 0, len(n.memberPairs))
-	for _, pair := range n.memberPairs {
-		key, ok1 := n.resolveLinkedValue(pair.key)
-		member, ok2 := n.resolveLinkedValue(pair.member)
-		if !ok1 || !ok2 {
-			continue
-		}
-		ret = append(ret, MemberPair{Key: key, Member: member})
-	}
-	return ret
-}
-
 func (n *anValue) String() string { return "" }
-
-// has/get user and value
-func (n *anValue) HasUsers() bool {
-	return n.userList != nil && len(n.userList) != 0
-}
-func (n *anValue) GetUsers() Users {
-	if len(n.userList) == 0 {
-		return nil
-	}
-	return n.GetUsersByIDs(n.userList)
-}
-
-// for Value
-func (n *anValue) AddUser(u User) {
-	id := u.GetId()
-	if index := slices.Index(n.userList, id); index == -1 {
-		n.userList = append(n.userList, id)
-	}
-}
-
-func (n *anValue) RemoveUser(u User) {
-	if len(n.userList) == 0 {
-		return
-	}
-	n.userList = utils.RemoveSliceItem(n.userList, u.GetId())
-}
 
 // for Value : type
 func (n *anValue) GetType() Type {
@@ -637,12 +468,34 @@ func (n *anValue) SetLazySaveType(lazySaveType func()) {
 }
 
 func (n *anValue) LazySaveType() {
+	if pendingType, ok := n.persistState.(Type); ok {
+		if cache := n.getProgramCache(); cache != nil {
+			cache.rememberType(pendingType)
+			n.typId = pendingType.GetId()
+			n.persistState = nil
+		}
+	}
 	if n.lazySaveType != nil {
-		n.lazySaveType()
+		work := n.lazySaveType
+		// Construction-only closures must not keep old type graphs alive.
+		n.lazySaveType = nil
+		work()
 	}
 }
 
+// SetTypeExact stores typ without instantiating a class. Blueprint.Apply builds
+// an instance and can replace the type; a zero or unresolved value must keep
+// the declaration identity it was given.
+func (n *anValue) SetTypeExact(typ Type) {
+	if n == nil || typ == nil {
+		return
+	}
+	defer n.markPersistenceDirty()
+	n.typId = n.cacheType(typ)
+}
+
 func (n *anValue) SetType(typ Type) {
+	defer n.markPersistenceDirty()
 	if typ == nil {
 		return
 	}
@@ -686,13 +539,12 @@ func (n *anValue) cacheType(typ Type) int64 {
 	}
 	if cache := n.getProgramCache(); cache != nil {
 		cache.rememberType(typ)
+		if _, pending := n.persistState.(Type); pending {
+			n.persistState = nil
+		}
 	} else {
-		n.SetLazySaveType(func() {
-			if cache := n.getProgramCache(); cache != nil {
-				cache.rememberType(typ)
-				n.typId = typ.GetId()
-			}
-		})
+		// Defer the type itself without allocating a closure per SSA value.
+		n.persistState = typ
 	}
 	return typ.GetId()
 }
@@ -768,6 +620,7 @@ func (a *anValue) GetAllVariables() map[string]*Variable {
 }
 
 func (a *anValue) AddVariable(v *Variable) {
+	defer a.markPersistenceDirty()
 	if v == nil {
 		return
 	}
@@ -798,6 +651,7 @@ func (i *anValue) getMaskMap(create ...bool) *omap.OrderedMap[int64, int64] {
 }
 
 func (i *anValue) AddMask(v Value) {
+	defer i.markPersistenceDirty()
 	id := v.GetId()
 	i.getMaskMap(true).Set(id, id)
 }
@@ -819,6 +673,7 @@ func (i *anValue) Masked() bool {
 }
 
 func (i *anValue) SetReference(v Value) {
+	defer i.markPersistenceDirty()
 	i.reference = v.GetId()
 }
 
@@ -828,6 +683,7 @@ func (i *anValue) GetReference() Value {
 }
 
 func (i *anValue) AddPointer(v Value) {
+	defer i.markPersistenceDirty()
 	i.pointer = append(i.pointer, v.GetId())
 }
 
@@ -836,6 +692,7 @@ func (i *anValue) GetPointer() Values {
 }
 
 func (i *anValue) AddOccultation(p Value) {
+	defer i.markPersistenceDirty()
 	i.occultation = append(i.occultation, p.GetId())
 }
 

@@ -107,6 +107,7 @@ const (
 	Yak_QueryHistoryHTTPFuzzerTask_FullMethodName                 = "/ypb.Yak/QueryHistoryHTTPFuzzerTask"
 	Yak_QueryHistoryHTTPFuzzerTaskEx_FullMethodName               = "/ypb.Yak/QueryHistoryHTTPFuzzerTaskEx"
 	Yak_DeleteHistoryHTTPFuzzerTask_FullMethodName                = "/ypb.Yak/DeleteHistoryHTTPFuzzerTask"
+	Yak_FetchHTTPPreviewResource_FullMethodName                   = "/ypb.Yak/FetchHTTPPreviewResource"
 	Yak_HTTPFuzzer_FullMethodName                                 = "/ypb.Yak/HTTPFuzzer"
 	Yak_HTTPFuzzerSequence_FullMethodName                         = "/ypb.Yak/HTTPFuzzerSequence"
 	Yak_HTTPFuzzerGroup_FullMethodName                            = "/ypb.Yak/HTTPFuzzerGroup"
@@ -684,6 +685,7 @@ const (
 	Yak_SetContextMenuActionBinding_FullMethodName                = "/ypb.Yak/SetContextMenuActionBinding"
 	Yak_ExecuteContextMenuAction_FullMethodName                   = "/ypb.Yak/ExecuteContextMenuAction"
 	Yak_UploadToTemporaryFile_FullMethodName                      = "/ypb.Yak/UploadToTemporaryFile"
+	Yak_GetAISessionCurrentResources_FullMethodName               = "/ypb.Yak/GetAISessionCurrentResources"
 )
 
 // YakClient is the client API for Yak service.
@@ -796,6 +798,7 @@ type YakClient interface {
 	QueryHistoryHTTPFuzzerTask(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*HistoryHTTPFuzzerTasks, error)
 	QueryHistoryHTTPFuzzerTaskEx(ctx context.Context, in *QueryHistoryHTTPFuzzerTaskExParams, opts ...grpc.CallOption) (*HistoryHTTPFuzzerTasksResponse, error)
 	DeleteHistoryHTTPFuzzerTask(ctx context.Context, in *DeleteHistoryHTTPFuzzerTaskRequest, opts ...grpc.CallOption) (*Empty, error)
+	FetchHTTPPreviewResource(ctx context.Context, in *HTTPPreviewResourceRequest, opts ...grpc.CallOption) (*HTTPPreviewResourceResponse, error)
 	HTTPFuzzer(ctx context.Context, in *FuzzerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FuzzerResponse], error)
 	HTTPFuzzerSequence(ctx context.Context, in *FuzzerRequests, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FuzzerSequenceResponse], error)
 	HTTPFuzzerGroup(ctx context.Context, in *GroupHTTPFuzzerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GroupHTTPFuzzerResponse], error)
@@ -1539,6 +1542,8 @@ type YakClient interface {
 	// filesystem. Returned paths are engine paths and can be used by file
 	// Fuzztags in both local and remote-engine modes.
 	UploadToTemporaryFile(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadToTemporaryFileRequest, UploadToTemporaryFileResponse], error)
+	// AI session resource snapshot query.
+	GetAISessionCurrentResources(ctx context.Context, in *GetAISessionCurrentResourcesRequest, opts ...grpc.CallOption) (*GetAISessionCurrentResourcesResponse, error)
 }
 
 type yakClient struct {
@@ -2579,6 +2584,16 @@ func (c *yakClient) DeleteHistoryHTTPFuzzerTask(ctx context.Context, in *DeleteH
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Empty)
 	err := c.cc.Invoke(ctx, Yak_DeleteHistoryHTTPFuzzerTask_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *yakClient) FetchHTTPPreviewResource(ctx context.Context, in *HTTPPreviewResourceRequest, opts ...grpc.CallOption) (*HTTPPreviewResourceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HTTPPreviewResourceResponse)
+	err := c.cc.Invoke(ctx, Yak_FetchHTTPPreviewResource_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -9207,6 +9222,16 @@ func (c *yakClient) UploadToTemporaryFile(ctx context.Context, opts ...grpc.Call
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Yak_UploadToTemporaryFileClient = grpc.ClientStreamingClient[UploadToTemporaryFileRequest, UploadToTemporaryFileResponse]
 
+func (c *yakClient) GetAISessionCurrentResources(ctx context.Context, in *GetAISessionCurrentResourcesRequest, opts ...grpc.CallOption) (*GetAISessionCurrentResourcesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetAISessionCurrentResourcesResponse)
+	err := c.cc.Invoke(ctx, Yak_GetAISessionCurrentResources_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // YakServer is the server API for Yak service.
 // All implementations must embed UnimplementedYakServer
 // for forward compatibility.
@@ -9317,6 +9342,7 @@ type YakServer interface {
 	QueryHistoryHTTPFuzzerTask(context.Context, *Empty) (*HistoryHTTPFuzzerTasks, error)
 	QueryHistoryHTTPFuzzerTaskEx(context.Context, *QueryHistoryHTTPFuzzerTaskExParams) (*HistoryHTTPFuzzerTasksResponse, error)
 	DeleteHistoryHTTPFuzzerTask(context.Context, *DeleteHistoryHTTPFuzzerTaskRequest) (*Empty, error)
+	FetchHTTPPreviewResource(context.Context, *HTTPPreviewResourceRequest) (*HTTPPreviewResourceResponse, error)
 	HTTPFuzzer(*FuzzerRequest, grpc.ServerStreamingServer[FuzzerResponse]) error
 	HTTPFuzzerSequence(*FuzzerRequests, grpc.ServerStreamingServer[FuzzerSequenceResponse]) error
 	HTTPFuzzerGroup(*GroupHTTPFuzzerRequest, grpc.ServerStreamingServer[GroupHTTPFuzzerResponse]) error
@@ -10060,6 +10086,8 @@ type YakServer interface {
 	// filesystem. Returned paths are engine paths and can be used by file
 	// Fuzztags in both local and remote-engine modes.
 	UploadToTemporaryFile(grpc.ClientStreamingServer[UploadToTemporaryFileRequest, UploadToTemporaryFileResponse]) error
+	// AI session resource snapshot query.
+	GetAISessionCurrentResources(context.Context, *GetAISessionCurrentResourcesRequest) (*GetAISessionCurrentResourcesResponse, error)
 	mustEmbedUnimplementedYakServer()
 }
 
@@ -10333,6 +10361,9 @@ func (UnimplementedYakServer) QueryHistoryHTTPFuzzerTaskEx(context.Context, *Que
 }
 func (UnimplementedYakServer) DeleteHistoryHTTPFuzzerTask(context.Context, *DeleteHistoryHTTPFuzzerTaskRequest) (*Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteHistoryHTTPFuzzerTask not implemented")
+}
+func (UnimplementedYakServer) FetchHTTPPreviewResource(context.Context, *HTTPPreviewResourceRequest) (*HTTPPreviewResourceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FetchHTTPPreviewResource not implemented")
 }
 func (UnimplementedYakServer) HTTPFuzzer(*FuzzerRequest, grpc.ServerStreamingServer[FuzzerResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method HTTPFuzzer not implemented")
@@ -12065,6 +12096,9 @@ func (UnimplementedYakServer) ExecuteContextMenuAction(*ExecuteContextMenuAction
 func (UnimplementedYakServer) UploadToTemporaryFile(grpc.ClientStreamingServer[UploadToTemporaryFileRequest, UploadToTemporaryFileResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method UploadToTemporaryFile not implemented")
 }
+func (UnimplementedYakServer) GetAISessionCurrentResources(context.Context, *GetAISessionCurrentResourcesRequest) (*GetAISessionCurrentResourcesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetAISessionCurrentResources not implemented")
+}
 func (UnimplementedYakServer) mustEmbedUnimplementedYakServer() {}
 func (UnimplementedYakServer) testEmbeddedByValue()             {}
 
@@ -13510,6 +13544,24 @@ func _Yak_DeleteHistoryHTTPFuzzerTask_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(YakServer).DeleteHistoryHTTPFuzzerTask(ctx, req.(*DeleteHistoryHTTPFuzzerTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Yak_FetchHTTPPreviewResource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HTTPPreviewResourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(YakServer).FetchHTTPPreviewResource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Yak_FetchHTTPPreviewResource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(YakServer).FetchHTTPPreviewResource(ctx, req.(*HTTPPreviewResourceRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -23116,6 +23168,24 @@ func _Yak_UploadToTemporaryFile_Handler(srv interface{}, stream grpc.ServerStrea
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Yak_UploadToTemporaryFileServer = grpc.ClientStreamingServer[UploadToTemporaryFileRequest, UploadToTemporaryFileResponse]
 
+func _Yak_GetAISessionCurrentResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAISessionCurrentResourcesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(YakServer).GetAISessionCurrentResources(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Yak_GetAISessionCurrentResources_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(YakServer).GetAISessionCurrentResources(ctx, req.(*GetAISessionCurrentResourcesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Yak_ServiceDesc is the grpc.ServiceDesc for Yak service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -23394,6 +23464,10 @@ var Yak_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteHistoryHTTPFuzzerTask",
 			Handler:    _Yak_DeleteHistoryHTTPFuzzerTask_Handler,
+		},
+		{
+			MethodName: "FetchHTTPPreviewResource",
+			Handler:    _Yak_FetchHTTPPreviewResource_Handler,
 		},
 		{
 			MethodName: "PreloadHTTPFuzzerParams",
@@ -25286,6 +25360,10 @@ var Yak_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetContextMenuActionBinding",
 			Handler:    _Yak_SetContextMenuActionBinding_Handler,
+		},
+		{
+			MethodName: "GetAISessionCurrentResources",
+			Handler:    _Yak_GetAISessionCurrentResources_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

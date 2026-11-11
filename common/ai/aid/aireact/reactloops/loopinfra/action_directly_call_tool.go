@@ -268,7 +268,7 @@ func directlyCallParamKeys(params aitool.InvokeParams) []string {
 var loopAction_directlyCallTool = &reactloops.LoopAction{
 	FunctionCallAction: nativeDirectToolAction,
 	ActionType:         schema.AI_REACT_LOOP_ACTION_DIRECTLY_CALL_TOOL,
-	Description: "直接调用已启用且参数完整的工具，跳过申请和参数生成阶段。默认使用 directly_call_tool_name 和 directly_call_tool_params 的单调用形式。" +
+	Description: "直接使用当前 action 提供的参数调用已启用工具，不额外请求模型生成参数。默认使用 directly_call_tool_name 和 directly_call_tool_params 的单调用形式。" +
 		"仅当存在 2-8 个低风险、互不依赖、互不干扰，且每层参数都已从真实 Schema 确定的调用时，才可用 directly_call_tool_params_group 并发；" +
 		"优先使用 CACHE_TOOL_CALL 中已展示参数 Schema 的工具；已启用但未缓存的工具仍可解析并产生告警。" +
 		"缺少参数 Schema 时先用 require_tool 加载，再构造完整参数显式执行；严禁混用单调用和批量字段，也不要为了凑数量发明调用。",
@@ -280,6 +280,9 @@ var loopAction_directlyCallTool = &reactloops.LoopAction{
 		aitool.WithRawParam("directly_call_tool_params", map[string]any{
 			"type": []string{"object", "string"},
 		}, aitool.WithParam_Description(`选择单调用形式时填写；存在 directly_call_tool_params_group 时必须省略。优先使用 JSON object 提供该工具的完整参数；为兼容旧协议仍接受包含 JSON object 的字符串。参数结构必须符合 CACHE_TOOL_CALL 中该工具的 Params Schema。`)),
+		aitool.WithBoolParam("async_directly_call_tool",
+			aitool.WithParam_Default(false),
+			aitool.WithParam_Description("可选的单调用异步标记，省略时遵循工具默认策略；显式 false 同步等待，true 提交后台执行并返回 execute_id，通过 manage_async_execution_runtime 查看或等待结果。批量调用使用每项 async，可混合同步和异步。")),
 		aitool.WithStringParam(
 			"directly_call_identifier",
 			aitool.WithParam_Description(`可选。描述调用目的的简短 snake_case 标识，例如 "scan_port_443"、"query_large_file"；用于报告文件命名。`),
@@ -298,6 +301,7 @@ var loopAction_directlyCallTool = &reactloops.LoopAction{
 	ActionVerifier: func(loop *reactloops.ReActLoop, action *aicommon.Action) error {
 		loop.SetActionExecutionValue(action, actionStateDirectToolBatch, nil)
 		loop.SetActionExecutionValue(action, "directly_call_tool_name", nil)
+		loop.SetActionExecutionValue(action, actionStateDirectToolAsync, nil)
 
 		// Keep the established scalar streaming contract. The legacy discriminator
 		// is readable before the root JSON object closes, so a valid one-call action
@@ -382,7 +386,7 @@ var loopAction_directlyCallTool = &reactloops.LoopAction{
 		resolveTool := func(name string) (*aitool.Tool, error) {
 			config := loop.GetConfig()
 
-			if buildinaitools.IsMCPToolName(name) && !aicommon.IsMCPServersAllowedConfig(config) {
+			if buildinaitools.IsMCPRelatedToolName(name) && !aicommon.IsMCPServersAllowedConfig(config) {
 				return nil, utils.Errorf("MCP tools are disabled for this runtime")
 			}
 
@@ -409,10 +413,9 @@ var loopAction_directlyCallTool = &reactloops.LoopAction{
 			return tool, nil
 		}
 
-		// prepare is the loop-layer callback run AFTER the tool-call card has been
-		// created (loading). It reads the streaming action's params (blocking until
-		// they arrive), normalizes/merges/validates them, streams progress, and either
-		// returns finalized params or a validation error; it never generates parameters.
+		// Both scheduling paths use the same normalize/merge/validate callback.
+		// The synchronous caller creates its loading card before running prepare;
+		// async submission fixes the parameters before creating its resource.
 		prepare := func(action *aicommon.Action, name string) (aitool.InvokeParams, bool, *aitool.Tool, error) {
 			emitProgress := func(string) {}
 			finishProgress := func(string) {}
@@ -487,8 +490,31 @@ var loopAction_directlyCallTool = &reactloops.LoopAction{
 			return params, false, tool, nil
 		}
 
-		// DirectlyCallTool emits the card (loading) first, then runs prepare (reads
-		// streaming params), then invokes or reports the validation error.
+		// Scheduling must use a complete action: the optional flag may follow
+		// params, and AI-tag bodies may still be streaming after the JSON object.
+		// The scalar verifier remains streaming; no caller starts on a partial action.
+		if err := action.WaitParseResult(ctx); err != nil {
+			handleToolCallResult(loop, ctx, invoker, toolName, nil, false, err, operator)
+			return
+		}
+		defaultAsync := false
+		if tool, err := loop.GetConfig().GetAiToolManager().GetToolByName(toolName); err == nil && tool != nil {
+			defaultAsync = tool.DefaultAsync
+		}
+		async := directToolActionAsync(action, defaultAsync)
+		loop.SetActionExecutionValue(action, actionStateDirectToolAsync, async)
+		if async {
+			params, _, _, err := prepare(action, toolName)
+			if err != nil {
+				handleToolCallResult(loop, ctx, invoker, toolName, nil, false, err, operator)
+				return
+			}
+			submitAsyncDirectTool(loop, toolName, params, operator,
+				aicommon.WithToolCaller_Reason(resolveToolCallReason(action, "directly_call_reason")),
+				aicommon.WithToolCaller_OmitResultParamsInTimeline())
+			return
+		}
+		// The synchronous caller still creates one card before prepare/invocation.
 		result, directly, callErr := invoker.DirectlyCallTool(ctx, toolName, action, prepare)
 		recordSuccessfulToolCache(loop, toolName, result, callErr)
 

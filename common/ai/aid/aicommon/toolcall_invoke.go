@@ -142,8 +142,16 @@ func (a *ToolCaller) intervalReviewContext(
 				ToolExecutionStartedAt: startedAt,
 				ReviewCount:            reviewCount,
 			})
+			if a.detachHandler != nil && !a.detached.Load() {
+				reviewCtx = withToolDetachContext(reviewCtx, a.Detach)
+			}
 			shouldContinue, err := a.intervalReviewHandler(reviewCtx, tool, params, stdout, stderr, a.callExpectations)
 			reviewDurationMS := time.Since(reviewStartedAt).Milliseconds()
+			// A completed/stopped tool cancels its pending review normally.
+			// Do not turn that teardown into a failed progress card.
+			if ctx.Err() != nil {
+				return
+			}
 			if err != nil {
 				log.Errorf("interval review handler failed: %v", err)
 				emitProgressReview(ToolCallProgressReviewPayload{
@@ -162,6 +170,9 @@ func (a *ToolCaller) intervalReviewContext(
 			}
 
 			decision := "continue"
+			if toolDetachedDuringReview(reviewCtx) {
+				decision = "detach"
+			}
 			if !shouldContinue {
 				decision = "cancel"
 			}
@@ -224,6 +235,9 @@ func (a *ToolCaller) invoke(
 	// suppress session/stat notifications when no plugin callback ran.
 	a.checkpointReplayed = false
 	c := a.config
+	if policy, ok := c.(interface{ IsToolUseDisabled() bool }); ok && policy.IsToolUseDisabled() {
+		return nil, fmt.Errorf("tool execution is disabled")
+	}
 	e := a.emitter
 	if err := toolCallerContextErr(a.ctx); err != nil {
 		return nil, err
@@ -314,6 +328,10 @@ func (a *ToolCaller) invoke(
 
 	ctx, cancel := context.WithCancel(baseCtx)
 	defer cancel()
+	ctx, err = bindBrowserHTTPFlowContext(ctx, c, tool.Name, params)
+	if err != nil {
+		return nil, err
+	}
 
 	newToolCallRes := func() *aitool.ToolResult {
 		return &aitool.ToolResult{
@@ -343,8 +361,15 @@ func (a *ToolCaller) invoke(
 		return result, err
 	}
 
+	watcherDone := make(chan struct{})
+	defer func() { cancel(); <-watcherDone }()
 	go func() {
-		ep.WaitContext(ctx)
+		defer close(watcherDone)
+		// Cancellation wakes the watcher without a user decision. In particular,
+		// async stop must not consume the card's terminal event before cleanup.
+		if err := ep.sig.WaitContext(ctx); err != nil || ctx.Err() != nil {
+			return
+		}
 		userSuggestion := ep.GetParams()
 		switch userSuggestion.GetString("suggestion") {
 		case string(ToolCallAction_Enough_Cancel):
@@ -370,7 +395,10 @@ func (a *ToolCaller) invoke(
 		// an immutable deep snapshot instead of racing those tool-owned mutations.
 		intervalReviewParams := cloneEndpointParams(params)
 		intervalStart := make(chan struct{})
+		intervalDone := make(chan struct{})
+		defer func() { cancel(); <-intervalDone }()
 		go func() {
+			defer close(intervalDone)
 			close(intervalStart)
 			a.intervalReviewContext(
 				ctx, cancel,
@@ -420,14 +448,6 @@ func (a *ToolCaller) invoke(
 	if c != nil {
 		browserTracker = c.GetBrowserSessionTracker()
 	}
-	// boundRisks 收集本次工具调用实际 emit / 绑定到 runtime 的 risk (漏洞).
-	// 漏洞主要由 cybersecurity-risk 等 yak 插件工具产生, 工具执行结束后据此异步
-	// 提交 risk_feedback 价值反馈 (交小模型判定是否误报). FeedBacker 可能被工具执行
-	// 协程并发回调, 故用锁保护.
-	var (
-		boundRisksMu sync.Mutex
-		boundRisks   []*schema.Risk
-	)
 	runtimeCfg := &aitool.ToolRuntimeConfig{
 		RuntimeID:             a.callToolId,
 		ProjectDatabase:       a.config.GetDB(),
@@ -441,9 +461,6 @@ func (a *ToolCaller) invoke(
 			risk, _ := handleRiskMessage(result)
 			if risk != nil {
 				e.EmitYakitRisk(risk.ID, risk.Title, risk.RuntimeId)
-				boundRisksMu.Lock()
-				boundRisks = append(boundRisks, risk)
-				boundRisksMu.Unlock()
 				// Append a compact summary to the session-level reported-risks
 				// store so the model sees a "已报告漏洞清单" in every subsequent
 				// prompt and avoids duplicate cybersecurity-risk calls.
@@ -479,13 +496,24 @@ func (a *ToolCaller) invoke(
 			runtimeCfg.MemoryNamespace = memory.GetSessionID()
 		}
 	}
+	setRiskSelectionScope := func(task AIStatefulTask) {
+		if required, ids := AttachedRiskSelectionScope(task); required {
+			runtimeCfg.RiskSelectionScope = &aitool.RiskSelectionScope{AllowedIDs: ids}
+		}
+	}
 	if statefulTask, ok := a.task.(AIStatefulTask); ok && statefulTask != nil {
 		runtimeCfg.CurrentTaskUserInput = statefulTask.GetOriginUserInput()
+		setRiskSelectionScope(statefulTask)
 	} else if a.invokeRuntime != nil {
 		if currentTask := a.invokeRuntime.GetCurrentTask(); currentTask != nil {
 			runtimeCfg.CurrentTaskUserInput = currentTask.GetOriginUserInput()
+			if statefulTask, ok := currentTask.(AIStatefulTask); ok {
+				setRiskSelectionScope(statefulTask)
+			}
 		}
 	}
+	runtimeCfg.Detach = a.Detach
+
 	// When the runtime is bound to a server-authorized target (Focus release or
 	// conversation-audit session), route tool-emitted risks to the platform
 	// result sink instead of process-local SQLite.
@@ -510,6 +538,7 @@ func (a *ToolCaller) invoke(
 		aitool.WithCancelCallback(toolCallCancel),
 		aitool.WithRuntimeConfig(runtimeCfg),
 		aitool.WithOutputCapture(false),
+		aitool.WithWaitForCallbackOnCancel(a.waitForCallbackOnCancel),
 	)
 	invokeCancelled := errors.Is(execErr, context.Canceled) ||
 		errors.Is(execErr, context.DeadlineExceeded) ||
@@ -561,18 +590,6 @@ func (a *ToolCaller) invoke(
 	// callback-time errors remain single events even when they are reported here too.
 	if execErr != nil {
 		reportError(execErr)
-	}
-
-	// 工具调用结束、runtime 已绑定漏洞之后, 异步提交 risk_feedback 价值反馈 (AI 自判).
-	// 这是对 cybersecurity-risk 等 "报漏洞" 工具插件的通用埋点, 与 loop 内 generate_risk
-	// 动作路径互补. 非阻塞投递 + 内部 recover, 绝不影响工具调用结果与主流程.
-	boundRisksMu.Lock()
-	risksSnapshot := boundRisks
-	boundRisksMu.Unlock()
-	if len(risksSnapshot) > 0 {
-		if cfg, ok := c.(*Config); ok {
-			cfg.SubmitToolRiskFeedback(tool.Name, risksSnapshot)
-		}
 	}
 
 	ep.ActiveWithParams(ctx, map[string]any{"suggestion": "finish"})

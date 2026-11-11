@@ -5,6 +5,9 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/yaklang/gorm"
+
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 
 	"go.uber.org/atomic"
@@ -14,13 +17,24 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/orderedmap"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 type SyntaxFlowResult struct {
 	id       uint
 	saveKind ssaconfig.SFResultSaveKind
 	TaskID   string
+	// resultUUID identifies this result even when it is never persisted. Risks
+	// carry it so the scan can tell two in-memory results apart. ResultID
+	// stays the database row id and is 0 until that row exists.
+	resultUUID string
+	// onRisk receives each risk this result builds. When it is set the result
+	// does not write the risk row itself.
+	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// auditHanded records alert slots whose graph was given to onRisk. A later
+	// save of the same result must not write that graph again.
+	auditHanded map[string]struct{}
+	// dbKind is the syntaxflow result kind used when this result is persisted.
+	dbKind schema.SyntaxflowResultKind
 	// result
 	memResult *sfvm.SFFrameResult
 	dbResult  *ssadb.AuditResult
@@ -43,17 +57,31 @@ type SyntaxFlowResult struct {
 
 	riskMap      map[string]*schema.SSARisk
 	riskCountMap map[string]int64
-	// cache
-	riskGRPCCache []*ypb.SSARisk
+	// riskPositions holds the (rule, file, code range) of every published risk.
+	// One source position is one report row: unrolled loops and container-level
+	// struct alerts otherwise produce N rows that point at the same code.
+	riskPositions map[string]struct{}
 	*ssaconfig.Config
 }
 
 func createEmptyResult() *SyntaxFlowResult {
 	return &SyntaxFlowResult{
-		symbol:       make(map[string]Values),
-		riskMap:      make(map[string]*schema.SSARisk),
-		riskCountMap: make(map[string]int64),
+		symbol:        make(map[string]Values),
+		riskMap:       make(map[string]*schema.SSARisk),
+		riskCountMap:  make(map[string]int64),
+		riskPositions: make(map[string]struct{}),
+		resultUUID:    uuid.NewString(),
 	}
+}
+
+// GetResultUUID returns the stable identity of this result. It exists for
+// results that are never persisted, so risks of one scan stay distinguishable
+// without a database row.
+func (r *SyntaxFlowResult) GetResultUUID() string {
+	if r == nil {
+		return ""
+	}
+	return r.resultUUID
 }
 
 var resultCacheId = atomic.NewInt64(1)

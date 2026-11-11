@@ -68,6 +68,11 @@ type ScopedVersionedTableIF[T versionedValue] interface {
 	SetCapturedVariable(string, VersionedIF[T])
 	SetCapturedSideEffect(string, VersionedIF[T], VersionedIF[T])
 	ChangeCapturedSideEffect(string, VersionedIF[T])
+	// RegisterCapturedVariable records ver as a capture of its name.
+	// The first assignment of an outer variable runs before the free-value
+	// parameter exists, so the caller registers again once that parameter
+	// is installed.
+	RegisterCapturedVariable(VersionedIF[T])
 
 	// use in phi
 	CoverBy(ScopedVersionedTableIF[T])
@@ -140,6 +145,7 @@ type ScopedVersionedTable[T versionedValue] struct {
 	newVersioned VersionedBuilder[T]
 
 	callback        func(VersionedIF[T])
+	linkMu          sync.RWMutex
 	linkValues      linkNodeMap[T]
 	linkVariable    map[T]VersionedIF[T]
 	linkCaptured    *omap.OrderedMap[string, VersionedIF[T]]
@@ -288,8 +294,13 @@ func (v *ScopedVersionedTable[T]) GetParent() ScopedVersionedTableIF[T] {
 
 func (v *ScopedVersionedTable[T]) GetHead() ScopedVersionedTableIF[T] {
 	var headScope ScopedVersionedTableIF[T]
+	depth := 0
 	for headScope = v; headScope.GetParent() != nil; headScope = headScope.GetParent() {
-
+		// The chain can cycle; stop instead of spinning forever.
+		if depth++; depth > maxScopeChainDepth {
+			log.Errorf("scope chain deeper than %d at %q while walking to the head", maxScopeChainDepth, v.GetScopeName())
+			break
+		}
 	}
 	return headScope
 }
@@ -326,29 +337,62 @@ func isZeroValue(i any) bool {
 // ---------------- read
 
 func (v *ScopedVersionedTable[T]) getLatestVersionInCurrentLexicalScope(name string) VersionedIF[T] {
+	if v == nil {
+		return nil
+	}
+	// linkMu covers the chain pointers. The ordered-map lock only covers
+	// lookup of the *LinkNode and is released before Last walks it.
+	v.linkMu.RLock()
+	defer v.linkMu.RUnlock()
 	return v.linkValues.Get(name)
 }
 
 func (v *ScopedVersionedTable[T]) getHeadVersionInCurrentLexicalScope(name string) VersionedIF[T] {
+	if v == nil {
+		return nil
+	}
+	v.linkMu.RLock()
+	defer v.linkMu.RUnlock()
 	return v.linkValues.GetHead(name)
 }
 
 func (v *ScopedVersionedTable[T]) getAllVersionInCurrentLexicalScope(name string) []VersionedIF[T] {
+	if v == nil {
+		return nil
+	}
+	v.linkMu.RLock()
+	defer v.linkMu.RUnlock()
 	return v.linkValues.GetAll(name)
 }
 
 func (scope *ScopedVersionedTable[T]) ReadVariableFromLinkSideEffect(name string) (VersionedIF[T], VersionedIF[T]) {
-	var find, bind VersionedIF[T]
-	scope.ForEachCapturedSideEffect(func(s string, vi []VersionedIF[T]) {
-		if s == name {
-			find = vi[0]
-			bind = vi[1]
-		}
-	})
-	return find, bind
+	// This is an exact lookup. Iteration snapshots the whole ordered map for
+	// every returned side effect, creating quadratic work and allocation.
+	if pair, ok := scope.linkSideEffect.Get(name); ok {
+		return pair[0], pair[1]
+	}
+	return nil, nil
+}
+
+// maxScopeChainDepth bounds a parent-chain walk. A scope whose parent resolves
+// back to itself (through a ScopeInstance wrapper) makes the chain a cycle;
+// ReadVariable used to recurse along it until the goroutine stack overflowed,
+// which surfaced as "fatal error: stack overflow" and, before the stack grew
+// large enough, as a scan that looked hung while GC scanned the giant stack.
+const maxScopeChainDepth = 512
+
+// depthAwareScope is implemented by every ScopedVersionedTable and by wrappers
+// that embed one, so a parent-chain walk can thread its depth through the
+// interface without changing the public signatures.
+type depthAwareScope[T versionedValue] interface {
+	readVariableAt(name string, depth int, current ...bool) VersionedIF[T]
 }
 
 func (scope *ScopedVersionedTable[T]) ReadVariable(name string, current ...bool) VersionedIF[T] {
+	return scope.readVariableAt(name, 0, current...)
+}
+
+func (scope *ScopedVersionedTable[T]) readVariableAt(name string, depth int, current ...bool) VersionedIF[T] {
 	// var parent = v
 	// for parent != nil {
 	var ret VersionedIF[T]
@@ -361,8 +405,16 @@ func (scope *ScopedVersionedTable[T]) ReadVariable(name string, current ...bool)
 	if result := scope.getLatestVersionInCurrentLexicalScope(name); result != nil {
 		ret = result
 	} else {
-		if scope.GetParent() != nil && !isCurrent {
-			ret = scope.GetParent().ReadVariable(name, current...)
+		if depth >= maxScopeChainDepth {
+			log.Errorf("scope chain deeper than %d at %q; treating the variable as missing", maxScopeChainDepth, scope.GetScopeName())
+			return nil
+		}
+		if parent := scope.GetParent(); parent != nil && !isCurrent {
+			if aware, ok := parent.(depthAwareScope[T]); ok {
+				ret = aware.readVariableAt(name, depth+1, current...)
+			} else {
+				ret = parent.ReadVariable(name, current...)
+			}
 		} else {
 			ret = nil
 		}
@@ -386,13 +438,17 @@ func (scope *ScopedVersionedTable[T]) ReadVariable(name string, current ...bool)
 
 func (scope *ScopedVersionedTable[T]) GetAllVariables() []VersionedIF[T] {
 	var ret []VersionedIF[T]
-
+	if scope == nil {
+		return ret
+	}
+	scope.linkMu.RLock()
 	scope.linkValues.ForEach(func(s string, vi VersionedIF[T]) {
 		if s == "" || s == "_" {
 			return
 		}
 		ret = append(ret, vi)
 	})
+	scope.linkMu.RUnlock()
 
 	return ret
 }
@@ -429,6 +485,35 @@ func (v *ScopedVersionedTable[T]) ReadValue(name string) (t T) {
 	return
 }
 
+// FindVariableByName visits newest first, then parents if current is false.
+// Existing scope implementations can keep the snapshot API; built-in scopes
+// supply the allocation-free traversal. Predicates must not mutate version links.
+func FindVariableByName[T versionedValue](scope ScopedVersionedTableIF[T], name string, current bool, match func(VersionedIF[T]) bool) VersionedIF[T] {
+	if finder, ok := scope.(interface {
+		FindVariableByName(string, bool, func(VersionedIF[T]) bool) VersionedIF[T]
+	}); ok {
+		return finder.FindVariableByName(name, current, match)
+	}
+	for _, variable := range scope.GetAllVariablesByName(name, current) {
+		if match(variable) {
+			return variable
+		}
+	}
+	return nil
+}
+
+func (scope *ScopedVersionedTable[T]) FindVariableByName(name string, current bool, match func(VersionedIF[T]) bool) VersionedIF[T] {
+	scope.linkMu.RLock()
+	ret := scope.linkValues.Find(name, match)
+	scope.linkMu.RUnlock()
+	if ret == nil && !current {
+		if parent := scope.GetParent(); parent != nil {
+			return FindVariableByName(parent, name, false, match)
+		}
+	}
+	return ret
+}
+
 // ---------------- create
 func (v *ScopedVersionedTable[T]) CreateVariable(name string, isLocal bool) VersionedIF[T] {
 	return v.newVar(name, isLocal)
@@ -449,24 +534,68 @@ func (scope *ScopedVersionedTable[T]) AssignVariable(variable VersionedIF[T], va
 	}
 
 	if updata {
-		// variable to value
+		scope.linkMu.Lock()
 		scope.linkValues.Append(variable.GetName(), variable)
-		// value to variable
 		scope.linkVariable[value] = variable
+		scope.linkMu.Unlock()
 	}
 
 	// capture variable
 	if !variable.GetLocal() && !scope.IsRoot() {
-		for _, find := range scope.GetCurrentVariables(variable.GetName()) {
-			if find.GetLocal() && variable.GetCaptured().GetGlobalIndex() == find.GetGlobalIndex() {
-				return
-			}
+		// skip capture only when the captured target is itself a local
+		// version of this name in the current scope
+		if scope.linkValues.HasLocalWithIndex(variable.GetName(), variable.GetCaptured().GetGlobalIndex()) {
+			return
 		}
 		scope.tryRegisterCapturedVariable(variable.GetName(), variable)
 	}
 }
 
+// UnlinkValue drops the reverse index from a value to its variable. The
+// versioned value itself stays in the scope; only the strong map key is removed.
+func (scope *ScopedVersionedTable[T]) UnlinkValue(value T) {
+	if scope == nil || isZeroValue(value) {
+		return
+	}
+	scope.linkMu.Lock()
+	delete(scope.linkVariable, value)
+	scope.linkMu.Unlock()
+}
+
+// TrimSettledVersion unlinks one persisted ordinary version. The lexical head
+// stays, so ReadVariable order does not change; callers that already hold the
+// removed version keep its id and reload path.
+// DropName removes one lexical name and every version under it. The
+// caller has already detached the values that must stay reloadable by id.
+func (scope *ScopedVersionedTable[T]) DropName(name string) {
+	if scope == nil || name == "" {
+		return
+	}
+	scope.linkMu.Lock()
+	scope.linkValues.Delete(name)
+	scope.linkMu.Unlock()
+}
+
+func (scope *ScopedVersionedTable[T]) TrimSettledVersion(variable VersionedIF[T]) bool {
+	if scope == nil || variable == nil {
+		return false
+	}
+	name := variable.GetName()
+	scope.linkMu.Lock()
+	defer scope.linkMu.Unlock()
+	if head := scope.linkValues.Get(name); head == variable {
+		return false
+	}
+	ln, ok := scope.linkValues.val.Get(name)
+	if !ok || ln == nil {
+		return false
+	}
+	return ln.Remove(variable)
+}
+
 func (scope *ScopedVersionedTable[T]) GetVariableFromValue(value T) VersionedIF[T] {
+	scope.linkMu.RLock()
+	defer scope.linkMu.RUnlock()
 	if res, ok := scope.linkVariable[value]; ok {
 		return res
 	}
@@ -523,6 +652,17 @@ func (scope *ScopedVersionedTable[T]) ChangeCapturedSideEffect(name string, ver 
 // }
 
 // try register captured variable
+// RegisterCapturedVariable records ver as a capture of name in this scope.
+// Call it again after the free-value parameter exists: the first assignment
+// of an outer variable runs before that parameter is installed, and the
+// initial registration sees no parent and drops the branch from the phi.
+func (v *ScopedVersionedTable[T]) RegisterCapturedVariable(ver VersionedIF[T]) {
+	if utils.IsNil(v) || utils.IsNil(ver) {
+		return
+	}
+	v.tryRegisterCapturedVariable(ver.GetName(), ver)
+}
+
 func (v *ScopedVersionedTable[T]) tryRegisterCapturedVariable(name string, ver VersionedIF[T]) {
 	if v.IsRoot() {
 		return
@@ -669,17 +809,19 @@ func (s *ScopedVersionedTable[T]) Compare(other ScopedVersionedTableIF[T]) bool 
 func (s *ScopedVersionedTable[T]) GetAllVariableNames() map[string]struct{} {
 	var names map[string]struct{} = make(map[string]struct{})
 
-	s.linkValues.ForEach(func(s string, vi VersionedIF[T]) {
-		if s == "" || s == "_" {
+	s.linkMu.RLock()
+	s.linkValues.ForEach(func(name string, vi VersionedIF[T]) {
+		if name == "" || name == "_" {
 			return
 		}
 
 		// TODO: 多值返回时生成的member导致phi值重复，这里暂时先跳过
-		if s[0] == '#' {
+		if name[0] == '#' {
 			return
 		}
-		names[s] = struct{}{}
+		names[name] = struct{}{}
 	})
+	s.linkMu.RUnlock()
 
 	parent := s.GetParent()
 	if parent != nil {

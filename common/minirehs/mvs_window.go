@@ -38,11 +38,18 @@ func computeLitWindow(expr string, lits []string) litWindow {
 	if len(lits) == 0 {
 		return w
 	}
-	re, err := syntax.Parse(expr, syntax.Perl)
+	re, err := parseRegexSyntax(expr, syntax.Perl)
 	if err != nil {
 		return w
 	}
-	re = re.Simplify()
+	return computeLitWindowTree(re.Simplify(), lits)
+}
+
+func computeLitWindowTree(re *syntax.Regexp, lits []string) litWindow {
+	w := litWindow{head: -1, tail: -1}
+	if re == nil || len(lits) == 0 {
+		return w
+	}
 	set := make(map[string]struct{}, len(lits))
 	for _, l := range lits {
 		set[l] = struct{}{}
@@ -93,10 +100,7 @@ func (a *litWindowAcc) record(litLen, pre int, preB bool, suf int, sufB bool) {
 func (a *litWindowAcc) walk(re *syntax.Regexp, pre int, preB bool, suf int, sufB bool) {
 	switch re.Op {
 	case syntax.OpLiteral:
-		s := asciiLowerString(string(re.Rune))
-		if _, ok := a.set[s]; ok {
-			a.record(len(string(re.Rune)), pre, preB, suf, sufB)
-		}
+		literalTriggerBounds(re, a.set, func(_ string, head, tail int) { a.record(head, pre, preB, addSat(suf, tail), sufB) })
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
@@ -104,6 +108,9 @@ func (a *litWindowAcc) walk(re *syntax.Regexp, pre int, preB bool, suf int, sufB
 		}
 
 	case syntax.OpConcat:
+		if compileWidthFactsEnabled && len(re.Sub) >= 8 && a.walkConcatFacts(re, pre, preB, suf, sufB) {
+			return
+		}
 		k := len(re.Sub)
 		for i, sub := range re.Sub {
 			lw, lb := sumWidthRange(re.Sub, 0, i)   // 左兄弟总宽 (0..i-1)
@@ -152,7 +159,7 @@ func computeLitHeads(expr string, lits []string) map[string]int32 {
 	if len(lits) == 0 {
 		return out
 	}
-	re, err := syntax.Parse(expr, syntax.Perl)
+	re, err := parseRegexSyntax(expr, syntax.Perl)
 	if err != nil {
 		return out
 	}
@@ -194,15 +201,29 @@ func (a *litHeadAcc) record(lit string, litLen, pre int, preB bool) {
 func (a *litHeadAcc) walk(re *syntax.Regexp, pre int, preB bool) {
 	switch re.Op {
 	case syntax.OpLiteral:
-		s := asciiLowerString(string(re.Rune))
-		if _, ok := a.set[s]; ok {
-			a.record(s, len(string(re.Rune)), pre, preB)
-		}
+		literalTriggerBounds(re, a.set, func(lit string, head, _ int) { a.record(lit, head, pre, preB) })
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
 			a.walk(re.Sub[0], pre, preB)
 		}
 	case syntax.OpConcat:
+		if compileWidthFactsEnabled {
+			// Preserve the original left-to-right saturating sequence exactly,
+			// including unknown/overflow behavior; no array is needed for heads.
+			left, bounded := 0, true
+			for i, sub := range re.Sub {
+				a.walk(sub, addSat(pre, left), preB && bounded)
+				if bounded && i+1 < len(re.Sub) {
+					w, b := maxByteWidth(sub)
+					if b {
+						left = addSat(left, w)
+					} else {
+						left, bounded = 0, false
+					}
+				}
+			}
+			return
+		}
 		for i, sub := range re.Sub {
 			lw, lb := sumWidthRange(re.Sub, 0, i)
 			a.walk(sub, addSat(pre, lw), preB && lb)

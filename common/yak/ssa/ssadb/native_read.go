@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/utils/damenggorm"
 )
 
 const defaultNativeQueryTimeout = 30 * time.Second
@@ -64,54 +68,6 @@ func NativeConstTypeIDQueries() int64 {
 //
 // All native queries run through bindSQLPlaceholdersDB so Postgres gets $n
 // placeholders (database/sql rejects raw "?").
-func nativeGetIrTypeItemById(db *gorm.DB, progName string, id int64) *IrType {
-	ir, _ := nativeGetIrTypeItemByIdErr(db, progName, id)
-	return ir
-}
-
-func nativeGetIrTypeItemByIdErr(db *gorm.DB, progName string, id int64) (*IrType, error) {
-	if db == nil || id < 0 {
-		return nil, nil
-	}
-	const q = `SELECT id, created_at, updated_at, deleted_at, type_id, kind, program_name, "string", extra_information ` +
-		`FROM ` + TableIrTypes + ` WHERE type_id = ? AND program_name = ? AND deleted_at IS NULL LIMIT 1`
-	started := time.Now()
-	ctx, cancel := nativeQueryContext(context.Background())
-	defer cancel()
-	bound := bindSQLPlaceholdersDB(db, q)
-	row := nativeQueryRowContext(db, ctx, bound, id, progName)
-	if row == nil {
-		RecordDBRead(time.Since(started), true)
-		return nil, sql.ErrConnDone
-	}
-	ir := &IrType{}
-	var (
-		deletedAt sql.NullTime
-		createdAt time.Time
-		updatedAt time.Time
-	)
-	if err := row.Scan(&ir.ID, &createdAt, &updatedAt, &deletedAt,
-		&ir.TypeId, &ir.Kind, &ir.ProgramName, &ir.String, &ir.ExtraInformation); err != nil {
-		logNativeSQL(bound, time.Since(started), err)
-		if errors.Is(err, sql.ErrNoRows) {
-			// Miss is a normal lookup result, not a DB failure.
-			RecordDBRead(time.Since(started), false)
-			return nil, nil
-		}
-		RecordDBRead(time.Since(started), true)
-		return nil, err
-	}
-	RecordDBRead(time.Since(started), false)
-	logNativeSQL(bound, time.Since(started), nil)
-	ir.CreatedAt = createdAt
-	ir.UpdatedAt = updatedAt
-	if deletedAt.Valid {
-		t := deletedAt.Time
-		ir.DeletedAt = &t
-	}
-	return ir, nil
-}
-
 func nativeGetIrCodeItemById(db *gorm.DB, progName string, id int64) *IrCode {
 	ir, _ := nativeGetIrCodeItemByIdErr(db, progName, id)
 	return ir
@@ -121,7 +77,7 @@ func nativeGetIrCodeItemByIdErr(db *gorm.DB, progName string, id int64) (*IrCode
 	if db == nil || id < 0 {
 		return nil, nil
 	}
-	const q = `SELECT id, created_at, updated_at, deleted_at, code_id, program_name, version, ` +
+	const columns = `SELECT id, created_at, updated_at, deleted_at, code_id, program_name, version, ` +
 		`source_code_start_offset, source_code_end_offset, source_code_hash, opcode, opcode_name, opcode_operator, ` +
 		`name, verbose_name, short_verbose_name, "string", readable_name, readable_name_short, ` +
 		`current_block, current_function, is_function, formal_args, free_values, member_call_args, ` +
@@ -129,12 +85,14 @@ func nativeGetIrCodeItemByIdErr(db *gorm.DB, progName string, id int64) (*IrCode
 		`children_function, parent_function, is_block, pred_block, succ_block, phis, has_defs, users, occulatation, ` +
 		`is_object, object_members, object_member_pairs, is_object_member, object_parent, object_key, object_owner_pairs, ` +
 		`masked_codes, is_masked, variable, program_compile_hash, type_id, point, pointer, extra_information, const_type ` +
-		`FROM ` + TableIrCodes + ` WHERE code_id = ? AND program_name = ? AND deleted_at IS NULL LIMIT 1`
+		`FROM ` + TableIrCodes + ` `
+	q := columns + `WHERE code_id = ? AND program_name = ? AND deleted_at IS NULL LIMIT 1`
+	args := []any{id, progName}
 	started := time.Now()
 	ctx, cancel := nativeQueryContext(context.Background())
 	defer cancel()
 	bound := bindSQLPlaceholdersDB(db, q)
-	row := nativeQueryRowContext(db, ctx, bound, id, progName)
+	row := nativeQueryRowContext(db, ctx, bound, args...)
 	if row == nil {
 		RecordDBRead(time.Since(started), true)
 		return nil, sql.ErrConnDone
@@ -235,15 +193,17 @@ func nativeGetIrCodesByIds(db *gorm.DB, progName string, ids []int64) ([]*IrCode
 			end = len(clean)
 		}
 		chunk := clean[start:end]
-		placeholders := make([]string, len(chunk))
-		args := make([]interface{}, 0, len(chunk)+1)
+		lookupIDs := chunk
+		idColumn := "code_id"
+		placeholders := make([]string, len(lookupIDs))
+		args := make([]interface{}, 0, len(lookupIDs)+1)
 		args = append(args, progName)
-		for i, id := range chunk {
+		for i, id := range lookupIDs {
 			placeholders[i] = "?"
 			args = append(args, id)
 		}
 		q := bindSQLPlaceholdersDB(db, `SELECT `+nativeIrCodeColumns+` FROM `+TableIrCodes+
-			` WHERE program_name = ? AND code_id IN (`+joinPlaceholders(placeholders)+`) AND deleted_at IS NULL ORDER BY code_id`)
+			` WHERE program_name = ? AND `+idColumn+` IN (`+joinPlaceholders(placeholders)+`) AND deleted_at IS NULL ORDER BY code_id`)
 		started := time.Now()
 		ctx, cancel := nativeQueryContext(context.Background())
 		rows, err := nativeQueryContextDB(db, ctx, q, args...)
@@ -319,6 +279,89 @@ func joinPlaceholders(ps []string) string {
 	return string(b)
 }
 
+// irCodeConstOpcode is ssa.SSAOpcodeConstInst. irCodeConstTypeNormal is the
+// only ConstType value this search accepts. Both stay SQL literals: a bound
+// parameter hides them from the planner, and the partial const index is then
+// ignored (the query falls back to scanning ir_codes).
+const irCodeConstOpcode = 5
+const irCodeConstTypeNormal = "normal"
+
+func constLookupSQL(operator, indexName string) string {
+	from := TableIrCodes
+	// SQLite will not use the partial index for REGEXP while a plain opcode
+	// index is present: REGEXP does not constrain "string", so the opcode
+	// index looks cheaper and the query goes back to the wide rows. INDEXED BY
+	// is SQLite-only; other dialects keep the literal predicate and their own
+	// planner.
+	if indexName != "" {
+		from += ` INDEXED BY "` + indexName + `"`
+	}
+	return fmt.Sprintf(
+		`SELECT code_id FROM %s WHERE program_name = ? AND opcode = %d AND const_type = '%s' AND "string" %s ? AND deleted_at IS NULL`,
+		from, irCodeConstOpcode, irCodeConstTypeNormal, operator,
+	)
+}
+
+// constLookupHintCache remembers whether the partial const index exists. The
+// answer changes whenever a compile drops or rebuilds the IR secondary indexes,
+// so it is tagged with an epoch instead of being cached forever.
+var (
+	constLookupHintCache sync.Map
+	constLookupHintEpoch atomic.Uint64
+)
+
+type constLookupHintEntry struct {
+	epoch uint64
+	hint  string
+}
+
+// invalidateConstLookupIndexHint makes the next const lookup probe sqlite_master
+// again. Called when the IR secondary indexes are dropped or restored.
+func invalidateConstLookupIndexHint() {
+	constLookupHintEpoch.Add(1)
+}
+
+// constLookupIndexMissing reports the error SQLite raises when an INDEXED BY
+// clause names an index that no longer exists.
+func constLookupIndexMissing(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such index")
+}
+
+func constLookupIndexHint(ctx context.Context, db *gorm.DB) (string, error) {
+	if db == nil || db.Dialect() == nil || db.CommonDB() == nil {
+		return "", nil
+	}
+	switch db.Dialect().GetName() {
+	case "sqlite3", "sqlite":
+	default:
+		return "", nil
+	}
+	key := db.CommonDB()
+	epoch := constLookupHintEpoch.Load()
+	if v, ok := constLookupHintCache.Load(key); ok {
+		if entry, ok := v.(constLookupHintEntry); ok && entry.epoch == epoch {
+			return entry.hint, nil
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var indexName string
+	err := db.DB().QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND name=? LIMIT 1`,
+		TableIrCodes, irCodeConstLookupIndex,
+	).Scan(&indexName)
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	hint := ""
+	if err == nil {
+		hint = indexName
+	}
+	constLookupHintCache.Store(key, constLookupHintEntry{epoch: epoch, hint: hint})
+	return hint, nil
+}
+
 // nativeGetIrCodeIDsByConstType returns the code_ids matching the ConstType
 // search predicate (opcode=5, const_type='normal', string exact or REGEXP),
 // mirroring the GORM Model(&IrCode{}) path used by searchVariableWithFileFilter
@@ -333,29 +376,43 @@ func nativeGetIrCodeIDsByConstTypeContext(parent context.Context, db *gorm.DB, p
 		return nil, nil
 	}
 	nativeConstTypeIDQueries.Add(1)
-	var q string
-	var args []interface{}
-	if compareMode == ExactCompare {
-		q = bindSQLPlaceholdersDB(db, `SELECT code_id FROM `+TableIrCodes+
-			` WHERE program_name = ? AND opcode = ? AND const_type = ? AND "string" = ? AND deleted_at IS NULL`)
-		args = []interface{}{progName, 5, "normal", value}
-	} else {
-		operator := "REGEXP"
-		switch db.Dialect().GetName() {
-		case "postgres", "postgresql", "cloudsqlpostgres":
-			operator = "~"
-		}
-		q = bindSQLPlaceholdersDB(db, `SELECT code_id FROM `+TableIrCodes+
-			` WHERE program_name = ? AND opcode = ? AND const_type = ? AND "string" `+operator+` ? AND deleted_at IS NULL`)
-		args = []interface{}{progName, 5, "normal", value}
-	}
 	started := time.Now()
 	if parent == nil {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(parent, nativeQueryTimeout())
 	defer cancel()
+	hint, err := constLookupIndexHint(ctx, db)
+	if err != nil {
+		query := bindSQLPlaceholdersDB(db, `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND name=? LIMIT 1`)
+		RecordDBRead(time.Since(started), true)
+		logNativeSQL(query, time.Since(started), err)
+		return nil, err
+	}
+	operator := "="
+	if compareMode != ExactCompare {
+		operator = "REGEXP"
+		switch db.Dialect().GetName() {
+		case "postgres", "postgresql", "cloudsqlpostgres":
+			operator = "~"
+		}
+	}
+	queryFor := func(hint string) string {
+		return bindSQLPlaceholdersDB(db, constLookupSQL(operator, hint))
+	}
+	args := []interface{}{progName, value}
+	q := queryFor(hint)
 	rows, err := nativeQueryContextDB(db, ctx, q, args...)
+	if err != nil && hint != "" && constLookupIndexMissing(err) && ctx.Err() == nil {
+		// Another project's compile can drop the index between the probe and
+		// the query. SQLite rejects the statement instead of ignoring the
+		// hint, so reprobe and retry without a stale INDEXED BY.
+		invalidateConstLookupIndexHint()
+		if currentHint, hintErr := constLookupIndexHint(ctx, db); hintErr == nil {
+			q = queryFor(currentHint)
+			rows, err = nativeQueryContextDB(db, ctx, q, args...)
+		}
+	}
 	if err != nil {
 		RecordDBRead(time.Since(started), true)
 		logNativeSQL(q, time.Since(started), err)
@@ -397,6 +454,9 @@ func nativeQueryRowContext(db *gorm.DB, ctx context.Context, query string, args 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if damenggorm.IsDM(db) {
+		query = damenggorm.NormalizeQuery(query)
+	}
 	switch q := common.(type) {
 	case *sql.DB:
 		return q.QueryRowContext(ctx, query, args...)
@@ -416,6 +476,9 @@ func nativeQueryContextDB(db *gorm.DB, ctx context.Context, query string, args .
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if damenggorm.IsDM(db) {
+		query = damenggorm.NormalizeQuery(query)
 	}
 	switch q := db.CommonDB().(type) {
 	case *sql.DB:

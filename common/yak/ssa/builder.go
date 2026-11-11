@@ -52,10 +52,14 @@ type FunctionBuilder struct {
 	Included bool
 	IsReturn bool
 
-	RefParameter map[string]struct {
+	// RefParameter records pointer/reference parameters while one compile
+	// worker assigns values and another records a member reference. It uses
+	// the existing concurrent map; Get, Set, and Delete hold its lock only
+	// for that map operation and do not cross AssignVariable or Emit.
+	RefParameter *utils.SafeMapWithKey[string, struct {
 		Index int
 		Kind  SideEffectKind
-	}
+	}]
 
 	target *target // for break and continue
 	labels map[string]*BasicBlock
@@ -65,6 +69,11 @@ type FunctionBuilder struct {
 	CurrentBlock *BasicBlock    // current block to build
 	CurrentRange *memedit.Range // current position in source code
 	CurrentFile  string         // current file name
+
+	// The entry state of a private stored execution view. A method build may
+	// trigger another initializer in this function without advancing this view.
+	executionInitialBlock  *BasicBlock
+	executionInitialReturn bool
 
 	parentScope *ParentScope
 
@@ -83,6 +92,21 @@ type FunctionBuilder struct {
 
 	//External variables acquired by use will determine whether sideEffect should be generated when assign variable is assigned
 	captureFreeValue map[string]struct{}
+	// capturedNames are lexical names a nested function has captured from
+	// this function. Later assignments of those names are marked so const
+	// folding does not drop the callback's update. Parallel unit compile
+	// notes a capture on one goroutine while another assigns the same name,
+	// so this is the existing concurrent map rather than a new mutex.
+	// Have/Set hold that map lock only for the lookup or insert. They do not
+	// call lockEmit, and lockEmit's caller may already be inside AssignVariable.
+	capturedNames *utils.SafeMapWithKey[string, struct{}]
+
+	placeholderConstants *utils.SafeMapWithKey[placeholderConstantKey, placeholderConstant]
+
+	// emitSinceFlush counts instructions since the last mid-function save.
+	// flushingEmits stops that save from re-entering itself.
+	emitSinceFlush int
+	flushingEmits  bool
 }
 
 func NewBuilder(editor *memedit.MemEditor, f *Function, parent *FunctionBuilder) *FunctionBuilder {
@@ -94,13 +118,14 @@ func NewBuilder(editor *memedit.MemEditor, f *Function, parent *FunctionBuilder)
 		CurrentBlock:  nil,
 		CurrentRange:  nil,
 		parentBuilder: parent,
-		RefParameter: make(map[string]struct {
+		RefParameter: utils.NewSafeMapWithKey[string, struct {
 			Index int
 			Kind  SideEffectKind
-		}),
+		}](),
 		SyntaxIncludingStack: utils.NewStack[string](),
 		includeStack:         utils.NewStack[*Program](),
 		captureFreeValue:     make(map[string]struct{}),
+		capturedNames:        utils.NewSafeMapWithKey[string, struct{}](),
 	}
 	if parent != nil {
 		b.DefineFunc = parent.DefineFunc
@@ -228,6 +253,7 @@ func (b *FunctionBuilder) PopFunction() *FunctionBuilder {
 
 // function param
 func (b FunctionBuilder) HandlerEllipsis() {
+	defer b.Function.markPersistenceDirty()
 	if len(b.Params) == 0 {
 		b.hasEllipsis = true
 		return
@@ -245,6 +271,16 @@ func (b FunctionBuilder) HandlerEllipsis() {
 func (b *FunctionBuilder) EmitDefer(instruction Instruction) {
 	deferBlock := b.GetDeferBlock()
 	endBlock := b.CurrentBlock
+	// The deferred call itself always lives in the function defer block.
+	// Remember the block that reached this statement so AOT can skip the
+	// call when that block never ran (defer inside an if).
+	if endBlock != nil && deferBlock != nil && endBlock.GetId() != deferBlock.GetId() {
+		after := int64(0)
+		if n := len(endBlock.Insts); n > 0 {
+			after = endBlock.Insts[n-1]
+		}
+		markDeferGuard(instruction, endBlock.GetId(), after)
+	}
 	defer func() {
 		b.CurrentBlock = endBlock
 	}()
@@ -262,6 +298,18 @@ func (b *FunctionBuilder) EmitDefer(instruction Instruction) {
 			deferBlock.Insts = utils.InsertSliceItem(deferBlock.Insts, instruction.GetId(), 0)
 		}
 	})
+}
+
+func markDeferGuard(inst Instruction, blockID, after int64) {
+	if utils.IsNil(inst) || blockID <= 0 {
+		return
+	}
+	type marker interface {
+		MarkDeferGuard(blockID, afterInst int64)
+	}
+	if m, ok := inst.(marker); ok && m != nil {
+		m.MarkDeferGuard(blockID, after)
+	}
 }
 
 func (b *FunctionBuilder) SetMarkedFunction(name string) (ret func()) {
@@ -293,13 +341,56 @@ func (b *FunctionBuilder) GetMarkedFunction() *FunctionType {
 }
 
 func (b *FunctionBuilder) ReferenceParameter(name string, index int, kind SideEffectKind) {
-	b.RefParameter[name] = struct {
+	if b == nil || b.RefParameter == nil {
+		return
+	}
+	b.RefParameter.Set(name, struct {
 		Index int
 		Kind  SideEffectKind
 	}{
 		Index: index,
 		Kind:  kind,
+	})
+}
+
+func (b *FunctionBuilder) lookupRefParameter(name string) (struct {
+	Index int
+	Kind  SideEffectKind
+}, bool) {
+	if b == nil || b.RefParameter == nil {
+		var zero struct {
+			Index int
+			Kind  SideEffectKind
+		}
+		return zero, false
 	}
+	return b.RefParameter.Get(name)
+}
+
+func (b *FunctionBuilder) TakeRefParameter(name string) (struct {
+	Index int
+	Kind  SideEffectKind
+}, bool) {
+	if b == nil || b.RefParameter == nil {
+		var zero struct {
+			Index int
+			Kind  SideEffectKind
+		}
+		return zero, false
+	}
+	prev, loaded, _ := b.RefParameter.UpdateAction(name, func(old struct {
+		Index int
+		Kind  SideEffectKind
+	}, loaded bool) (struct {
+		Index int
+		Kind  SideEffectKind
+	}, utils.SafeMapAction) {
+		if !loaded {
+			return old, utils.SafeMapKeep
+		}
+		return old, utils.SafeMapDelete
+	})
+	return prev, loaded
 }
 
 func (b *FunctionBuilder) ClassConstructor(bluePrint *Blueprint, args []Value) Value {

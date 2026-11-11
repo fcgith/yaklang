@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 var errBinContext = errors.New("protocol context required")
 
 type binHTTPState struct {
+	awaitRequest                                                   bool
+	awaitCharge                                                    int64
 	ws                                                             *binWebSocket
 	requestID                                                      uint64
 	declared                                                       int64
@@ -27,7 +30,7 @@ type binHTTPState struct {
 	trailerBytes                                                   int
 	rawHeader                                                      []byte
 	headerFields                                                   map[string]any
-	wsKey, wsOffer                                                 string
+	wsKey, wsOffer, wsProtocols                                    string
 	wsIssue                                                        string
 	header, total, cursor, next, search                            int
 	chunked, trailers, closeDelimited, response, tunnel, websocket bool
@@ -51,6 +54,24 @@ func (h *binHTTPState) config(bodyLimit int) map[string]any {
 func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 	if f.binding == nil {
 		switch f.protocol {
+		case "tls":
+			if f.wcfTLS != nil {
+				return f.frameWCFTLS(dir, w)
+			}
+		case "ipfix":
+			return f.frameIPFIX(w)
+		case "ldp":
+			return f.frameLDP(w)
+		case "bgp":
+			return f.frameBGP(w)
+		case "rtmp":
+			return f.frameRTMP(dir, w)
+		case "ajp":
+			return f.frameAJP(dir, w)
+		case "mms":
+			return f.frameMMSISO(w)
+		case "fins":
+			return f.frameFINS(w)
 		case "slmp":
 			return f.frameSLMPTCP(w)
 		case "vnc":
@@ -99,12 +120,16 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 			return f.frameTDS(w)
 		case "amqp":
 			return f.frameAMQP(w)
-		case "smb2":
+		case "smb", "smb2":
 			return f.frameSMB2(w)
 		case "dcerpc":
 			return f.frameDCERPC(w)
 		case "ssh":
 			return f.frameSSH(dir, w)
+		case "telnet":
+			return f.frameTelnet(w)
+		case "nbss":
+			return f.frameNBSS(dir, w)
 		case "nfs":
 			return f.frameNFS(w)
 		case "snmp":
@@ -139,6 +164,8 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 			return f.frameCoAP(w)
 		case "modbus":
 			return f.frameModbus(w)
+		case "iso8583":
+			return f.frameISO8583(w)
 		case "memcached":
 			if f.memcached != nil {
 				if err := f.reserveSession(f.memcached.sessionBytes()); err != nil {
@@ -161,7 +188,7 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 			if err == nil && n > 0 {
 				// Charge the complete owned event/projection before event() copies
 				// raw bytes, in addition to any retained invoke context.
-				err = f.reserveSession(f.wrapper.storage() + wrapperProjectionBytes + 256 + 128*int64(n))
+				err = f.reserveSession(f.wrapper.storage() + wrapperProjection(w, n) + 256)
 				var typed *ProtocolError
 				if errors.As(err, &typed) {
 					err = typed
@@ -192,10 +219,16 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 			return n, &binSpec{}, err
 		case "doip":
 			if err := f.reserveSession(f.doip.sessionBytes()); err != nil {
+				f.doip.refusedWire(dir, w)
 				return 0, nil, err
 			}
 			n, err := doipFrameSize(w, f.a.budget.MaxFrameBytes)
+			if err != nil {
+				f.doip.refusedWire(dir, w)
+			}
 			return n, &binSpec{}, err
+		case "hart-ip":
+			return f.frameHARTIP(w)
 		case "enip":
 			return f.frameENIP(w)
 		case "stratum":
@@ -214,6 +247,8 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 			return f.frameClickHouse(dir, w)
 		case "stomp":
 			return f.frameSTOMP(dir, w)
+		case "wcf":
+			return f.frameWCF(dir, w)
 		case "dnp3":
 			return f.frameDNP3(w)
 		case "c37118":
@@ -229,6 +264,15 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 	}
 	d := &f.directions[dir]
 	h := d.http
+	if h != nil && h.awaitRequest {
+		if len(f.httpMethods) == 0 || !f.httpMayAwaitRequest(dir) {
+			return 0, nil, nil
+		}
+		// Reparse the same owned bytes with the actually observed method.
+		// Await state has no initialized body length or tunnel decision.
+		defer f.releaseHTTPAwait(h)
+		d.http, d.headerScan, h = nil, 0, nil
+	}
 	if h == nil {
 		end := incrementalHTTPIndex(w, 0, &d.headerScan, "\r\n\r\n")
 		if end < 0 {
@@ -268,6 +312,9 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 			h.rawHeader = bytes.Clone(w[:end])
 			d.http = h
 			if len(f.httpMethods) == 0 {
+				if f.httpMayAwaitRequest(dir) {
+					return 0, nil, f.awaitHTTPRequest(h)
+				}
 				return 0, nil, sessionContext("HTTP response header observed without request framing context (capture may have started midstream or lost request bytes)")
 			}
 			// Interim responses do not complete the queued request and carry
@@ -299,6 +346,13 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 				if err != nil {
 					return 0, nil, err
 				}
+				selected, err := websocketSubprotocol(f.httpWSProtocols[0], response.Header.Values("Sec-WebSocket-Protocol"))
+				if err != nil {
+					return 0, nil, err
+				}
+				if selected == "ocpp1.6" || selected == "ocpp2.0.1" {
+					h.ws.ocpp = &binOCPP{version: strings.TrimPrefix(selected, "ocpp")}
+				}
 			}
 			h.tunnel = h.status == 101 || (h.method == "CONNECT" && h.status >= 200 && h.status < 300)
 			if h.method == "HEAD" || h.status < 200 || h.status == 204 || h.status == 304 || h.tunnel {
@@ -327,6 +381,11 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 					h.websocket = false
 				}
 				h.wsOffer = request.Header.Get("Sec-WebSocket-Extensions")
+				h.wsProtocols = strings.Join(request.Header.Values("Sec-WebSocket-Protocol"), ",")
+				if !websocketProtocolOffer(h.wsProtocols) {
+					h.websocket = false
+					h.wsIssue = "invalid WebSocket subprotocol offer"
+				}
 			}
 			length, transfer = request.ContentLength, request.TransferEncoding
 			if len(f.httpMethods) >= 128 {
@@ -355,24 +414,28 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 		// Expect: 100-continue can produce a response before the request body.
 		// Associate the method as soon as its complete header is validated.
 		if !h.response {
-			h.requestID = f.a.ids.Add(1)
-			f.httpIDs = append(f.httpIDs, h.requestID)
-			f.httpTimes = append(f.httpTimes, d.ts)
-			cost := int64(3*end + 128*(len(f.httpMethods)+1) + len(h.wsKey) + len(h.wsOffer) + len(h.method))
+			cost := int64(3*end + 128*(len(f.httpMethods)+1) + len(h.wsKey) + len(h.wsOffer) + len(h.wsProtocols) + len(h.method))
 			for _, s := range f.httpWSKeys {
 				cost += int64(len(s))
 			}
 			for _, s := range f.httpWSExtensions {
 				cost += int64(len(s))
 			}
+			for _, s := range f.httpWSProtocols {
+				cost += int64(len(s))
+			}
 			if err := f.reserveSession(cost); err != nil {
 				return 0, nil, err
 			}
+			h.requestID = f.a.ids.Add(1)
+			f.httpIDs = append(f.httpIDs, h.requestID)
+			f.httpTimes = append(f.httpTimes, d.ts)
 			f.httpMethods = append(f.httpMethods, h.method)
 			f.httpUpgrades = append(f.httpUpgrades, h.websocket)
 			f.httpUpgradeIssues = append(f.httpUpgradeIssues, h.wsIssue)
 			f.httpWSKeys = append(f.httpWSKeys, h.wsKey)
 			f.httpWSExtensions = append(f.httpWSExtensions, h.wsOffer)
+			f.httpWSProtocols = append(f.httpWSProtocols, h.wsProtocols)
 			f.httpDoH = append(f.httpDoH, h.doh)
 			// Allocate the sparse IPP marker queue only after an IPP request.
 			if h.ipp || len(f.httpIPP) > 0 {
@@ -381,6 +444,9 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 				}
 				f.httpIPP = append(f.httpIPP, h.ipp)
 			}
+			// Commit the observed role only after every request queue and its
+			// reservation succeeded. Opposite request roles disable waiting.
+			f.httpRequestDirections |= byte(1 << uint(dir))
 		}
 	}
 	if h.declared > int64(f.a.config.MaxMessageBytes) {
@@ -388,7 +454,7 @@ func (f *binFlow) frameDirection(dir int, w []byte) (int, *binSpec, error) {
 	}
 	if h.closeDelimited {
 		return 0, nil, nil
-	} // only a clean TCP FIN can end this body
+	} // A clean transport FIN or authenticated TLS sender EOF ends this body.
 	if !h.chunked {
 		return h.total, f.spec("http", "HTTPExact"), nil
 	}
@@ -462,6 +528,7 @@ func (f *binFlow) finishHTTP(dir int) {
 				}
 				f.httpWSKeys = f.httpWSKeys[1:]
 				f.httpWSExtensions = f.httpWSExtensions[1:]
+				f.httpWSProtocols = f.httpWSProtocols[1:]
 			}
 			if len(f.httpIPP) > 0 {
 				f.httpIPP = f.httpIPP[1:]
@@ -474,8 +541,10 @@ func (f *binFlow) finishHTTP(dir int) {
 	f.directions[dir].http = nil
 	f.directions[dir].headerScan = 0
 	if h.tunnel {
+		f.httpRequestDirections = 0
 		f.httpIDs, f.httpTimes = nil, nil
 		f.httpWSKeys, f.httpWSExtensions = nil, nil
+		f.httpWSProtocols = nil
 	}
 	if h.tunnel && h.status == 101 && h.websocket {
 		client := 1 - dir
@@ -532,6 +601,10 @@ func (f *binFlow) httpEvidence(dir int, e *ProtocolEvent) {
 	if h == nil {
 		return
 	}
+	if h.awaitRequest {
+		e.Completeness = "headers"
+		return // No guessed method, request ID, or message boundary.
+	}
 	e.Completeness = "message"
 	if !h.response {
 		e.ID = h.requestID
@@ -550,6 +623,9 @@ func (f *binFlow) httpEvidence(dir int, e *ProtocolEvent) {
 			e.Completeness = "transaction"
 		}
 	}
+	// The framer has already admitted these headers. Keep their literal values
+	// independently of connection context and the optional deferred rule tree.
+	e.nativeHTTPMessage = &httpMessageEvidence{fields: cloneSession(h.headerFields), header: h.header, response: h.response, chunked: h.chunked, complete: !h.omitted, digest: sha256.Sum256(e.Raw)}
 }
 
 func websocketRequestIssue(request *http.Request) string {

@@ -243,6 +243,7 @@ service Yak {
   rpc QueryHistoryHTTPFuzzerTask(Empty) returns (HistoryHTTPFuzzerTasks);
   rpc QueryHistoryHTTPFuzzerTaskEx(QueryHistoryHTTPFuzzerTaskExParams) returns (HistoryHTTPFuzzerTasksResponse);
   rpc DeleteHistoryHTTPFuzzerTask(DeleteHistoryHTTPFuzzerTaskRequest) returns (Empty);
+  rpc FetchHTTPPreviewResource(HTTPPreviewResourceRequest) returns (HTTPPreviewResourceResponse);
   rpc HTTPFuzzer(FuzzerRequest) returns (stream FuzzerResponse);
   rpc HTTPFuzzerSequence(FuzzerRequests) returns (stream FuzzerSequenceResponse);
   rpc HTTPFuzzerGroup(GroupHTTPFuzzerRequest) returns (stream GroupHTTPFuzzerResponse);
@@ -1132,6 +1133,9 @@ service Yak {
   // filesystem. Returned paths are engine paths and can be used by file
   // Fuzztags in both local and remote-engine modes.
   rpc UploadToTemporaryFile(stream UploadToTemporaryFileRequest) returns (UploadToTemporaryFileResponse);
+
+  // AI session resource snapshot query.
+  rpc GetAISessionCurrentResources(GetAISessionCurrentResourcesRequest) returns (GetAISessionCurrentResourcesResponse);
 }
 
 // IMBotConfig 描述一个 IM 平台 bot 的配置凭证。
@@ -2181,6 +2185,8 @@ message AIInputEvent {
   // 配置热补丁目标任务的逻辑 ID (AIStatefulTask.GetId)。
   // 非空时，仅当前正在执行且 ID 匹配的任务会应用该热补丁（主要用于能力热更新）。
   string TaskId = 17;
+  // JSON metadata for a question/form submission. FreeInput remains human-readable.
+  string UserInteraction = 18;
 }
 
 message AttachedResourceInfo {
@@ -2294,7 +2300,14 @@ message AIStartParams {
 
   // 限制 Timeline 的最大条目和最大内容大小（bytes）
   int64 TimelineItemLimit = 28; // 已经废弃，功能不可用了，只需要关注 TimelineContentSizeLimit 就好
+  // Deprecated: 运行时的 Timeline 现在除了普通历史，还承载 Skill 正文、Evidence 等
+  // 运行时上下文，内容规模已经不同；而且前端会下发一个非零默认值，覆盖服务端默认阈值。
+  // 请改用 RuntimeContextSizeLimit。
   int64 TimelineContentSizeLimit = 29;
+  // 运行时上下文（普通历史、Skill 正文、Evidence 等）的压缩阈值。
+  // >0 时覆盖服务端默认阈值；<=0（含前端不传）时使用服务端默认值，保证携带运行时
+  // 上下文的时间线不会被过早压缩。
+  int64 RuntimeContextSizeLimit = 51;
 
   // 用户交互的最大次数限制,超过这个次数，AI 将不再被允许问用户问题
   int64 UserInteractLimit = 30;
@@ -2349,6 +2362,10 @@ message AIStartParams {
   bool DisableMemoryTriage = 49;
   // Session-local opt-in; a globally enabled single-model mode still wins.
   bool SingleModelMode = 50;
+  // Opt-in complete model HTTP diagnostics. Includes credentials/prompts, stored locally and exported with AI logs.
+  optional bool NetworkDebug = 52;
+  // Connection-local, build-generated component catalog and interaction capabilities.
+  string ClientUI = 53;
 }
 
 message AIExecutionStrategy {
@@ -3447,6 +3464,10 @@ message ThirdPartyApplicationConfig {
   optional double FrequencyPenalty = 22;
   optional string ReasoningEffort = 23;
   optional bool EnableThinkingOpt = 24;
+  // yak-script: the complete provider implementation; connection and model options live in the source.
+  string Script = 25;
+  // yak-script: opt into native tool_calls; false uses text actions.
+  bool EnableNativeToolCalling = 26;
 }
 
 message DiagnoseNetworkRequest {
@@ -9093,6 +9114,8 @@ message SSARisk {
   string Solution = 28;
   string Description = 29 ;
   string LatestDisposalStatus = 30; // 最新处置状态 not_set | is_issue | not_issue | suspicious
+  // Stable result identity, including results without an audit-result row.
+  string ResultUUID = 32;
 }
 
 message SSARisksFilter {
@@ -9117,6 +9140,7 @@ message SSARisksFilter {
   SSARiskDiffRequest SSARiskDiffRequest = 18;
   // 增量查询
   bool Incremental = 19;
+  repeated string ResultUUID = 20;
 }
 
 message QuerySSARisksRequest {
@@ -9602,6 +9626,12 @@ message AIGlobalConfig {
   string AIPlanPrompt = 10;
   // Single-model routing takes precedence over tier selection without deleting tier lists.
   bool SingleModelMode = 11;
+  // Retry failed model calls and invalid model output until recovery or cancellation.
+  bool RetryForever = 12;
+  // Opt-in complete HTTP diagnostics for subsequent model calls on this engine.
+  bool NetworkDebug = 13;
+  // Engine-wide model attempts per minute; zero disables proactive rate limiting.
+  int64 ModelRequestsPerMinute = 14;
 }
 
 // Local Model Messages
@@ -9810,6 +9840,9 @@ message MITMV2Request{
 
   // disable built-in TrafficGuard sensitive-info scanning
   bool DisableTrafficGuard = 58;
+
+  // Opt in to the compromised eMudhra CA for TLS trust testing. Default: false.
+  bool UseEMudhra = 59;
 }
 
 message MITMV2Response {
@@ -10502,4 +10535,42 @@ message BrowserExtensionTaskEvent {
   bytes Data = 5;
   int64 Timestamp = 6;
   uint64 Sequence = 7;
+}
+
+message AISessionTaskResourceInfo {
+  string Type = 1;
+  string Key = 2;
+  string Value = 3;
+  // turn: current task only; session: retained across tasks in the session.
+  string Scope = 4;
+  // attached_resource_info / attached_file_path / inherited
+  string Source = 5;
+}
+
+message GetAISessionCurrentResourcesRequest {
+  string SessionID = 1;
+}
+
+message GetAISessionCurrentResourcesResponse {
+  string SessionID = 1;
+  string TaskID = 2;
+  string UserInputUUID = 3;
+  // Resources explicitly attached to or inherited by the latest task.
+  repeated AISessionTaskResourceInfo TaskResources = 4;
+  // Session-scoped resources reconstructed from task input history.
+  repeated AISessionTaskResourceInfo SessionResources = 5;
+}
+
+// A credential-free, bounded static GET. Network is read only for transport settings;
+// no fuzzing, hot patch, browser transform, task creation or persistence is performed.
+message HTTPPreviewResourceRequest {
+  string URL = 1;
+  string PageURL = 2;
+  string Kind = 3; // image, css, font
+  FuzzerRequest Network = 4;
+}
+message HTTPPreviewResourceResponse {
+  string URL = 1;
+  string MimeType = 2;
+  bytes Data = 3;
 }

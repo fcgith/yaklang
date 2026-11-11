@@ -613,7 +613,7 @@ func renderTimelineEntry(item *TimelineItem, bucketStart time.Time, state *timel
 		ts = bucketStart
 	}
 	hh, mm, ss := ts.Clock()
-	buf.WriteString(fmt.Sprintf("%02d:%02d:%02d [%s]", hh, mm, ss, renderItemTypeVerbose(item)))
+	buf.WriteString(fmt.Sprintf("%02d:%02d:%02d [%s] [item_id:%d]", hh, mm, ss, renderItemTypeVerbose(item), item.GetID()))
 	state.firstEntry = false
 	if explicitTask {
 		state.activeTaskID = taskID
@@ -633,7 +633,10 @@ func renderTimelineEntry(item *TimelineItem, bucketStart time.Time, state *timel
 		return buf.String()
 	}
 	var prevBlank bool
-	for _, line := range utils.ParseStringToRawLines(content) {
+	// Native call arguments can contain an entire report on one JSON line.
+	// Scanner-based line helpers silently stop at 64 KiB, losing the payload
+	// and closing replay tag. Content is already in memory; split without a cap.
+	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimRight(line, " \t\r")
 		if strings.TrimSpace(line) == "" {
 			if prevBlank {

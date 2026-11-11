@@ -39,6 +39,8 @@ type PreparedSubAgent struct {
 	runtimeErr    error
 	configOptions []aicommon.ConfigOption // captured with the timeline, before queueing
 	parentEmitter *aicommon.Emitter
+	parentConfig  *aicommon.Config
+	evidenceSink  func(aicommon.EvidenceOperation) error
 }
 
 // ExecutedSubAgent 是阶段 2（执行任务）的产物：一个已执行（或执行失败）的子
@@ -104,6 +106,28 @@ func prepareSubAgents(
 		return nil
 	}
 	parentTimeline := parentCfg.GetTimeline()
+	parentContext := parentCfg.GetContext()
+	if parentTask != nil {
+		parentContext = parentTask.GetContext()
+	}
+	// Capture the callback on the owner thread. Internal synchronous helpers
+	// can forward an explicit finding through their enclosing sub-agent too.
+	var parentPublisher func(aicommon.EvidenceOperation) error
+	if opts.ParentLoop != nil {
+		parentPublisher = opts.ParentLoop.saveEvidencePublisher
+	}
+	publishEvidence := func(op aicommon.EvidenceOperation) error {
+		if parentContext != nil && parentContext.Err() != nil {
+			return parentContext.Err()
+		}
+		if _, err := SaveSessionEvidence(parentCfg, op.ID, op.Content); err != nil {
+			return err
+		}
+		if parentPublisher != nil {
+			return parentPublisher(op)
+		}
+		return nil
+	}
 
 	prepared := make([]*PreparedSubAgent, 0, len(jobs))
 	for _, job := range jobs {
@@ -142,6 +166,8 @@ func prepareSubAgents(
 			StartedAt:     startedAt,
 			configOptions: snapshotSubAgentConfig(parentCfg, job.ContextMode),
 			parentEmitter: parentCfg.GetEmitter(),
+			parentConfig:  parentCfg,
+			evidenceSink:  publishEvidence,
 		})
 	}
 	return prepared
@@ -359,6 +385,15 @@ func executeSubAgent(prepared *PreparedSubAgent, opts SubAgentOptions) *Executed
 		if opt != nil {
 			opt(loop)
 		}
+	}
+	// Custom builders are sub-agents too. Set identity and the parent channel
+	// together so core actions use the same propagation rule in every child.
+	if !loop.IsSubAgent() {
+		loop.Set(SubAgentDepthLoopVar, 1)
+	}
+	loop.saveEvidencePublisher = prepared.evidenceSink
+	if opts.evidenceSink != nil {
+		loop.saveEvidencePublisher = opts.evidenceSink
 	}
 	execErr := loop.ExecuteWithExistedTask(prepared.Task)
 
@@ -620,10 +655,10 @@ func elaborateGoal(
 		[]aitool.ToolOption{
 			aitool.WithStringParam("goal",
 				aitool.WithParam_Required(true),
-				aitool.WithParam_Description("Elaborated, self-contained task goal for the sub agent."),
+				aitool.WithParam_Description("补全后的子任务目标，包含独立执行所需的事实和约束。"),
 			),
 			aitool.WithStringParam("result_contract",
-				aitool.WithParam_Description("Optional acceptance criteria / output format for the sub agent result."),
+				aitool.WithParam_Description("子任务的交付、证据、验收标准和输出格式；无特殊要求可省略。"),
 			),
 		},
 		// The prepared child snapshot is already in prompt. Never add a second
@@ -846,7 +881,7 @@ func buildUserInput(goal, resultContract string) string {
 	var sb strings.Builder
 	sb.WriteString(goal)
 	if contract := strings.TrimSpace(resultContract); contract != "" {
-		sb.WriteString("\n\n## Result Contract\n\n")
+		sb.WriteString("\n\n## 交付与验收要求\n\n")
 		sb.WriteString(contract)
 	}
 	return sb.String()
@@ -893,6 +928,7 @@ type SubAgentOptions struct {
 	taskReady      func(aicommon.AIStatefulTask)
 	observeEvent   func(*schema.AiOutputEvent)
 	resultWriter   func(id, content string) (string, error)
+	evidenceSink   func(aicommon.EvidenceOperation) error
 	// TimelineMode 决定子 Agent 的 timeline 容器。默认 SubAgentTimelineFork。
 	TimelineMode SubAgentTimelineMode
 

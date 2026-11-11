@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils/diagnostics"
 
@@ -70,6 +71,12 @@ func (m *scanManager) StartQuerySF(startIndex ...int64) error {
 		return utils.Errorf("SyntaxFlow scan start with a wrong task index")
 	}
 
+	// Initialize before launching rule goroutines; the loader's entries are
+	// concurrency-safe, but lazy assignment of the config pointer is not.
+	m.Config.rulePreparationState()
+	sourceRuntimes, closeSourceRuntimes := m.prepareSourceRuntimes()
+	defer closeSourceRuntimes()
+
 	var errs error
 	var taskIndex atomic.Int64
 	var concurrency int
@@ -100,20 +107,38 @@ func (m *scanManager) StartQuerySF(startIndex ...int64) error {
 			if taskIndex.Load() <= start {
 				continue
 			}
+			// Mode and language mismatches are known before the rule starts. Count
+			// them in the same task index, but do not spend a worker or a task-row
+			// write on each one. The scan's terminal SaveTask persists the totals.
+			if reason, skip := deterministicRuleSkip(m.ignoreLanguage(), rule, target); skip {
+				m.skipRule(queryTargetName(target), rule.RuleName, reason)
+				continue
+			}
 
 			swg.Add()
 			go func(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlowQueryInstance) {
-				defer m.SaveTask()
+				// Done runs last, so Wait cannot return while this snapshot is still
+				// being queued. The scan boundary then flushes a newer snapshot.
 				defer swg.Done()
+				defer m.queueTaskSnapshot()
 				if utils.IsNil(target) {
 					log.Errorf("SyntaxFlow Scan Failed:the query target is nil")
 					return
 				}
-				m.Query(rule, target)
+				var options []ssaapi.QueryOption
+				if rule.IsSourceMode() && sourceRuntimes[target] != nil {
+					options = append(options, ssaapi.QueryWithSourceScanRuntime(sourceRuntimes[target]))
+				}
+				m.Query(rule, target, options...)
 			}(rule, target)
 		}
 	}
 	swg.Wait()
+	for _, runtime := range sourceRuntimes {
+		if err := runtime.Wait(m.ctx); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
 	return errs
 }
 
@@ -126,6 +151,7 @@ func queryTargetName(target ssaapi.SyntaxFlowQueryInstance) string {
 
 func (m *scanManager) skipRule(program, rule, reason string) {
 	m.markRuleSkipped()
+	log.Infof("[code-scan-rule] program=%q rule=%q status=skipped duration=0s duration_ms=0 reason=%q", program, rule, reason)
 	if m.processMonitor == nil {
 		return
 	}
@@ -133,9 +159,16 @@ func (m *scanManager) skipRule(program, rule, reason string) {
 	m.processMonitor.EmitEvent()
 }
 
+// ruleMatchesQueryTarget decides whether a rule runs on a target on its own.
+// A Program is a multi-mode target (its Query dispatches by the rule mode), so
+// it accepts every mode; the single-mode targets accept only their own mode,
+// and an SSA rule never runs on a raw source target.
 func ruleMatchesQueryTarget(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlowQueryInstance) bool {
 	if rule == nil || target == nil {
 		return false
+	}
+	if _, ok := target.(*ssaapi.Program); ok {
+		return true
 	}
 	switch schema.ValidRuleMode(rule.Mode) {
 	case schema.SFR_MODE_SOURCE:
@@ -155,22 +188,35 @@ func ruleMatchesQueryTarget(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlo
 	}
 }
 
-func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlowQueryInstance) {
-	targetName := queryTargetName(target)
+func (m *scanManager) ignoreLanguage() bool {
+	return m != nil && m.Config != nil && m.Config.GetScanIgnoreLanguage()
+}
+
+// deterministicRuleSkip reports mismatches that do not depend on other rules
+// having already run. Struct-already-ran stays in Query so a rule can observe
+// work finished by an earlier worker.
+func deterministicRuleSkip(ignoreLanguage bool, rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlowQueryInstance) (string, bool) {
+	if rule == nil || target == nil {
+		return "", false
+	}
 	if !ruleMatchesQueryTarget(rule, target) {
-		m.skipRule(targetName, rule.RuleName, "skipped: target-mode mismatch")
+		return "skipped: target-mode mismatch", true
+	}
+	if !ignoreLanguage && !rule.IsSourceMode() && rule.Language != ssaconfig.General && rule.Language != target.GetLanguage() {
+		return "skipped: language mismatch", true
+	}
+	return "", false
+}
+
+func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlowQueryInstance, queryOptions ...ssaapi.QueryOption) {
+	targetName := queryTargetName(target)
+	if reason, skip := deterministicRuleSkip(m.ignoreLanguage(), rule, target); skip {
+		m.skipRule(targetName, rule.RuleName, reason)
 		return
 	}
 	if rule.IsStructMode() {
 		if prog, ok := target.(*ssaapi.Program); ok && prog.StructRulesAlreadyRan(rule) {
 			m.skipRule(targetName, rule.RuleName, "skipped: struct already ran")
-			return
-		}
-	}
-	// 语言匹配检查（source 模式规则按文件 glob 过滤，不强制语言对齐）
-	if !m.Config.GetScanIgnoreLanguage() && !rule.IsSourceMode() {
-		if rule.Language != ssaconfig.General && rule.Language != target.GetLanguage() {
-			m.skipRule(targetName, rule.RuleName, "skipped: language mismatch")
 			return
 		}
 	}
@@ -223,11 +269,13 @@ func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlo
 	}
 
 	// 将查询逻辑包装到函数中
+	ruleStartedAt := time.Now()
 	f := func() error {
 		var ruleRecorder *diagnostics.Recorder
 		option := []ssaapi.QueryOption{}
 		option = append(option,
 			ssaapi.QueryWithSSAConfig(m.Config.Config),
+			ssaapi.QueryWithRuleLoader(&m.Config.rulePreparationState().loader),
 			ssaapi.QueryWithContext(ruleCtx),
 			ssaapi.QueryWithTaskID(m.taskID),
 			ssaapi.QueryWithProcessCallback(func(f float64, info string) {
@@ -240,6 +288,13 @@ func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlo
 			}),
 			ssaapi.QueryWithProjectId(m.Config.GetProjectID()),
 		)
+		option = append(option, queryOptions...)
+		if m.Config != nil && m.Config.scanRuntime != nil {
+			rt := m.Config.scanRuntime
+			option = append(option, ssaapi.QueryWithOnRisk(func(risk *schema.SSARisk, audits ...func(*gorm.DB) error) {
+				rt.SubmitRisk(risk, audits...)
+			}))
+		}
 		if workBudget != nil {
 			option = append(option, ssaapi.QueryWithWorkBudget(workBudget))
 		}
@@ -302,6 +357,33 @@ func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlo
 				targetName, rule.RuleName, err)
 		}
 
+		resultStatus := "success"
+		switch {
+		case bailedByBudget:
+			resultStatus = "partial"
+		case err != nil:
+			resultStatus = "failed"
+		}
+		var riskCount int64
+		if res != nil {
+			riskCount = int64(res.RiskCount())
+		}
+		var workLimitValue, workVisited int64
+		if workBudget != nil {
+			workLimitValue = int64(workBudget.Limit())
+			workVisited = int64(workBudget.Visited())
+		}
+		errorMessage := ""
+		if err != nil {
+			errorMessage = err.Error()
+		} else if bailedByBudget {
+			errorMessage = bailReason
+		}
+		ruleDuration := time.Since(ruleStartedAt)
+		log.Infof("[code-scan-rule] program=%q rule=%q status=%s duration=%s duration_ms=%d risks=%d work_limit=%d work_visited=%d error=%q",
+			targetName, rule.RuleName, resultStatus, ruleDuration, ruleDuration.Milliseconds(), riskCount,
+			workLimitValue, workVisited, errorMessage)
+
 		if enableRulePerf && ruleRecorder != nil {
 			snapshots := ruleRecorder.Snapshot()
 			if len(snapshots) > 0 {
@@ -350,9 +432,8 @@ func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlo
 }
 
 func (m *scanManager) notifyResult(res *ssaapi.SyntaxFlowResult) {
-	if m.Config.Reporter != nil {
-		m.Config.Reporter.AddSyntaxFlowResult(res)
-	}
+	// Risks reach the report through the scan callback. This only keeps the
+	// stage metrics and the caller's result callback.
 	m.processMonitor.RiskCount.Add(int64(res.RiskCount()))
 	if m.Config.resultCallback != nil {
 		m.Config.resultCallback(&ScanResult{
@@ -378,10 +459,10 @@ func (m *scanManager) notifyDone() {
 
 // saveReport writes the findings collected so far.
 //
-// It runs at every stage boundary: each stage streams its results into the
-// shared report, so saving here keeps a complete snapshot on disk even when a
-// later stage fails. The report rewrites its output, so the final save (see
-// ScanProject) simply supersedes the intermediate ones.
+// Risks arrive through ApplyRiskUpdate as the scan accepts them, so the
+// document is already current here. Saving at each stage boundary keeps a
+// complete snapshot even when a later stage fails. The report rewrites its
+// output, so the final save (see ScanProject) supersedes the intermediate ones.
 func (m *scanManager) saveReport() {
 	if m == nil || m.Config == nil || m.Config.Reporter == nil {
 		return

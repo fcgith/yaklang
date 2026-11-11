@@ -2,8 +2,8 @@ package ssadb
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
-	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/yaklang/yaklang/common/utils"
@@ -14,10 +14,10 @@ import (
 
 type IrCode struct {
 	gorm.Model
-	CodeID int64 `json:"code_id" gorm:"index:idx_ircode_program_codeid;index"`
+	CodeID int64 `json:"code_id"`
 
-	ProgramName string `json:"program_name" gorm:"index:idx_ircode_program_codeid;index:idx_ircode_program_opcode;index"`
-	Version     string `json:"package_version" gorm:"index"`
+	ProgramName string `json:"program_name"`
+	Version     string `json:"package_version"`
 
 	// source code
 	SourceCodeStartOffset int64  `json:"source_code_start_offset"`
@@ -25,7 +25,7 @@ type IrCode struct {
 	SourceCodeHash        string `json:"source_code_hash"` // default md5
 
 	// opcode
-	Opcode     int64  `json:"opcode" gorm:"index:idx_ircode_program_opcode"`
+	Opcode     int64  `json:"opcode"`
 	OpcodeName string `json:"opcode_name"`
 
 	// just for binary and unary operator
@@ -90,7 +90,7 @@ type IrCode struct {
 	Variable StringSlice `json:"variable" gorm:"type:text"`
 
 	// compile hash means: hash[ (file-content)+(program-name)+(package-name)+(program-index) ]
-	ProgramCompileHash string `json:"program_compile_hash" gorm:"index"`
+	ProgramCompileHash string `json:"program_compile_hash"`
 
 	// type
 	TypeID int64 `json:"type_id"`
@@ -102,7 +102,7 @@ type IrCode struct {
 	// not important information
 	ExtraInformation string `json:"extra_information" gorm:"type:text"`
 
-	ConstType string `json:"const_type" gorm:"index"`
+	ConstType string `json:"const_type"`
 }
 
 func (*IrCode) TableName() string {
@@ -126,7 +126,9 @@ func GetIrCodeItemById(db *gorm.DB, progName string, id int64) *IrCode {
 	// soft-delete semantics, custom scanners). Context timeout/cancel on the
 	// native path does not fall back to GORM (that would re-hang).
 	native, err := nativeGetIrCodeItemByIdErr(db, progName, id)
-	if native != nil {
+	if native != nil || err == nil {
+		// A successful native lookup may be empty. Retrying that normal miss
+		// through GORM doubles SQL traffic during compile-time lazy lookups.
 		return native
 	}
 	if nativeContextErr(err) {
@@ -147,79 +149,75 @@ func (ir *IrCode) Save(db *gorm.DB) error {
 	return db.Save(ir).Error
 }
 
+// UpsertIrCode writes one row. It shares the batched upsert path so a single
+// row is still one INSERT ... ON CONFLICT statement instead of a per-row
+// FirstOrCreate SELECT that PG can resolve via the wrong (program_name, opcode)
+// index on large tables (30ms+ scans).
 func UpsertIrCode(db *gorm.DB, ir *IrCode) error {
 	if db == nil || ir == nil {
 		return nil
 	}
-	// Prefer the batched delete+insert path even for one row: FirstOrCreate
-	// issues a SELECT that PG can resolve via the wrong (program_name, opcode)
-	// index on large tables, turning each upsert into a 30ms+ scan.
 	return SaveIrCodeBatch(db, []*IrCode{ir})
 }
 
-// irCodeBatchChunk bounds rows per CreateInBatches call. IrCode is a wide
+// irCodeBatchChunk bounds rows per SaveInBatches chunk. IrCode is a wide
 // model; 500 matches saveIrCodeInsertBatchSize and stays under SQLite's
 // host-parameter ceiling.
 const irCodeBatchChunk = 500
 
-// SaveIrCodeBatch issues a chunked batched UPSERT for IR codes: per chunk it
-// DELETEs the (program_name, code_id) rows this batch is about to write, then
-// bulk-INSERTs them. Same pattern as SaveIrTypeBatch — replaces N
-// FirstOrCreate round-trips (SELECT+UPDATE) with one DELETE + one multi-row
-// INSERT. Soft-deleted rows are removed with Unscoped so the UNIQUE index
-// ux_ir_codes_program_code cannot block the insert.
+// SaveIrCodeBatch writes IR snapshots as batched in-place upserts on
+// (program_name, code_id) via gorm SaveInBatches (native upsert or DM MERGE).
+// Updating in place keeps row ids and their secondary-index entries
+// stable across the resident-cache flush, and a rejected statement cannot first
+// remove the previous snapshot. The batch still inserts rows that do not exist
+// yet, so one call both publishes new IR and refreshes changed IR.
+// ux_ir_codes_program_code is created with the schema; SaveInBatches skips nil
+// elements itself and owns one transaction unless a caller supplied one.
 func SaveIrCodeBatch(db *gorm.DB, items []*IrCode) error {
 	if db == nil || len(items) == 0 {
 		return nil
 	}
-	clean := make([]*IrCode, 0, len(items))
-	for _, it := range items {
-		if it != nil {
-			clean = append(clean, it)
-		}
+	// One call keeps the batch in a single transaction, so a rejected row
+	// rolls back the earlier chunks too. PostgreSQL rejects a statement that
+	// names the same conflict key twice, so the batch keeps the last row per
+	// (program_name, code_id) before SaveInBatches splits it.
+	deduped := dedupeIrCodeConflictKeys(items)
+	if len(deduped) == 0 {
+		return nil
 	}
-	for start := 0; start < len(clean); start += irCodeBatchChunk {
-		end := start + irCodeBatchChunk
-		if end > len(clean) {
-			end = len(clean)
-		}
-		if err := bulkUpsertIrCode(db, clean[start:end]); err != nil {
-			return err
-		}
+	if err := db.New().SaveInBatches(deduped, irCodeBatchChunk, "program_name", "code_id").Error; err != nil {
+		return fmt.Errorf("upsert IR snapshot: %w", err)
+	}
+	for program, rows := range irCodeRowsByProgram(deduped) {
+		counter := irCodeWriteCounterFor(program)
+		counter.updateStatements.Add(int64((rows + irCodeBatchChunk - 1) / irCodeBatchChunk))
+		counter.updateRows.Add(int64(rows))
 	}
 	return nil
 }
 
-func bulkUpsertIrCode(db *gorm.DB, items []*IrCode) error {
-	if len(items) == 0 {
-		return nil
+// dedupeIrCodeConflictKeys keeps the last row for a repeated
+// (program_name, code_id) so one upsert chunk cannot name a conflict key twice.
+func dedupeIrCodeConflictKeys(items []*IrCode) []*IrCode {
+	type conflictKey struct {
+		program string
+		codeID  int64
 	}
-	progCodeIDs := make(map[string][]interface{}, 1)
-	for _, it := range items {
-		progCodeIDs[it.ProgramName] = append(progCodeIDs[it.ProgramName], it.CodeID)
-		// Fresh insert after delete: clear primary key / soft-delete state so
-		// CreateInBatches allocates a new row instead of colliding on id.
-		it.ID = 0
-		it.CreatedAt = time.Time{}
-		it.UpdatedAt = time.Time{}
-		it.DeletedAt = nil
-	}
-	for prog, ids := range progCodeIDs {
-		for i := 0; i < len(ids); i += 999 {
-			end := i + 999
-			if end > len(ids) {
-				end = len(ids)
-			}
-			if err := db.Where("program_name = ? AND code_id IN (?)", prog, ids[i:end]).
-				Unscoped().Delete(&IrCode{}).Error; err != nil {
-				return err
-			}
+	seen := make(map[conflictKey]int, len(items))
+	out := items[:0]
+	for _, item := range items {
+		if item == nil {
+			continue
 		}
+		key := conflictKey{program: item.ProgramName, codeID: item.CodeID}
+		if index, ok := seen[key]; ok {
+			out[index] = item
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, item)
 	}
-	if r := db.CreateInBatches(items, irCodeBatchChunk); r.Error != nil {
-		return r.Error
-	}
-	return nil
+	return out
 }
 
 var hash = []string{
@@ -294,11 +292,11 @@ func (r *IrCode) GetStartAndEndPositions() (*memedit.MemEditor, *memedit.Positio
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions failed: %v", err)
 	}
 	startOff, endOff := memedit.ClampOffsetPair(editor, int(r.SourceCodeStartOffset), int(r.SourceCodeEndOffset))
-	start, startErr := editor.GetPositionByOffsetWithError(startOff)
+	start, startErr := editor.GetSourceBoundaryPosition(startOff)
 	if startErr != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions start: %v", startErr)
 	}
-	end, endErr := editor.GetPositionByOffsetWithError(endOff)
+	end, endErr := editor.GetSourceBoundaryPosition(endOff)
 	if endErr != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions end: %v", endErr)
 	}

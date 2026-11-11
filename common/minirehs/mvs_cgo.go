@@ -14,15 +14,99 @@ package minirehs
 #else
 #include "native/mvscan/mvscan.c"
 #endif
+
+// Read-only qualification of the actual derived tables, including truth codes
+// that no concrete adjacent character pair can produce. Not a scan dispatch.
+static int mvs_assert_tables_1(const mvscan_db *db, int32_t idx,
+    int truth, int pos, uint64_t *out) {
+    if (!db || !out || idx < 0 || idx >= db->npat || truth < 0 || truth >= 64)
+        return -1;
+    int32_t unit = db->slotUnit[idx];
+    if (unit < 0 || unit >= db->nUnits) return -1;
+    const mvs_nfa *a = &db->units[unit];
+    if (!a->hasAssert || a->nword != 1 || pos < 0 || pos >= a->npos) return -1;
+    out[0] = a->condFollowEval != NULL;
+    out[1] = a->condFirstEval[truth];
+    out[2] = a->condFollowEval ? a->condFollowEval[(size_t)truth*a->npos+pos] : 0;
+    out[3] = a->condAcceptEval[truth];
+    return 0;
+}
+
+static int mvs_dfa_plan_kind(const mvscan_db *db, int32_t idx) {
+    if (!db || idx < 0 || idx >= db->npat) return -1;
+    int32_t unit = db->slotUnit[idx];
+    return unit < 0 || unit >= db->nUnits ? -1 : db->units[unit].hasDFA;
+}
+
+// Read-only qualification of the checked base-arena loader, outside scans.
+static int mvs_base_arena_layout(const mvscan_db *db, int32_t idx, uint64_t *out) {
+    if (!db || !out || idx < -1 || idx >= db->npat) return 0;
+    int32_t unit = idx < 0 ? db->mergedUnit : db->slotUnit[idx];
+    if (unit < 0 || unit >= db->nUnits) return 0;
+    const mvs_nfa *a = &db->units[unit];
+    if (!a->baseArena) return 0;
+    uintptr_t start = (uintptr_t)a->baseArena, cur = start;
+    const uint64_t *words[] = {a->firstUnanchored, a->firstAnchored, a->lastAny,
+        a->lastEnd, a->follow, a->reach};
+    const size_t sizes[] = {a->nword, a->nword, a->nword, a->nword,
+        (size_t)a->npos*a->nword, (size_t)a->nsym*a->nword};
+    for (int i = 0; i < 6; i++) {
+        if (cur % 8 || (uintptr_t)words[i] != cur) return 0;
+        cur += sizes[i]*8;
+    }
+    if (cur % 4 || (uintptr_t)a->cuts != cur) return 0;
+    cur += ((size_t)a->nsym+1)*4;
+    if ((uintptr_t)a->asciiSym != cur) return 0;
+    cur += 128*4;
+    if ((uintptr_t)a->posPat != cur) return 0;
+    cur += (size_t)a->npos*4;
+    out[0] = sizeof(mvs_nfa); out[1] = cur-start;
+    return 1;
+}
+
+// Qualified singleton: retain the original merged LimEx, start-byte skipping
+// and necessary precheck. Invoke its existing scalar presence mode directly;
+// the per-rule dispatcher would select a different loop or DFA ASCII prescan.
+static int mvs_merged_singleton_exists(const mvscan_db *db, const uint8_t *data, size_t len) {
+    if (!db || (!data && len) || db->mergedUnit < 0 || db->mergedUnit >= db->nUnits)
+        return MVS_ERR_INVALID;
+    const mvs_nfa *a = &db->units[db->mergedUnit];
+    if (a->nword != 1 || a->hasAssert) return MVS_ERR_INVALID;
+    // Same necessary condition as mvscan_db_merged_scan. Non-ASCII cannot
+    // be rejected by an ASCII start mask, including invalid UTF bytes.
+    if (a->hasStartByteMask) {
+        int possible = 0;
+        for (size_t i = 0; i < len; i++) {
+            uint8_t b = data[i];
+            if (b >= 0x80 || a->startByteMask[b]) { possible = 1; break; }
+        }
+        if (!possible) return 0;
+    }
+    return nfa_run_scalar(a, data, len, 0, NULL, 0, NULL, 0, NULL);
+}
 */
 import "C"
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 )
+
+func (k *mvsKernel) baseArenaLayout(idx int) (structBytes, baseBytes uint64, ok bool) {
+	if k == nil || k.db == nil {
+		return 0, 0, false
+	}
+	var out [2]C.uint64_t
+	status := C.mvs_base_arena_layout(k.db, C.int32_t(idx), &out[0])
+	runtime.KeepAlive(k)
+	if status == 0 {
+		return 0, 0, false
+	}
+	return uint64(out[0]), uint64(out[1]), true
+}
 
 // anchSpanPool 复用锚定式 spans 的 lo/hi []int32 切片, 避免 cgo 热路径每次分配.
 // 锚定批处理每报文每 pattern 调用 nfaExistsAnchored, 若每次 make 会成为分配大头.
@@ -56,7 +140,7 @@ func anchSpanPut(b *anchSpanBufs) {
 // 本文件是纯 C99 运行期内核 (native/mvscan) 的 cgo 薄封装 (范式同 prefilter_cgo.go):
 // Go 把编译产物序列化为平台无关 blob 传入 C, C 出力做位并行存在性扫描. 只要启用 CGO
 // (CGO_ENABLED=1) 即默认编入此 C 内核 (无需额外 build tag), 这是"默认 CGO 最强优化"档;
-// CGO_ENABLED=0 时走 mvs_stub.go 退化为纯 Go 参考执行器, 全平台可移植零依赖.
+// Go 参考执行器用于差分验证，整个包的 PCRE2 确认器仍依赖 cgo。
 //
 // 契约: 存在性 (nfaExists / mergedScan) 走 C, 与 Go existsIn / scanExist 逐位一致 (差分护栏
 // 见 mvs_cgo_test.go). 定位 (findAllLoc) 始终走已验证的 Go 路径, C 内核只判存在性 (符合
@@ -69,22 +153,17 @@ func anchSpanPut(b *anchSpanBufs) {
 type mvsKernel struct {
 	db   *C.mvscan_db
 	npat int
+	// Derived before publication; -1 preserves the original merged executor.
+	mergedSingleton int
+	// Ordinary fault-injection tests configure this before any scan starts.
+	// Immutable production databases leave it nil.
+	testStatus func(stage string, index, status int) int
 }
 
 // mvsKernelAvailable 报告当前构建是否编入了 C 运行期内核.
 func mvsKernelAvailable() bool { return true }
 
-// newMVSKernel 在 minirehs_mvs 构建下把 db 的 per-pattern NFA + 合并 always-on 序列化为
-// 平台无关 blob 并交 C 内核解析; 失败 (无 NFA / 解析错误) 返回 nil, 调用方据此退化为纯 Go.
-func newMVSKernel(d *mvsDB) *mvsKernel {
-	if d == nil {
-		return nil
-	}
-	blob := buildMVSBlob(d.nfas, d.merged, d.assertNecFactor, d.hasLiterals)
-	return openMVSKernel(blob, d.n)
-}
-
-// openMVSKernel 解析一段 blob 为 C 内核句柄. 供 newMVSKernel 与差分测试共用.
+// openMVSKernel 解析一段 blob 为 C 内核句柄，供编译、镜像加载与差分测试共用。
 func openMVSKernel(blob []byte, npat int) *mvsKernel {
 	if len(blob) == 0 {
 		return nil
@@ -93,10 +172,21 @@ func openMVSKernel(blob []byte, npat int) *mvsKernel {
 	if h == nil {
 		return nil
 	}
-	k := &mvsKernel{db: h, npat: npat}
+	k := &mvsKernel{db: h, npat: npat, mergedSingleton: -1}
 	// 兜底: 即便调用方漏调 close, GC 回收时也释放 C 内存 (close 仍是首选, 及时确定性释放).
 	runtime.SetFinalizer(k, func(x *mvsKernel) { x.close() })
 	return k
+}
+
+func (k *mvsKernel) configureMergedSingleton(d *mvsDB) {
+	if k == nil || k.db == nil {
+		return
+	}
+	k.mergedSingleton = -1
+	if idx, ok := singleMergedMember(d); ok && C.mvscan_db_has_merged(k.db) != 0 {
+		k.mergedSingleton = idx
+	}
+	runtime.KeepAlive(k)
 }
 
 func (k *mvsKernel) close() {
@@ -108,22 +198,39 @@ func (k *mvsKernel) close() {
 	runtime.SetFinalizer(k, nil)
 }
 
+func (k *mvsKernel) assertTables1(idx, truth, pos int) ([4]uint64, bool) {
+	var out [4]uint64
+	status := C.mvs_assert_tables_1(k.db, C.int32_t(idx), C.int(truth), C.int(pos),
+		(*C.uint64_t)(unsafe.Pointer(&out[0])))
+	runtime.KeepAlive(k)
+	return out, status == 0
+}
+
+func (k *mvsKernel) dfaPlanKind(idx int) int {
+	kind := C.mvs_dfa_plan_kind(k.db, C.int32_t(idx))
+	runtime.KeepAlive(k)
+	return int(kind)
+}
+
 // nfaExists 判定 pattern 下标 idx 的 NFA 是否在 data 中存在命中 (C 实现, == Go existsIn).
 func (k *mvsKernel) nfaExists(idx int, data []byte) bool {
-	return k.nfaExistsImpl(idx, data, false)
+	return mustNativeMatch(k.nfaExistsErr(idx, data))
 }
 
 // nfaExistsScalar 强制走 C 标量孪生 (绕过 SIMD 分发), 仅供差分测试.
 func (k *mvsKernel) nfaExistsScalar(idx int, data []byte) bool {
-	return k.nfaExistsImpl(idx, data, true)
+	return mustNativeMatch(k.nfaExistsImpl(idx, data, true))
 }
 
 // findAllLoc 在 C 内核中枚举 lean NFA 的 leftmost-longest 非重叠定位。
 // C 先前只做存在性判定，命中后 Go 会再次整段扫描以取 span；此入口把两段扫描收敛为
-// 一次 C 定位。返回 false 表示该 NFA 不适用，调用方必须安全回退 Go 定位器。
-func (k *mvsKernel) findAllLoc(idx int, data []byte, sc *scratch) ([]int32, bool) {
-	if k == nil || k.db == nil || len(data) == 0 || sc == nil {
-		return nil, false
+// 一次 C 定位。调用方先检查 lean NFA 资格；执行失败必须返回 error。
+func (k *mvsKernel) findAllLocErr(idx int, data []byte, sc *scratch) ([]int32, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if k == nil || k.db == nil || sc == nil {
+		return nil, &nativeExecutionError{stage: "locate", index: idx, code: -1}
 	}
 	const initialPairs = 16
 	if cap(sc.cLocs) < initialPairs*2 {
@@ -138,11 +245,12 @@ func (k *mvsKernel) findAllLoc(idx int, data []byte, sc *scratch) ([]int32, bool
 			(*C.int32_t)(unsafe.Pointer(&sc.cLocs[0])), C.int32_t(capPairs)))
 		keepAlive(data)
 		runtime.KeepAlive(sc.cLocs)
+		got = int32(k.nativeStatus("locate", idx, int(got)))
 		if got < 0 {
-			return nil, false
+			return nil, &nativeExecutionError{stage: "locate", index: idx, code: int(got)}
 		}
 		if int(got) <= capPairs {
-			return sc.cLocs[:int(got)*2], true
+			return sc.cLocs[:int(got)*2], nil
 		}
 		need := int(got) * 2
 		sc.cLocs = make([]int32, need)
@@ -153,17 +261,20 @@ func (k *mvsKernel) findAllLoc(idx int, data []byte, sc *scratch) ([]int32, bool
 // 注入区间内注入起点 (锚定式语义, 对应 Go existsInAnchored). spans 须已排序合并.
 // 与 Go existsInAnchored 逐位一致 (差分护栏). 返回 true 命中.
 func (k *mvsKernel) nfaExistsAnchored(idx int, data []byte, spans []anchorSpan) bool {
-	return k.nfaExistsAnchoredImpl(idx, data, spans, false)
+	return mustNativeMatch(k.nfaExistsAnchoredErr(idx, data, spans))
 }
 
 // nfaExistsAnchoredScalar 强制走 C 标量孪生, 仅供差分测试.
 func (k *mvsKernel) nfaExistsAnchoredScalar(idx int, data []byte, spans []anchorSpan) bool {
-	return k.nfaExistsAnchoredImpl(idx, data, spans, true)
+	return mustNativeMatch(k.nfaExistsAnchoredImpl(idx, data, spans, true))
 }
 
-func (k *mvsKernel) nfaExistsAnchoredImpl(idx int, data []byte, spans []anchorSpan, scalar bool) bool {
-	if k == nil || k.db == nil || len(spans) == 0 {
-		return false
+func (k *mvsKernel) nfaExistsAnchoredImpl(idx int, data []byte, spans []anchorSpan, scalar bool) (bool, error) {
+	if len(spans) == 0 {
+		return false, nil
+	}
+	if k == nil || k.db == nil {
+		return false, &nativeExecutionError{stage: "anchored", index: idx, code: -1}
 	}
 	// 把 Go anchorSpan (lo,hi int32) 拆为两个 []int32 传 C, 避免 C.mvs_span 的 Go 分配.
 	// 用 sync.Pool 复用 lo/hi 切片, 消除热路径 make 开销 (cgo 调用后归还).
@@ -190,15 +301,18 @@ func (k *mvsKernel) nfaExistsAnchoredImpl(idx int, data []byte, spans []anchorSp
 	runtime.KeepAlive(lo)
 	runtime.KeepAlive(hi)
 	anchSpanPut(buf)
-	return r == 1
+	return k.nativeMatch("anchored", idx, int(r))
 }
 
 // nfaExistsAssert 判定断言 NFA (hasAssert) 在 data 中是否存在命中 (C 实现).
 // bound 为预算的共享边界数组 (computeBoundariesC). 与 Go existsInAssertShared1 逐位一致.
 // 返回 true 命中 / false 不命中或无 C 断言 NFA.
-func (k *mvsKernel) nfaExistsAssert(idx int, data []byte, bound []byte) bool {
-	if k == nil || k.db == nil || len(data) == 0 || len(bound) < len(data)+1 {
-		return false
+func (k *mvsKernel) nfaExistsAssertErr(idx int, data []byte, bound []byte) (bool, error) {
+	if len(data) == 0 {
+		return false, nil
+	}
+	if k == nil || k.db == nil || len(bound) < len(data)+1 {
+		return false, &nativeExecutionError{stage: "assert", index: idx, code: -1}
 	}
 	var dptr *C.uint8_t
 	if len(data) > 0 {
@@ -211,13 +325,16 @@ func (k *mvsKernel) nfaExistsAssert(idx int, data []byte, bound []byte) bool {
 	r := C.mvscan_db_nfa_exists_assert(k.db, C.int32_t(idx), dptr, C.size_t(len(data)), bptr)
 	keepAlive(data)
 	runtime.KeepAlive(bound)
-	return r == 1
+	return k.nativeMatch("assert", idx, int(r))
 }
 
 // nfaExistsAssertSelf 自包含断言扫描 — C 内部预算边界, 省去 Go 侧 sharedBound 一次 cgo.
-func (k *mvsKernel) nfaExistsAssertSelf(idx int, data []byte, boundBuf []byte) bool {
-	if k == nil || k.db == nil || len(data) == 0 {
-		return false
+func (k *mvsKernel) nfaExistsAssertSelfErr(idx int, data []byte, boundBuf []byte) (bool, error) {
+	if len(data) == 0 {
+		return false, nil
+	}
+	if k == nil || k.db == nil {
+		return false, &nativeExecutionError{stage: "assert_self", index: idx, code: -1}
 	}
 	if cap(boundBuf) < len(data)+1 {
 		boundBuf = make([]byte, len(data)+1)
@@ -231,18 +348,21 @@ func (k *mvsKernel) nfaExistsAssertSelf(idx int, data []byte, boundBuf []byte) b
 	r := C.mvscan_db_nfa_exists_assert_self(k.db, C.int32_t(idx), dptr, C.size_t(len(data)), bptr)
 	keepAlive(data)
 	runtime.KeepAlive(boundBuf)
-	return r == 1
+	return k.nativeMatch("assert_self", idx, int(r))
 }
 
 // nfaExistsAssertOnline 把多字断言的边界生成与 NFA 递推融合为单次 C 遍历。
-func (k *mvsKernel) nfaExistsAssertOnline(idx int, data []byte) bool {
-	if k == nil || k.db == nil || len(data) == 0 {
-		return false
+func (k *mvsKernel) nfaExistsAssertOnlineErr(idx int, data []byte) (bool, error) {
+	if len(data) == 0 {
+		return false, nil
+	}
+	if k == nil || k.db == nil {
+		return false, &nativeExecutionError{stage: "assert_online", index: idx, code: -1}
 	}
 	dptr := (*C.uint8_t)(unsafe.Pointer(&data[0]))
 	r := C.mvscan_db_nfa_exists_assert_online(k.db, C.int32_t(idx), dptr, C.size_t(len(data)))
 	keepAlive(data)
-	return r == 1
+	return k.nativeMatch("assert_online", idx, int(r))
 }
 
 // nfaExistsAssertMany 一次 cgo、一次数据遍历推进多条断言 always-on NFA.
@@ -275,12 +395,18 @@ func (k *mvsKernel) dfaScanBatch(idxs []int32, data []byte, sc *scratch) []int32
 	keepAlive(data)
 	runtime.KeepAlive(idxs)
 	runtime.KeepAlive(sc.cmerged)
+	if got < 0 {
+		panic(&nativeExecutionError{stage: "dfa_batch", index: -1, code: int(got)})
+	}
 	return sc.cmerged[:got]
 }
 
 func (k *mvsKernel) nfaExistsAssertMany(idxs []int32, data []byte, sc *scratch) []byte {
-	if k == nil || k.db == nil || len(idxs) == 0 {
+	if len(idxs) == 0 {
 		return nil
+	}
+	if k == nil || k.db == nil || sc == nil {
+		return nativeFailedBatch(len(idxs), -1)
 	}
 	if cap(sc.assertBatchOut) < len(idxs) {
 		sc.assertBatchOut = make([]byte, len(idxs))
@@ -305,16 +431,20 @@ func (k *mvsKernel) nfaExistsAssertMany(idxs []int32, data []byte, sc *scratch) 
 	keepAlive(data)
 	runtime.KeepAlive(idxs)
 	runtime.KeepAlive(out)
+	k.nativeBatchStatus("assert_many", idxs, out)
 	return out
 }
 
 // combinedScan: 单次数据遍历同时跑 merged NFA + assert NFA.
 // 返回 (mergedHits, assertHits).
-func (k *mvsKernel) combinedScan(data []byte, assertIdxs []int32, keepBound bool, sc *scratch) ([]int, []int) {
+func (k *mvsKernel) combinedScanErr(data []byte, assertIdxs []int32, keepBound bool, sc *scratch) ([]int, []int, error) {
+	if k == nil || k.db == nil || sc == nil {
+		return nil, nil, &nativeExecutionError{stage: "combined", index: -1, code: -1}
+	}
 	sc.mergedHits = sc.mergedHits[:0]
 	sc.assertHits = sc.assertHits[:0]
-	if k == nil || k.db == nil || len(data) == 0 {
-		return sc.mergedHits, sc.assertHits
+	if len(data) == 0 {
+		return sc.mergedHits, sc.assertHits, nil
 	}
 	n := len(data)
 	// mergedSeen
@@ -330,6 +460,8 @@ func (k *mvsKernel) combinedScan(data []byte, assertIdxs []int32, keepBound bool
 	mergedCap := k.npat
 	if cap(sc.cmerged) < mergedCap {
 		sc.cmerged = make([]int32, mergedCap)
+	} else {
+		sc.cmerged = sc.cmerged[:mergedCap]
 	}
 	// 只有后续 Go 多字断言仍会消费边界数组时才物化；C 内的 single-word
 	// assert 直接使用在线生成的 bpre/bpost，无需每字节写回内存。
@@ -393,13 +525,18 @@ func (k *mvsKernel) combinedScan(data []byte, assertIdxs []int32, keepBound bool
 	runtime.KeepAlive(assertIdxs)
 	runtime.KeepAlive(assertOutBuf)
 
+	assertTotal = int32(k.nativeStatus("combined", -1, int(assertTotal)))
+	if assertTotal < 0 {
+		return nil, nil, &nativeExecutionError{stage: "combined", index: -1, code: int(assertTotal)}
+	}
+
 	for i := int32(0); i < sc.cmergedTotal && i < int32(mergedCap); i++ {
 		sc.mergedHits = append(sc.mergedHits, int(sc.cmerged[i]))
 	}
 	for i := int32(0); i < assertTotal && i < int32(assertCap); i++ {
 		sc.assertHits = append(sc.assertHits, int(assertOutBuf[i]))
 	}
-	return sc.mergedHits, sc.assertHits
+	return sc.mergedHits, sc.assertHits, nil
 }
 
 // buf 容量须 >= len(data)+1. 返回 buf[:len(data)+1].
@@ -439,8 +576,11 @@ func (k *mvsKernel) computeBoundariesC(data []byte, buf []byte) []byte {
 // 把同一报文所有 lean anchored verifier 合并为一次跨界；默认路径仍可保守回退 Go gap-jump。
 func (k *mvsKernel) nfaExistsAnchoredMany(idxs []int32, data []byte,
 	patSpanOff []int32, spansLo, spansHi []int32, sc *scratch) []byte {
-	if k == nil || k.db == nil || len(idxs) == 0 {
+	if len(idxs) == 0 {
 		return nil
+	}
+	if k == nil || k.db == nil || sc == nil || len(patSpanOff) != len(idxs)+1 || len(spansLo) != len(spansHi) {
+		return nativeFailedBatch(len(idxs), -1)
 	}
 	if cap(sc.anchorBatchOut) < len(idxs) {
 		sc.anchorBatchOut = make([]byte, len(idxs))
@@ -474,15 +614,16 @@ func (k *mvsKernel) nfaExistsAnchoredMany(idxs []int32, data []byte,
 	runtime.KeepAlive(patSpanOff)
 	runtime.KeepAlive(spansLo)
 	runtime.KeepAlive(spansHi)
+	k.nativeBatchStatus("anchored_many", idxs, out)
 	return out
 }
 
 // simdEnabled 报告 C 内核是否编入 SIMD 加速档.
 func (k *mvsKernel) simdEnabled() bool { return C.mvscan_simd_enabled() != 0 }
 
-func (k *mvsKernel) nfaExistsImpl(idx int, data []byte, scalar bool) bool {
+func (k *mvsKernel) nfaExistsImpl(idx int, data []byte, scalar bool) (bool, error) {
 	if k == nil || k.db == nil {
-		return false
+		return false, &nativeExecutionError{stage: "exists", index: idx, code: -1}
 	}
 	if cgoDiagEnabled {
 		atomic.AddInt64(&cgoNfaExistsCalls, 1)
@@ -499,15 +640,18 @@ func (k *mvsKernel) nfaExistsImpl(idx int, data []byte, scalar bool) bool {
 		r = C.mvscan_db_nfa_exists(k.db, C.int32_t(idx), dptr, C.size_t(len(data)))
 	}
 	keepAlive(data)
-	return r == 1
+	return k.nativeMatch("exists", idx, int(r))
 }
 
 // nfaExistsMany 一次 cgo 调用判定 idxs 中每个 pattern 的 per-pattern NFA 是否在 data 命中,
 // 结果写入并返回 sc.batchOut (len==len(idxs), 1 命中/0 不命中). 把"每 pattern 一次 cgo"摊薄为
 // "每报文一次 cgo" (Phase 2 批处理). idxs 必须都是非断言、有 NFA 的 idx (断言 NFA 不入 C blob).
 func (k *mvsKernel) nfaExistsMany(idxs []int32, data []byte, sc *scratch) []byte {
-	if k == nil || k.db == nil || len(idxs) == 0 {
+	if len(idxs) == 0 {
 		return nil
+	}
+	if k == nil || k.db == nil || sc == nil {
+		return nativeFailedBatch(len(idxs), -1)
 	}
 	if cap(sc.batchOut) < len(idxs) {
 		sc.batchOut = make([]byte, len(idxs))
@@ -523,24 +667,41 @@ func (k *mvsKernel) nfaExistsMany(idxs []int32, data []byte, sc *scratch) []byte
 		(*C.uint8_t)(unsafe.Pointer(&sc.batchOut[0])))
 	keepAlive(data)
 	runtime.KeepAlive(idxs)
+	k.nativeBatchStatus("exists_many", idxs, sc.batchOut)
 	return sc.batchOut
 }
 
 // mergedScan 单趟扫描 data, 返回合并 always-on 自动机命中的成员 idx (按成员去重, 不触碰
 // fullDone; 跨步去重由调用方完成). 复用 sc.cseen / sc.cmerged / sc.mergedHits 缓冲.
 func (k *mvsKernel) mergedScan(data []byte, sc *scratch) []int {
-	return k.mergedScanImpl(data, sc, false)
+	hits, err := k.mergedScanErr(data, sc)
+	if err != nil {
+		panic(err)
+	}
+	return hits
 }
 
 // mergedScanBatch 批量扫描多条记录 (拼接为一个 buffer), 一次 cgo 调用.
 // recOff 长度 nrec+1: 第 i 条 = data[recOff[i]..recOff[i+1]).
 // 返回 (recIdx, memberIdx) 对列表.
-func (k *mvsKernel) mergedScanBatch(data []byte, recOff []int32, sc *scratch) [][2]int32 {
+func (k *mvsKernel) mergedScanBatch(data []byte, recOff []int32, sc *scratch) ([][2]int32, error) {
 	if k == nil || k.db == nil || C.mvscan_db_has_merged(k.db) == 0 || len(recOff) <= 1 {
-		return nil
+		return nil, nil
 	}
-	nrec := int32(len(recOff) - 1)
-	capPairs := nrec * 8
+	const maxNativeCount = 1<<31 - 1
+	nrec := len(recOff) - 1
+	if nrec > maxNativeCount || sc == nil {
+		return nil, fmt.Errorf("minirehs: invalid native merged batch size or scratch")
+	}
+	for i, off := range recOff {
+		if off < 0 || int64(off) > int64(len(data)) || i > 0 && off < recOff[i-1] {
+			return nil, fmt.Errorf("minirehs: invalid native merged batch offset at %d", i)
+		}
+	}
+	capPairs := 64
+	if nrec <= maxNativeCount/8 {
+		capPairs = nrec * 8
+	}
 	if capPairs < 64 {
 		capPairs = 64
 	}
@@ -559,35 +720,71 @@ func (k *mvsKernel) mergedScanBatch(data []byte, recOff []int32, sc *scratch) []
 			sc.cpairs = sc.cpairs[:capPairs*2]
 		}
 		optr := (*C.int32_t)(unsafe.Pointer(&sc.cpairs[0]))
-		got := int32(C.mvscan_db_merged_scan_batch(k.db, dptr, C.size_t(len(data)),
+		got := int(C.mvscan_db_merged_scan_batch(k.db, dptr, C.size_t(len(data)),
 			recOffPtr, C.int(nrec), optr, C.int(capPairs)))
 		keepAlive(data)
 		runtime.KeepAlive(recOff)
 		runtime.KeepAlive(sc.cpairs)
-		if got <= 0 {
-			return nil
+		if got < 0 {
+			return nil, &nativeExecutionError{stage: "merged_batch", index: -1, code: got}
+		}
+		if got == 0 {
+			return nil, nil
 		}
 		if got > capPairs {
+			if got > int(^uint(0)>>1)/2 {
+				return nil, fmt.Errorf("minirehs: native merged batch output size overflow")
+			}
 			capPairs = got
 			continue
 		}
 		out := make([][2]int32, 0, got)
-		for i := int32(0); i < got; i++ {
+		for i := 0; i < got; i++ {
 			out = append(out, [2]int32{sc.cpairs[i*2], sc.cpairs[i*2+1]})
 		}
-		return out
+		return out, nil
 	}
 }
 
 // mergedScanScalar 强制走 C 标量孪生, 仅供差分测试.
 func (k *mvsKernel) mergedScanScalar(data []byte, sc *scratch) []int {
-	return k.mergedScanImpl(data, sc, true)
+	hits, err := k.mergedScanImpl(data, sc, true)
+	if err != nil {
+		panic(err)
+	}
+	return hits
 }
 
-func (k *mvsKernel) mergedScanImpl(data []byte, sc *scratch, scalar bool) []int {
+func (k *mvsKernel) mergedScanImpl(data []byte, sc *scratch, scalar bool) ([]int, error) {
+	if k == nil || k.db == nil || sc == nil {
+		return nil, &nativeExecutionError{stage: "merged", index: -1, code: -1}
+	}
 	sc.mergedHits = sc.mergedHits[:0]
-	if k == nil || k.db == nil || C.mvscan_db_has_merged(k.db) == 0 {
-		return sc.mergedHits
+	if !scalar && k.mergedSingleton >= 0 {
+		// All members have completed at the first acceptance. Reuse the
+		// original merged scalar presence mode and retain merged error
+		// attribution. Scalar and fused/locating paths remain references.
+		if cgoDiagEnabled {
+			atomic.AddInt64(&cgoMergedCalls, 1)
+			atomic.AddInt64(&cgoMergedBytes, int64(len(data)))
+		}
+		var dptr *C.uint8_t
+		if len(data) > 0 {
+			dptr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+		}
+		n := k.nativeStatus("merged", -1, int(C.mvs_merged_singleton_exists(k.db, dptr, C.size_t(len(data)))))
+		keepAlive(data)
+		runtime.KeepAlive(k)
+		if n < 0 || n > 1 {
+			return nil, &nativeExecutionError{stage: "merged", index: -1, code: n}
+		}
+		if n == 1 {
+			sc.mergedHits = append(sc.mergedHits, k.mergedSingleton)
+		}
+		return sc.mergedHits, nil
+	}
+	if C.mvscan_db_has_merged(k.db) == 0 {
+		return sc.mergedHits, nil
 	}
 	// 去重位图 (长度 npat, 清零).
 	if cap(sc.cseen) < k.npat {
@@ -631,7 +828,7 @@ func (k *mvsKernel) mergedScanImpl(data []byte, sc *scratch, scalar bool) []int 
 			seenPtr, C.int32_t(len(sc.cseen)),
 			(*C.int32_t)(unsafe.Pointer(&sc.cmerged[0])), C.int32_t(len(sc.cmerged))))
 	}
-	n := callScan()
+	n := k.nativeStatus("merged", -1, callScan())
 
 	if n > len(sc.cmerged) {
 		// 极少: 缓冲不足截断, 清零去重位图后扩容重扫一次.
@@ -639,17 +836,85 @@ func (k *mvsKernel) mergedScanImpl(data []byte, sc *scratch, scalar bool) []int 
 			sc.cseen[i] = 0
 		}
 		sc.cmerged = make([]int32, n)
-		n = callScan()
+		n = k.nativeStatus("merged", -1, callScan())
 		if n > len(sc.cmerged) {
-			n = len(sc.cmerged)
+			keepAlive(data)
+			return nil, &nativeExecutionError{stage: "merged", index: -1, code: -2}
 		}
 	}
 	keepAlive(data)
+	runtime.KeepAlive(sc.cseen)
+	runtime.KeepAlive(sc.cmerged)
+	if n < 0 {
+		return nil, &nativeExecutionError{stage: "merged", index: -1, code: n}
+	}
 	for i := 0; i < n; i++ {
 		sc.mergedHits = append(sc.mergedHits, int(sc.cmerged[i]))
 	}
-	return sc.mergedHits
+	return sc.mergedHits, nil
 }
 
 // keepAlive 防止传入 C 期间 GC 回收底层数组 (cgo 调用同步, 此处显式标注语义).
 func keepAlive(b []byte) { runtime.KeepAlive(b) }
+
+func (k *mvsKernel) nfaExistsAssert(idx int, data []byte, bound []byte) bool {
+	return mustNativeMatch(k.nfaExistsAssertErr(idx, data, bound))
+}
+
+func (k *mvsKernel) nfaExistsAssertSelf(idx int, data []byte, boundBuf []byte) bool {
+	return mustNativeMatch(k.nfaExistsAssertSelfErr(idx, data, boundBuf))
+}
+
+func (k *mvsKernel) nfaExistsAssertOnline(idx int, data []byte) bool {
+	return mustNativeMatch(k.nfaExistsAssertOnlineErr(idx, data))
+}
+
+func (k *mvsKernel) nfaExistsErr(idx int, data []byte) (bool, error) {
+	return k.nfaExistsImpl(idx, data, false)
+}
+func (k *mvsKernel) nfaExistsAnchoredErr(idx int, data []byte, spans []anchorSpan) (bool, error) {
+	return k.nfaExistsAnchoredImpl(idx, data, spans, false)
+}
+func (k *mvsKernel) nativeStatus(stage string, idx, status int) int {
+	if k != nil && k.testStatus != nil {
+		return k.testStatus(stage, idx, status)
+	}
+	return status
+}
+func (k *mvsKernel) nativeMatch(stage string, idx, status int) (bool, error) {
+	status = k.nativeStatus(stage, idx, status)
+	if status < 0 || status > 1 {
+		return false, &nativeExecutionError{stage: stage, index: idx, code: status}
+	}
+	return status == 1, nil
+}
+
+// Batch slots encode signed native statuses modulo 256, not just Booleans.
+// The caller checks each slot in original callback order before reporting hits.
+func (k *mvsKernel) nativeBatchStatus(stage string, idxs []int32, out []byte) {
+	if k.testStatus != nil {
+		for i := range out {
+			out[i] = byte(k.nativeStatus(stage, int(idxs[i]), int(int8(out[i]))))
+		}
+	}
+}
+
+func (k *mvsKernel) findAllLoc(idx int, data []byte, sc *scratch) ([]int32, bool) {
+	locs, err := k.findAllLocErr(idx, data, sc)
+	if err != nil {
+		panic(err)
+	}
+	return locs, true
+}
+
+func (k *mvsKernel) mergedScanErr(data []byte, sc *scratch) ([]int, error) {
+	return k.mergedScanImpl(data, sc, false)
+}
+
+func (k *mvsKernel) combinedScan(data []byte, assertIdxs []int32, keepBound bool, sc *scratch) ([]int, []int) {
+	m, a, err := k.combinedScanErr(data, assertIdxs, keepBound, sc)
+	if err != nil {
+		panic(err)
+	}
+	return m, a
+}

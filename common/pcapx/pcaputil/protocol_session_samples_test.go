@@ -364,6 +364,24 @@ func TestProtocolSessionM1PCAP(t *testing.T) {
 		}
 		negativeWS := sample.name == "websocket-upgrade-text"
 		plaintext := (sample.protocol == "quic" && sample.name != "quic-v1-rfc9001-initial") || sample.protocol == "http3" || sample.protocol == "doq"
+		if sample.protocol == "quic" || sample.protocol == "http3" || sample.protocol == "doq" {
+			// These archived records really carry TCP. Retain every original
+			// byte/hash and require carrier rejection, rather than requiring a
+			// falsely selected QUIC session to produce a context error.
+			requireNoUDPOnlyQUICOnTCP(t, events)
+			require.Zero(t, stats.Decoded+stats.Deferred, sample.name)
+			require.Positive(t, stats.Unknown+stats.Incomplete, sample.name)
+			inputBytes := 0
+			for _, step := range sample.steps {
+				inputBytes += len(step.wire)
+			}
+			require.EqualValues(t, inputBytes, stats.InputBytes, "carrier qualification must not discard the TCP input")
+			require.Zero(t, stats.BufferedBytes)
+			for _, e := range events {
+				require.Equal(t, "tcp", e.Transport)
+				require.NotEqual(t, true, e.Session["Authentication Verified"])
+			}
+		}
 		if plaintext {
 			// Historical TCP-wrapped plaintext fixtures remain byte-identical. Their
 			// ordinary replay is now a negative authentication test, not wire coverage.
@@ -373,7 +391,6 @@ func TestProtocolSessionM1PCAP(t *testing.T) {
 				require.NotEqual(t, "http3", e.Protocol, sample.name)
 				require.NotEqual(t, "doq", e.Protocol, sample.name)
 			}
-			require.Positive(t, stats.Malformed+stats.ContextRequired, sample.name)
 			session, err := NewDecryptedQUICSession(DefaultParserBudget(), "synthetic fixture: "+sample.name)
 			require.NoError(t, err)
 			events = nil
@@ -389,9 +406,58 @@ func TestProtocolSessionM1PCAP(t *testing.T) {
 			require.Len(t, events, len(sample.steps), sample.name)
 			session.Close("fixture-end")
 			require.Zero(t, session.Stats().BufferedBytes)
+		} else if sample.name == "quic-v1-rfc9001-initial" {
+			// The same complete protected packet remains a positive algorithm
+			// test through the explicit QUIC-capable API. That does not turn its
+			// archived TCP wrapper into native UDP capture coverage.
+			session, sessionErr := NewProtocolSession(DefaultParserBudget())
+			require.NoError(t, sessionErr)
+			events = nil
+			for _, step := range sample.steps {
+				result := session.Feed(step.dir, time.Unix(1, 0), step.wire)
+				require.Nil(t, result.Err, sample.name)
+				for _, e := range result.Events {
+					require.Equal(t, true, e.Session["Authentication Verified"])
+					require.NotEqual(t, true, e.Session["Plaintext Input"])
+				}
+				events = append(events, result.Events...)
+			}
+			require.Len(t, events, len(sample.steps), sample.name)
+			session.Close("fixture-end")
+			require.Zero(t, session.Stats().BufferedBytes)
+		} else if sample.protocol == "radius" {
+			// Preserve the original archived request and answer bytes. RFC2865
+			// 4.1 requires NAS identity; an invalid request cannot own its reply.
+			require.EqualValues(t, 1, stats.Malformed)
+			require.Zero(t, stats.BufferedBytes)
+			require.Len(t, events, 2)
+			for i, e := range events {
+				require.Equal(t, sample.steps[i].wire, e.Raw)
+				require.Equal(t, i, e.Direction)
+				require.Equal(t, time.Unix(1700000000, int64(i)*1234), e.Timestamp)
+				require.Zero(t, e.TransactionID)
+				require.Zero(t, e.ResponseTo)
+				require.Equal(t, "radius-access-observed", e.Profile)
+			}
+			require.Nil(t, events[0].Session)
+			require.Equal(t, "malformed", events[0].Completeness)
+			f, queryErr := events[0].GetFields()
+			require.Nil(t, f)
+			rocTypedError(t, "MalformedMessage", queryErr)
+			require.Equal(t, "message", events[1].Completeness)
+			require.Equal(t, radiusM1ReplyFields("ambiguous-identifier", false), events[1].Session)
+			f, queryErr = events[1].GetFields()
+			require.NoError(t, queryErr)
+			require.Equal(t, radiusM1ReplyFields("ambiguous-identifier", false), f)
 		} else if !negativeWS && sample.protocol == "dcerpc" {
 			// The original M1 BindAck contains only fixed fields and omits the
 			// required result list. Preserve its bytes as a negative legacy sample.
+			require.Equal(t, uint64(1), stats.Malformed, sample.name)
+		} else if sample.name == "ssh-kex-newkeys" {
+			// Preserve the original bytes and hash. The old helper encodes an
+			// impossible one-byte Curve25519 public value and four-byte Ed25519
+			// signature. The first invalid method stops this connection; independent
+			// selected-context tests reject each fault without rewriting this PCAP.
 			require.Equal(t, uint64(1), stats.Malformed, sample.name)
 		} else if !negativeWS {
 			require.Zero(t, stats.Malformed, sample.name)
@@ -443,4 +509,15 @@ func TestProtocolSessionM1PCAP(t *testing.T) {
 	stored, err := trafficfixture.ReadFile(manifestPath)
 	require.NoError(t, err)
 	require.Contains(t, string(stored), doc.Samples[0].SHA256)
+}
+
+func radiusM1ReplyFields(association string, matched bool) map[string]any {
+	out := map[string]any{"Packet Name": "Access-Accept", "Code": 2, "Identifier": 7, "Packet Length": 20, "Padding Bytes": 0, "Authenticator": []byte("0123456789abcdef"), "Authentication": "not-verified", "Role": "response", "Observation Scope": "conversation", "Attributes": []map[string]any{}, "Attribute Count": 0}
+	if association != "" {
+		out["Association"] = association
+	}
+	if matched {
+		out["In Reply To"] = "Access-Request"
+	}
+	return out
 }

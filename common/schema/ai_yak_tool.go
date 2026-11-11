@@ -6,14 +6,19 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
+// Bump when builtin metadata, CLI conversion or SSA extraction changes its output.
+const BuiltinAIToolExtractorVersion = "1"
+
 type AIYakTool struct {
 	gorm.Model
 
-	Name string `json:"name" gorm:"unique_index"`
+	DefaultAsync bool `json:"default_async" gorm:"default:false"`
+
+	Name          string `json:"name" gorm:"unique_index"`
 	VerboseName   string `json:"verbose_name"`    // English string；列表双语另见 VerboseNameToI18n / VerboseNameI18n
 	VerboseNameZh string `json:"verbose_name_zh"` // Chinese storage；勿把 gRPC VerboseName 改成 I18n 对象
 	Description   string `json:"description" gorm:"type:text;index"`
-	Keywords    string `json:"keywords" gorm:"type:text;index"`
+	Keywords      string `json:"keywords" gorm:"type:text;index"`
 	// 工具使用说明，在参数生成阶段披露给 AI（2阶段披露），帮助 AI 更好地使用参数
 	Usage      string `json:"usage" gorm:"type:text"`
 	Content    string `json:"content" gorm:"type:text"`
@@ -46,6 +51,7 @@ func (a *AIYakTool) ToUpdateMap() map[string]interface{} {
 		"hash":                 a.CalcHash(),
 		"is_favorite":          a.IsFavorite,
 		"enable_ai_output_log": a.EnableAIOutputLog,
+		"default_async":        a.DefaultAsync,
 	}
 }
 
@@ -83,6 +89,9 @@ func (*AIYakTool) TableName() string {
 }
 
 func (d *AIYakTool) CalcHash() string {
+	if d.IsBuiltin {
+		return utils.CalcSha1(d.Name, d.Content, d.Path, BuiltinAIToolExtractorVersion)
+	}
 	return utils.CalcSha1(d.Name, d.Content, d.Params, d.Path, d.Description, d.Keywords, d.Usage)
 }
 

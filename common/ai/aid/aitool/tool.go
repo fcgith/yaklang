@@ -21,7 +21,17 @@ import (
 	"github.com/yaklang/yaklang/common/mcp/mcp-go/mcp"
 )
 
+// RiskSelectionScope constrains risk reads and writes to an explicit set of
+// attached risk IDs. A nil scope means no attachment scope is active. A
+// non-nil scope with no allowed IDs is invalid and must fail closed.
+type RiskSelectionScope struct {
+	AllowedIDs []int64
+}
+
 type ToolRuntimeConfig struct {
+	// Detach transfers this invocation to its owning loop's background manager.
+	// It returns the same execution ID on repeated calls. Nil means unsupported.
+	Detach          func() (string, error)
 	FeedBacker      func(result *ypb.ExecResult) error
 	RuntimeID       string
 	ProjectDatabase *gorm.DB
@@ -40,6 +50,9 @@ type ToolRuntimeConfig struct {
 	// RiskSaveHandler replaces the process-local SQLite write for a risk when
 	// the current AI runtime is bound to a platform-owned result sink.
 	RiskSaveHandler func(context.Context, *schema.Risk) error
+	// RiskSelectionScope limits risk queries and triage writes to the task's
+	// attached risk IDs. It is nil only when the task has no risk attachment.
+	RiskSelectionScope *RiskSelectionScope
 	// EmitUIEvent emits structured metadata for a local UI surface. Tool callbacks
 	// must never place binary or base64 content in this channel.
 	EmitUIEvent func(schema.EventType, string, any) error
@@ -61,12 +74,14 @@ type MCPClientCloser interface {
 
 type Tool struct {
 	*mcp.Tool
+	// DefaultAsync is scheduling metadata, never a business input parameter.
+	DefaultAsync bool `json:"default_async,omitempty"`
 	// A list of keywords for tool indexing and searching.
 	Keywords      []string `json:"keywords,omitempty"`
 	VerboseName   string   `json:"verbose_name,omitempty"`    // English string（事件/列表同名字段保持 string）
 	VerboseNameZh string   `json:"verbose_name_zh,omitempty"` // Chinese；对外双语走 verbose_name_i18n / VerboseNameI18n
-	// Usage 工具使用说明，在参数生成阶段(第2阶段)才披露给 AI，
-	// 包含使用原则、参数建议、关联使用等信息，帮助 AI 更好地使用工具参数。
+	// Usage 工具使用说明，包含使用原则、参数建议、关联使用等信息，
+	// 帮助 AI 根据工具定义在当前决策中填写调用参数。
 	Usage    string         `json:"usage,omitempty"`
 	Callback InvokeCallback // 添加回调函数字段
 	// MCPPendingStub marks a placeholder MCP tool loaded from DB cache before the
@@ -79,6 +94,10 @@ type Tool struct {
 
 // ToolOption 定义工具选项函数的类型
 type ToolOption func(*Tool)
+
+func WithDefaultAsync(enabled bool) ToolOption {
+	return func(t *Tool) { t.DefaultAsync = enabled }
+}
 
 // PropertyOption 定义属性选项函数的类型
 type PropertyOption func(map[string]any)
@@ -143,7 +162,7 @@ func WithVerboseNameZh(verboseNameZh string) ToolOption {
 	}
 }
 
-// WithUsage 设置工具的使用说明（在参数生成阶段披露）
+// WithUsage 设置工具的使用说明，供 AI 结合工具定义填写调用参数。
 func WithUsage(usage string) ToolOption {
 	return func(t *Tool) {
 		t.Usage = usage

@@ -1,7 +1,9 @@
 package sharkcli
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -10,11 +12,50 @@ import (
 	"github.com/yaklang/yaklang/common/bin-parser/parser/stream_parser"
 )
 
-func formatFieldValue(name string, value any) string {
-	var data []byte
+// Parser leaf bytes may cross worker JSON as an octet list instead of Base64.
+// Reject lossy conversions, including fractional, negative or oversized values.
+func fieldOctetList(v any) ([]byte, bool) {
+	items, ok := v.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]byte, len(items))
+	for i, x := range items {
+		switch n := x.(type) {
+		case uint8:
+			out[i] = n
+		case int:
+			if n < 0 || n > 255 {
+				return nil, false
+			}
+			out[i] = byte(n)
+		case uint64:
+			if n > 255 {
+				return nil, false
+			}
+			out[i] = byte(n)
+		case float64:
+			if !(n >= 0 && n <= 255 && float64(byte(n)) == n) {
+				return nil, false
+			}
+			out[i] = byte(n)
+		case json.Number:
+			u, err := strconv.ParseUint(string(n), 10, 8)
+			if err != nil {
+				return nil, false
+			}
+			out[i] = byte(u)
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+func fieldValueOctets(name string, value any) ([]byte, bool) {
 	switch v := value.(type) {
 	case []byte:
-		data = v
+		return v, true
 	case string:
 		binary := !utf8.ValidString(v)
 		for _, r := range v {
@@ -25,10 +66,23 @@ func formatFieldValue(name string, value any) string {
 		}
 		lower := strings.ToLower(name)
 		if !binary && lower != "data" && lower != "payload" && !strings.HasSuffix(lower, "protocol data") {
-			return safeText(v)
+			return nil, false
 		}
-		data = []byte(v)
+		return []byte(v), true // Literal string octets, never base64 guessing.
 	default:
+		return nil, false
+	}
+}
+
+func formatFieldValue(name string, value any) string {
+	if text, ok := tlsMetadataVersion(name, value); ok {
+		return text
+	}
+	if text, ok := httpLatencyMetadata(name, value); ok {
+		return text
+	}
+	data, binary := fieldValueOctets(name, value)
+	if !binary {
 		return safeText(fmt.Sprint(value))
 	}
 	preview := data[:min(32, len(data))]
@@ -44,6 +98,43 @@ func formatFieldValue(name string, value any) string {
 		suffix = " … (select for full bytes)"
 	}
 	return fmt.Sprintf("%d bytes · HEX % x |%s|%s", len(data), preview, ascii, suffix)
+}
+
+func formatNodeFieldValue(n *base.NodeValue) string {
+	// A raw bit result is full octets followed by a right-aligned partial
+	// octet, not a byte-aligned integer or a slice of captured wire bytes.
+	// Qualify it by its parser type and exact bit span, never by a field name.
+	data, raw := n.Value.([]byte)
+	if raw && n.Origin != nil && n.Origin.Cfg != nil && n.Origin.Cfg.GetString(base.CfgType) == "raw" {
+		span, ok := n.Origin.Cfg.GetItem(base.CfgNodeResult).([2]uint64)
+		if ok && span[1] > span[0] && span[1] <= 262144*8 {
+			width := span[1] - span[0]
+			if (span[0]%8 != 0 || width%8 != 0) && uint64(len(data)) == (width+7)/8 &&
+				(width%8 == 0 || data[len(data)-1]>>(width%8) == 0) {
+				var bits strings.Builder
+				for i := uint64(0); i < min(width, 128); i++ {
+					chunkWidth := min(uint64(8), width-i/8*8)
+					bits.WriteByte('0' + (data[i/8]>>(chunkWidth-1-i%8))&1)
+				}
+				if width > 128 {
+					return fmt.Sprintf("%d bits · BITS %s … (select for full bytes)", width, bits.String())
+				}
+				// Group from the low end so a 12-bit result {0x0f, 0x0e}
+				// becomes 0x0fe, rather than the misleading octets 0f 0e.
+				padded := strings.Repeat("0", int((4-width%4)%4)) + bits.String()
+				hex := make([]byte, len(padded)/4)
+				for i := range hex {
+					var nibble byte
+					for _, bit := range padded[i*4 : i*4+4] {
+						nibble = nibble<<1 | byte(bit-'0')
+					}
+					hex[i] = "0123456789abcdef"[nibble]
+				}
+				return fmt.Sprintf("%d bits · HEX %s · BITS %s", width, hex, bits.String())
+			}
+		}
+	}
+	return formatFieldValue(n.Name, n.Value)
 }
 
 func nodeField(n *base.NodeValue, text string, branch bool) field {
@@ -85,9 +176,17 @@ func (u *tui) selectFieldBytes() bool {
 	}
 	f := u.fields.fields[indices[u.fieldSelection]]
 	raw := u.inspectedPacket()
-	if !f.hasRange || raw == nil || f.start < 0 || f.end > len(raw.data) || f.end <= f.start {
+	if !f.hasRange || raw == nil || f.source < 0 || f.source > len(u.fields.sources) {
 		return false
 	}
+	data := raw.data
+	if f.source > 0 {
+		data = u.fields.sources[f.source-1].Data
+	}
+	if f.start < 0 || f.end > len(data) || f.end <= f.start {
+		return false
+	}
+	u.bytesSource = f.source
 	u.hexStart, u.hexEnd = f.start, f.end
 	perRow := bytesPerRow(u.viewport(2).w - 2)
 	u.setTop(2, f.start/perRow)
@@ -106,20 +205,23 @@ func (u *tui) selectByteAt(x, y int) {
 			break
 		}
 	}
-	raw := u.inspectedPacket()
+	data := u.byteData()
 	offset := (u.hexTop+y-r.y)*perRow + column
-	if column < 0 || raw == nil || offset < 0 || offset >= len(raw.data) {
+	if column < 0 || offset < 0 || offset >= len(data) {
 		return
 	}
 	u.touchFields()
 	u.hexStart, u.hexEnd = offset, offset+1
-	best, span := -1, len(raw.data)+1
+	best, span := -1, len(data)+1
 	for i, f := range u.fields.fields {
-		if f.hasRange && offset >= f.start && offset < f.end && f.end-f.start < span {
+		if f.hasRange && f.source == u.bytesSource && offset >= f.start && offset < f.end && f.end-f.start < span {
 			best, span = i, f.end-f.start
 		}
 	}
 	if best >= 0 {
+		if u.fieldSelection != best {
+			u.fieldLeft = 0
+		}
 		u.fieldSelection = best
 		f := u.fields.fields[best]
 		u.hexStart, u.hexEnd = f.start, f.end
@@ -128,8 +230,22 @@ func (u *tui) selectByteAt(x, y int) {
 }
 
 func (u *tui) bytesLabel() string {
-	if u.hexEnd > u.hexStart {
-		return fmt.Sprintf("0x%x–0x%x · %d bytes", u.hexStart, u.hexEnd-1, u.hexEnd-u.hexStart)
+	label := "Captured frame"
+	if u.bytesSource > 0 && u.bytesSource <= len(u.fields.sources) {
+		label = u.fields.sources[u.bytesSource-1].Name
 	}
-	return "hex / ascii · click to locate field"
+	if u.hexEnd > u.hexStart {
+		return fmt.Sprintf("%s · 0x%x–0x%x · %d bytes", label, u.hexStart, u.hexEnd-1, u.hexEnd-u.hexStart)
+	}
+	return label + " · b source · click bytes"
+}
+
+func (u *tui) byteData() []byte {
+	if u.bytesSource > 0 && u.bytesSource <= len(u.fields.sources) {
+		return u.fields.sources[u.bytesSource-1].Data
+	}
+	if raw := u.inspectedPacket(); raw != nil {
+		return raw.data
+	}
+	return nil
 }

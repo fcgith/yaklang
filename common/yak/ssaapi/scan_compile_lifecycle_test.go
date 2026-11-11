@@ -60,7 +60,7 @@ func TestStructScanLanguageSelection(t *testing.T) {
 		{"ignore", ssaconfig.JAVA, true, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &structScanRuntime{rules: []*schema.SyntaxFlowRule{
+			s := &structScanState{rules: []*schema.SyntaxFlowRule{
 				{Language: ssaconfig.JAVA}, {Language: ssaconfig.PHP}, {Language: ssaconfig.General},
 			}}
 			s.filterLanguage(tc.lang, tc.ignore)
@@ -72,13 +72,14 @@ func TestStructScanLanguageSelection(t *testing.T) {
 func TestStructScanReleasesPersistedBatchResults(t *testing.T) {
 	t.Setenv(compileUnitBatchMinFilesEnv, "1")
 	t.Setenv(compileUnitBatchMinBytesEnv, "1")
+	t.Setenv(compileUnitBatchMinUnitsEnv, "1")
 	t.Setenv("YAK_SSA_COMPILE_UNIT_LOG", "1")
 	vf := filesys.NewVirtualFs()
 	vf.AddFile("a/A.java", `package a; class A { void f(String s) throws Exception { Runtime.getRuntime().exec(s); } }`)
 	vf.AddFile("b/B.java", `package b; class B { void f(String s) throws Exception { Runtime.getRuntime().exec(s); } }`)
 	name := uuid.NewString()
 	t.Cleanup(func() { ssadb.DeleteProgram(ssadb.GetDB(), name) })
-	var state *structScanRuntime
+	var state *structScanState
 	callbacks := 0
 	completedBatches := 0
 	progs, err := ParseProjectWithFS(vf, WithLanguage(ssaconfig.JAVA), WithProgramName(name),

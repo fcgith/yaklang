@@ -1,10 +1,11 @@
 package yak2ssa
 
 import (
+	"strconv"
+
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/utils/memedit"
 
 	"github.com/yaklang/antlr/v4"
 	yak "github.com/yaklang/yaklang/common/yak/antlr4yak/parser"
@@ -34,9 +35,12 @@ func (b *astbuilder) build(raw ssa.FrontAST) {
 
 	prog := b.GetProgram()
 	root := prog.GetApplication()
-	var currentEditor *memedit.MemEditor
-	if root != nil {
-		currentEditor = root.GetCurrentEditor()
+	// Includes build on their own program while the application's editor
+	// stack still belongs to the caller. Deduplicate and record the source
+	// this builder actually consumes, independently of file completion order.
+	currentEditor := b.GetEditor()
+	if currentEditor == nil && prog != nil {
+		currentEditor = prog.GetCurrentEditor()
 	}
 	if currentEditor != nil && root != nil {
 		hasFile := func(p *ssa.Program) bool {
@@ -47,7 +51,10 @@ func (b *astbuilder) build(raw ssa.FrontAST) {
 			}
 			return false
 		}
-		if hasFile(root) {
+		// A source already consumed in the application's main scope is not
+		// necessarily built in an include's own scope. The include loader owns
+		// its subprogram cache; skipping that body would publish an empty module.
+		if prog == root && hasFile(root) {
 			return
 		}
 	}
@@ -1244,7 +1251,10 @@ func (b *astbuilder) buildExpression(stmt *yak.ExpressionContext) ssa.Value {
 
 	// function call
 	if s, ok := stmt.FunctionCall().(*yak.FunctionCallContext); ok {
-		return b.EmitCall(b.buildFunctionCallWarp(stmt, s))
+		if c := b.buildFunctionCallWarp(stmt, s); c != nil {
+			return b.EmitCall(c)
+		}
+		return nil
 	}
 
 	// paren expression
@@ -1373,10 +1383,27 @@ func (b *astbuilder) buildExpression(stmt *yak.ExpressionContext) ssa.Value {
 	}
 
 	// | expression '<-' expression
-	// TODO: handler "<-"
 	if stmt.ChanIn() != nil {
-		// op1, op2 := getValue(0), getValue(1)
-		// b.EmitUpdate(op1, op2)
+		op1, op2 := getValue(0), getValue(1)
+		if op1 == nil || op2 == nil {
+			b.NewError(ssa.Error, TAG, "chan send need two expression")
+			return nil
+		}
+		// Only the AOT compiler binds __yak_chan_send (it installs the helper as
+		// an extern value). Static analysis and the interpreter have no binding:
+		// ReadValue would invent a free-value or undefined placeholder for the
+		// name, and calling that reports an undefined value (which fails the
+		// built-in script check). Look the binding up directly and leave the
+		// send unlowered when it is absent.
+		target := b.TryBuildExternValue("__yak_chan_send")
+		if target == nil {
+			return nil
+		}
+		if und, ok := ssa.ToUndefined(target); ok && und != nil {
+			return nil
+		}
+		c := b.NewCall(target, []ssa.Value{op1, op2})
+		return b.EmitCall(c)
 	}
 
 	// | expression 'not'? 'in' expression
@@ -1737,6 +1764,9 @@ func (b *astbuilder) buildFunctionParamDecl(stmt *yak.FunctionParamDeclContext) 
 
 func (b *astbuilder) buildFunctionCallWarp(exprstmt *yak.ExpressionContext, stmt *yak.FunctionCallContext) *ssa.Call {
 	if expr, ok := exprstmt.Expression(0).(*yak.ExpressionContext); ok {
+		if b.tryBuildConstantEval(expr, stmt) {
+			return nil
+		}
 		v := b.buildExpression(expr)
 		if v != nil {
 			return b.buildFunctionCall(stmt, v)
@@ -1781,11 +1811,40 @@ func (b *astbuilder) buildOrdinaryArguments(stmt *yak.OrdinaryArgumentsContext) 
 		values = values[:len(values)-1]
 		if !utils.IsNil(ellipsisValue) {
 			memberPairs := ssa.GetLastWinsMemberPairs(ellipsisValue)
-			if len(memberPairs) == 0 {
-				values = append(values, ellipsisValue)
-			}
-			for _, pair := range memberPairs {
+			// GetLastWinsMemberPairs walks the pair list backwards (last wins),
+			// so iterate in reverse to restore element order. Skip read
+			// placeholders (Undefined members) and negative-index reads
+			// (a[-1] merged into the Make's pair list) that are not literal
+			// members of the container. expanded stays 0 when the container
+			// has no literal elements (a runtime slice, or only placeholders);
+			// the fallback below then passes that container once.
+			expanded := 0
+			for i := len(memberPairs) - 1; i >= 0; i-- {
+				pair := memberPairs[i]
+				if pair.Member == nil || pair.Member.GetId() <= 0 {
+					continue
+				}
+				if u, isUndef := pair.Member.(*ssa.Undefined); isUndef && u != nil {
+					continue
+				}
+				if pair.Key != nil {
+					if keyStr := ssa.GetKeyString(pair.Key); keyStr != "" {
+						if idx, err := strconv.Atoi(keyStr); err == nil && idx < 0 {
+							continue
+						}
+					}
+				}
 				values = append(values, pair.Member)
+				expanded++
+			}
+			// A container built at runtime (a.Push(x) rather than a literal)
+			// has a pair list whose members are all read placeholders, so the
+			// loop above expands nothing. Falling through with an empty
+			// argument list would drop the argument entirely — dictutil.Mix(a...)
+			// then received zero dictionaries. Pass the container itself in
+			// that case, which keeps the value available to the callee.
+			if expanded == 0 {
+				values = append(values, ellipsisValue)
 			}
 		}
 		hasEll = true
@@ -1803,23 +1862,52 @@ func (b *astbuilder) buildOrdinaryArguments(stmt *yak.OrdinaryArgumentsContext) 
 func (b *astbuilder) buildSliceCall(stmt *yak.SliceCallContext) []ssa.Value {
 	recoverRange := b.SetRange(&stmt.BaseParserRuleContext)
 	defer recoverRange()
-	exprLen := len(stmt.AllColon()) + 1
-	exprs := stmt.AllExpression()
+	colonCount := len(stmt.AllColon())
+	exprLen := colonCount + 1
+	if colonCount == 0 {
+		// Single index form [key]; the caller treats it as a member read.
+		exprs := stmt.AllExpression()
+		if len(exprs) == 0 {
+			b.NewError(ssa.Error, TAG, SliceCallExpressionIsEmpty())
+			return nil
+		}
+		if len(exprs) > 1 {
+			b.NewError(ssa.Error, TAG, SliceCallExpressionTooMuch())
+			return nil
+		}
+		return []ssa.Value{b.buildExpression(exprs[0].(*yak.ExpressionContext))}
+	}
+	// Position each expression by its grammar slot relative to the colons:
+	// `[a:b]` -> values[0]=a, values[1]=b; `[:b]` -> values[0]=nil, values[1]=b;
+	// `[a:]` -> values[0]=a, values[1]=nil. AllExpression() drops absent
+	// slots, so iterating children is required to tell [:b] apart from [b:].
 	values := make([]ssa.Value, exprLen)
-	if len(exprs) == 0 {
+	colonSeen := 0
+	exprSeen := 0
+	for _, child := range stmt.GetChildren() {
+		if expr, ok := child.(*yak.ExpressionContext); ok {
+			// The expression's slot is the number of colons seen before it:
+			// `[a:b]` -> a at 0, b at 1; `[:b]` -> b at 1; `[a:]` -> a at 0.
+			if colonSeen >= exprLen {
+				return nil
+			}
+			values[colonSeen] = b.buildExpression(expr)
+			exprSeen++
+			continue
+		}
+		if terminal, ok := child.(antlr.TerminalNode); ok {
+			if terminal.GetSymbol().GetTokenType() == yak.YaklangParserColon {
+				colonSeen++
+			}
+		}
+	}
+	if exprSeen == 0 {
 		b.NewError(ssa.Error, TAG, SliceCallExpressionIsEmpty())
 		return nil
 	}
-	if len(exprs) > 3 {
+	if exprSeen > 3 {
 		b.NewError(ssa.Error, TAG, SliceCallExpressionTooMuch())
 		return nil
-	}
-	for i, expr := range exprs {
-		if s, ok := expr.(*yak.ExpressionContext); ok {
-			values[i] = b.buildExpression(s)
-		} else {
-			values[i] = b.EmitConstInstPlaceholder(0)
-		}
 	}
 	return values
 }

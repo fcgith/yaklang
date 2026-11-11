@@ -54,6 +54,9 @@ func (s *captureSession) feedDatagram(dir int, ts time.Time, raw []byte) FeedRes
 	out := FeedResult{Consumed: int(s.f.a.input.Load() - before), Events: s.events, State: "undetected"}
 	for _, e := range out.Events {
 		e.Direction = dir
+		if e.Profile == someIPTPProfile {
+			s.f.a.retainSomeIPSessionDirection(e)
+		}
 		if e.Protocol != "" {
 			out.State = e.Protocol
 		}
@@ -85,8 +88,8 @@ func probeDatagram(raw []byte, maxBytes int) ProbeResult {
 	if len(raw) > maxBytes {
 		return ProbeResult{Verdict: ProbeReject, Reason: "datagram exceeds configured byte limit"}
 	}
-	if dlmsRequestEvidence(raw) {
-		return probeAccept("dlms", "hdlc-get-normal", 98)
+	if p := probeDLMS(raw, maxBytes); p.Verdict == ProbeAccept {
+		return p
 	}
 	if slmpRequestEvidence(raw) {
 		return probeAccept("slmp", "slmp-binary-self-test", 98)
@@ -220,6 +223,41 @@ func cassandraRequestEvidence(w []byte, maxBytes int) bool {
 }
 
 func initialProtocolNeedMore(w []byte, maxBytes int) ProbeResult {
+	if p := probeSMB1FileCommand(w, 65582); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeSMB1SessionSetupExtended(w, 65598); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeSMB1Negotiate(w, maxBytes); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeSMB1NegotiateExtendedResponse(w, 65608); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeRTSP(w, maxBytes); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeSSH(w, maxBytes); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeAJP(w, maxBytes); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if p := probeBGP(w, maxBytes); p.Verdict == ProbeNeedMore {
+		return p
+	}
+	if len(w) >= 9 {
+		if p := probeRTMP(w, maxBytes); p.Verdict == ProbeNeedMore {
+			return p
+		}
+	}
+	// A split first ISO 8583 message has a length prefix that already exceeds the
+	// captured bytes. Hold only while the envelope is a valid MTI/bitmap prefix;
+	// a carrier that can never become a complete message rejects instead.
+	if p, _ := probeISO8583(w, maxBytes); p.Verdict == ProbeNeedMore {
+		return p
+	}
 	if p := probeDLMS(w, maxBytes); p.Verdict == ProbeNeedMore {
 		return p
 	}
@@ -262,21 +300,5 @@ func (f *binFlow) needsMoreSSHServerPreamble(dir int, wire []byte) bool {
 }
 
 func radiusDatagramEvidence(w []byte, src, dst string) bool {
-	if probeRADIUS(w, len(w)).Verdict != ProbeAccept || int(binary.BigEndian.Uint16(w[2:4])) != len(w) {
-		return false
-	}
-	// A known carrier still reports malformed attributes; arbitrary ports need
-	// complete attribute spans rather than a four-byte length coincidence.
-	_, sp, _ := net.SplitHostPort(src)
-	_, dp, _ := net.SplitHostPort(dst)
-	if sp == "1812" || sp == "1813" || dp == "1812" || dp == "1813" {
-		return true
-	}
-	for at := 20; at < len(w); {
-		if at+2 > len(w) || w[at+1] < 2 || at+int(w[at+1]) > len(w) {
-			return false
-		}
-		at += int(w[at+1])
-	}
-	return true
+	return radiusAdmittedDatagram(w, src, dst)
 }

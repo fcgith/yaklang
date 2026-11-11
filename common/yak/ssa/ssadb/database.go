@@ -9,6 +9,7 @@ import (
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils/damenggorm"
 	"github.com/yaklang/yaklang/common/yak/ssa/reportstore"
 )
 
@@ -49,6 +50,11 @@ func init() {
 	schema.RegisterDatabaseSchema(schema.KEY_SCHEMA_SSA_DATABASE, SSAProjectTables...)
 	schema.RegisterDatabasePatch(schema.KEY_SCHEMA_SSA_DATABASE, patchIrSourceQuotedCode)
 	schema.RegisterDatabasePatch(schema.KEY_SCHEMA_SSA_DATABASE, patchIrCodeIndex)
+	schema.RegisterDatabasePatch(schema.KEY_SCHEMA_SSA_DATABASE, patchIrTypeIndexes)
+	// gorm.Open copies gorm.DefaultCallback exactly once and never re-reads
+	// it, so the timing callbacks have to be on the default before the SSA
+	// database opens. Importing ssadb is what triggers the open.
+	EnsureDBOpCallbacks(nil)
 }
 
 // patchIrSourceQuotedCode patches the QuotedCode column type based on database dialect
@@ -85,6 +91,12 @@ func patchIrSourceQuotedCode(db *gorm.DB) {
 
 // doSSAPatch 添加数据库索引以优化查询性能
 func patchIrCodeIndex(db *gorm.DB) {
+	if damenggorm.IsDM(db) {
+		if err := installDMIRIndexes(db); err != nil {
+			db.AddError(err)
+		}
+		return
+	}
 	if !db.HasTable(TableIrCodes) {
 		return
 	}
@@ -96,18 +108,9 @@ func patchIrCodeIndex(db *gorm.DB) {
 		query string
 	}{
 		{
-			"idx_ir_codes_program_code",
-			`CREATE INDEX IF NOT EXISTS "idx_ir_codes_program_code" ON "` + TableIrCodes + `" ("program_name", "code_id");`,
-		},
-		{
 			"idx_ir_codes_program_opcode",
 			// composite index for program+opcode lookups
 			`CREATE INDEX IF NOT EXISTS "idx_ir_codes_program_opcode" ON "` + TableIrCodes + `" ("program_name", "opcode");`,
-		},
-		// 为 ir_types 表添加复合索引
-		{
-			"idx_ir_types_program_type",
-			`CREATE INDEX IF NOT EXISTS "idx_ir_types_program_type" ON "` + TableIrTypes + `" ("program_name", "type_id");`,
 		},
 		// 为 ir_indices 表添加复合索引以优化常见查询
 		{
@@ -131,6 +134,51 @@ func patchIrCodeIndex(db *gorm.DB) {
 	// persist pipeline. This is a hard database invariant.
 	ensureUniqueIrCodesProgramCodeIndex(db)
 	ensureUniqueIrOffsetsIndex(db)
+	ensureConstLookupIndex(db)
+
+	// Supported SQLite and PostgreSQL databases shed these redundant indexes
+	// without rewriting rows. Other dialects keep their legacy indexes until a
+	// dialect-specific drop path is available.
+	pruneRedundantIRIndexes(db)
+
+}
+
+// irCodeConstLookupIndex is the covering lookup for ConstType searches.
+// Equality seeks (program_name, string). A regexp uses the program_name
+// prefix and filters strings in the index, instead of reading every wide
+// ir_codes row. The WHERE matches constLookupSQL's literals; a bound
+// opcode or const_type parameter makes SQLite ignore this index.
+const irCodeConstLookupIndex = "idx_ir_codes_const_lookup"
+
+func ensureConstLookupIndex(db *gorm.DB) {
+	if db == nil || db.Dialect() == nil || !db.HasTable(TableIrCodes) {
+		return
+	}
+	if hasNamedIndex(db, TableIrCodes, irCodeConstLookupIndex) {
+		return
+	}
+	switch db.Dialect().GetName() {
+	case "sqlite3", "sqlite", "postgres", "postgresql", "cloudsqlpostgres":
+	default:
+		log.Debugf("skip const lookup index on dialect %s", db.Dialect().GetName())
+		return
+	}
+	query := fmt.Sprintf(
+		`CREATE INDEX IF NOT EXISTS "%s" ON "%s" ("program_name", "string", "code_id") WHERE opcode = %d AND const_type = '%s' AND deleted_at IS NULL`,
+		irCodeConstLookupIndex, TableIrCodes, irCodeConstOpcode, irCodeConstTypeNormal,
+	)
+	if err := db.Exec(query).Error; err != nil {
+		log.Warnf("failed to add index %s: %v", irCodeConstLookupIndex, err)
+	}
+}
+
+// hasNamedIndex asks the dialect whether an index exists. db.New() clears a
+// program_name row scope while keeping the current connection.
+func hasNamedIndex(db *gorm.DB, table, index string) bool {
+	if db == nil || db.Dialect() == nil {
+		return false
+	}
+	return db.New().Dialect().HasIndex(table, index)
 }
 
 // deleteDuplicateIrCodes removes every row except the oldest (MIN id) per
@@ -382,4 +430,66 @@ func retryProgramDelete(name string, deleteFn func() error) error {
 		}
 	}
 	return fmt.Errorf("%s: delete failed after %d attempts: %w", name, programDeleteAttempts, err)
+}
+
+// redundantIRIndexes are single-column B-trees that a composite index already
+// answers, or that no IR query filters on. They cost a B-tree build on every
+// compile and, on a Hue-sized database, about 860MB of the file. The model
+// tags no longer create them; this list prunes databases created by older
+// binaries. Removing a redundant index preserves every row and also improves
+// writes when a populated database is recompiled.
+var redundantIRIndexes = []struct{ table, index string }{
+	{TableIrCodes, "idx_ir_codes_program_name"},           // ux_ir_codes_program_code is (program_name, code_id)
+	{TableIrCodes, "idx_ir_codes_code_id"},                // every lookup also binds program_name
+	{TableIrCodes, "idx_ircode_program_opcode"},           // idx_ir_codes_program_opcode is (program_name, opcode)
+	{TableIrCodes, "idx_ir_codes_version"},                // version lives on ir_programs
+	{TableIrCodes, "idx_ir_codes_program_compile_hash"},   // never a predicate
+	{TableIrCodes, "idx_ir_codes_const_type"},             // const lookups use idx_ir_codes_const_lookup
+	{TableIrOffsets, "idx_ir_offsets_program_name"},       // ux_ir_offsets_program_value_file_range prefix
+	{TableIrOffsets, "idx_ir_offsets_value_id"},           // the same UNIQUE index covers (program_name, value_id)
+	{TableIrOffsets, "idx_ir_offsets_start_offset"},       // never a predicate
+	{TableIrIndices, "idx_ir_indices_v1_program_name"},    // idx_ir_indices_program_value is (program_name, value_id)
+	{TableIrIndices, "idx_ir_indices_v1_value_id"},        // the composite covers it
+	{TableIrIndices, "idx_ir_indices_v1_owner_value_id"},  // never a predicate
+	{TableIrIndices, "idx_ir_indices_v1_version_id"},      // read, never filtered
+	{TableIrNamePool, "idx_ir_name_pool_v1_program_name"}, // idx_ir_name_pool_program_name_name prefix
+	{TableIrNamePool, "idx_ir_name_pool_v1_name"},         // name lookups bind program_name too
+}
+
+func pruneRedundantIRIndexes(db *gorm.DB) {
+	if db == nil || db.Dialect() == nil {
+		return
+	}
+	dialect := db.Dialect().GetName()
+	if dialect != "sqlite3" && dialect != "sqlite" && dialect != "postgres" && dialect != "postgresql" {
+		return
+	}
+	dropped := 0
+	for _, redundant := range redundantIRIndexes {
+		if !hasNamedIndex(db, redundant.table, redundant.index) {
+			continue
+		}
+		if err := db.Exec(`DROP INDEX IF EXISTS ` + quoteSQLIdent(redundant.index)).Error; err != nil {
+			log.Warnf("[ir-index-prune] drop %s: %v", redundant.index, err)
+			continue
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		log.Infof("[ir-index-prune] removed %d redundant IR indexes", dropped)
+	}
+}
+
+// patchIrTypeIndexes installs the UNIQUE key the type writes conflict on.
+func patchIrTypeIndexes(db *gorm.DB) {
+	if db == nil || db.Dialect() == nil {
+		return
+	}
+	if damenggorm.IsDM(db) {
+		// installDMIRIndexes creates this key for the DM dialect.
+		return
+	}
+	if err := ensureIrTypeIndexes(db); err != nil {
+		log.Warnf("[ir-type] index patch: %v", err)
+	}
 }

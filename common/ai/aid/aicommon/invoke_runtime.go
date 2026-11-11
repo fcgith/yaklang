@@ -238,8 +238,22 @@ func NewSelectedKnowledgeBaseResult(reason string, knowledgeBases []string) *Sel
 	}
 }
 
+type LoopPromptMode uint8
+
+const (
+	LoopPromptModeNormal LoopPromptMode = iota
+	LoopPromptModeCompressContext
+)
+
 type LoopPromptAssemblyInput struct {
 	Nonce string
+	// Both modes share the same cacheable prefix. Only the dynamic section
+	// changes; compression carries instructions and the snapshot's candidates.
+	PromptMode       LoopPromptMode
+	CompressionGuide string
+	// HistoryThroughID, when set, renders and reports timeline history only
+	// through that ID. Later items stay outside this request.
+	HistoryThroughID *int64
 	// FunctionCallMode describes this request's output protocol, not the loop's
 	// global preference. Auxiliary parameter-generation requests remain textual.
 	FunctionCallMode bool
@@ -264,8 +278,10 @@ type LoopPromptAssemblyInput struct {
 	OutputExample       string
 	Schema              string
 	FunctionCallSchemas string
-	SkillsContext       string
 	ExtraCapabilities   string
+	// AutoContext is a loop-owned, per-request snapshot appended to the runtime's
+	// dynamic context. It must not be reconstructed from a mutable current task.
+	AutoContext string
 	// PlanStatus is the live, read-only plan state displayed between Timeline Open
 	// and TODO. It does not contain task goals, documents, or result summaries.
 	PlanStatus string
@@ -313,27 +329,15 @@ type LoopPromptAssemblyInput struct {
 	// FrozenPartitions 是业务侧提供的通用 frozen-block 分区。共享模板只识别
 	// FrozenBlockPartition，不直接依赖 planAndExec / CONTENT / DOCUMENT 等业务类型。
 	FrozenPartitions []FrozenBlockPartition
-
-	// ForcedSkills 是「用户强制加载」SKILL 的满内容渲染 (含 USER_FORCED_SKILL 边界).
-	// 物理位置: frozen_block 顶部 (比 SKILLS_CONTEXT 目录层级还高), 最高优先级.
-	// 用户主动加载是偶发行为, 加载后整段字节稳定, 利于 frozen_block 缓存; 热加载时
-	// 接受重缓存. 空字符串时 frozen_block 顶部子块自动跳过.
-	//
-	// 关键词: ForcedSkills, 用户强制加载, frozen_block 顶部, 最高优先级
-	ForcedSkills string
-
-	// AutoLoadedSkills 是「AI 意图驱动加载」SKILL 的渲染 (含 AUTO_LOADED_SKILLS 边界).
-	// 物理位置: semi_dynamic_2 尾部 (TaskInstruction/Schema/OutputExample 之后).
-	// 关键缓存点: semi2 前缀字节不变 → AI_CACHE_SEMI2 前缀缓存命中, 仅尾部变化.
-	// 空字符串时 semi_dynamic_2 尾部子块自动跳过.
-	//
-	// 关键词: AutoLoadedSkills, AI 意图驱动, semi_dynamic_2 尾部, LRU 折叠
-	AutoLoadedSkills string
 }
 
 type LoopPromptAssemblyResult struct {
 	Prompt   string
-	Sections any
+	Mode     LoopPromptMode
+	Sections []*PromptSectionObservation
+	// Captured with the rendered Timeline; compression must not consume later writes.
+	TimelineThroughID *int64
+	TimelineItemIDs   []int64
 }
 
 // ExecutePlanInput carries an approved plan generated outside Coordinator plan loop.
@@ -368,13 +372,9 @@ type AIInvokeRuntime interface {
 	AskForClarification(ctx context.Context, question string, payloads []string) string
 	DirectlyAnswer(ctx context.Context, query string, tools []*aitool.Tool, opts ...any) (string, error)
 	CompressLongTextWithDestination(ctx context.Context, i any, destination string, targetByteSize int64) (string, error)
-	// QuickKnowledgeSearch performs a fast local knowledge-base search using LIKE + BM25.
+	// Deprecated: use query_knowledge_base with explicit scope and token limits.
 	QuickKnowledgeSearch(ctx context.Context, query string, keywords []string, collections ...string) (string, error)
-	// EnhanceKnowledgeGetterEx 支持多种 EnhancePlan 的知识增强获取器
-	// enhancePlans 参数可选，支持：
-	//   - nil 或空切片：使用默认完整增强流程
-	//   - []string{"exact_keyword_search"}: 仅使用精准关键词搜索
-	//   - []string{"hypothetical_answer", "generalize_query"}: 指定增强策略组合
+	// Deprecated: legacy AI RAG retrieval is disabled; use the Skill-guided knowledge tools.
 	EnhanceKnowledgeGetterEx(ctx context.Context, userQuery string, enhancePlans []string, collections ...string) (string, error)
 	// VerifyUserSatisfaction verifies if the user is satisfied with the result
 	VerifyUserSatisfaction(ctx context.Context, query string, isToolCall bool, payload string) (*VerifySatisfactionResult, error)
@@ -395,8 +395,7 @@ type AIInvokeRuntime interface {
 	// so they participate in the auxiliary-task registry.
 	InvokeSpeedPriorityLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...GeneralKVConfigOption) (*Action, error)
 	InvokeQualityPriorityLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...GeneralKVConfigOption) (*Action, error)
-	// SelectKnowledgeBase selects appropriate knowledge bases based on the user query
-	// It uses AI to analyze the query and match it with available knowledge bases
+	// Deprecated: select explicit names using manage_knowledge_base(op=list).
 	SelectKnowledgeBase(ctx context.Context, originQuery string) (*SelectedKnowledgeBaseResult, error)
 
 	ExecuteLoopTaskIF(taskTypeName string, task AIStatefulTask, options ...any) (bool, error)

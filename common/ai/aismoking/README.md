@@ -4,7 +4,7 @@
 
 库入口：`aimemory.Search(query, aimemory.memoryNamespace(id), aimemory.memoryTokenLimit(1500), aimemory.memorySearchMode("hybrid"))`。仅一个 namespace/id，指向当前项目数据库里的 `ai-memory-<id>` 集合；不引入 workspace。AI 工具中默认绑定当前运行时实际使用的 memory 集，独立脚本默认 `default`。不假设 persistent session ID 就是 memory 集 ID。
 
-库复用 RAG BM25/向量查询及已有 memory 表接口，返回现有 `AIMemoryEntity` 行，限量、去重、过滤过期/删除项并限制正文 token；输出格式在 `search_memory.yak` 中维护。`bm25` 还补充正文/标签关键词匹配，缺少索引可回退；`hybrid` 向量不可用时保留关键词结果并记录英文诊断，`vector` 明确报错。无匹配返回空数组，不创建 memory 集、不初始化 triage。`smart_qa` 仍是已注册的专注模式，其 memory action 转发至同一脚本。
+库复用 RAG BM25/向量查询及已有 memory 表接口，返回现有 `AIMemoryEntity` 行，限量、去重、过滤过期/删除项并限制正文 token；输出格式在 `search_memory.yak` 中维护。`bm25` 还补充正文/标签关键词匹配，缺少索引可回退；`hybrid` 向量不可用时保留关键词结果并记录英文诊断，`vector` 明确报错。无匹配返回空数组，不创建 memory 集、不初始化 triage。
 
 自动 injection 只在意图识别结果落地时复用现有 `SearchMemoryWithoutAI` 检索一次，最多 5 条、1200 tokens；没有意图识别不自动检索。同一意图的空结果也不重搜，后续工具步骤和记忆写入不刷新快照。显式搜索仅进入普通工具 Timeline 及冻结块，不修改 injection。自动沉淀仅来自 Timeline 压缩产生的 memory entities；执行中沿用原阈值，完整用户任务正常结束且有新增业务内容时额外收尾。审核等待、idle wait、阶段切换不触发抽取。取消/断连只记下待处理来源，恢复后补处理；手动创建记忆及管理接口保留。
 
@@ -20,12 +20,16 @@ yak common/ai/aismoking/run.yak
 
 | 脚本 | 覆盖内容 |
 | --- | --- |
+| [knowledge_base_management.yak](knowledge_base_management.yak) | 两种协议的真实 ReAct → SKILL 索引 → require 两个内置 Yak 工具 → 库列表/增删改查、条目修改、文件构建、稳定 ID 索引重建、语义查询、全 JSON token 预算与续读、names 多库/显式 all；模型与 embedding 为确定性夹具 |
+| [knowledge_callers.yak](knowledge_callers.yak) | `aim.InvokeReAct` 验证普通、报告、侦察三个 loop：加载 SKILL、require 完整 schema、执行受库名和 token 预算约束的查询；保留附件偏好，核验隐藏随机事实、隔离干扰库、报告文件和完成卡片。模型和 embedding 为 mock；不自动切换到知识专注模式 |
+| [knowledge_plan.yak](knowledge_plan.yak) | 两种协议的 `aim.InvokeReAct` Plan：三个依赖 worker 加载 SKILL 和完整工具 Schema，实际创建/构建/查询/更新/删除知识库，保留稳定条目 ID 和干扰库，核对共享 Evidence、报告、审批和数据库清理；模型和 embedding 为 mock |
 | [mainloop.yak](mainloop.yak) | 默认 `aim.InvokeReAct` × 两种协议 × require/load_capability；只加载 Schema、错误参数 reason/retry、修正后显式执行、实际读文件、session Evidence、冻结提升和纯动态区不重复展示用户输入 |
+| [mcp_management.yak](mcp_management.yak) | 默认 `aim.InvokeReAct` × 文本流/function-call；自动 system skill、require 三个 MCP 脚本工具、真实 profile 配置增删/启用状态/分页/凭据隐藏、远端 MCP 游标分页与调用；`AISMOKING_CASE=mcp_management` 隔离执行 |
 | [tool_params_group.yak](tool_params_group.yak) | 双协议；名称数组只加载 Schema、无效分组零执行、修正后真实文件读取、结果隔离、Evidence 及六轮主请求静态前缀稳定 |
 | [tool_review.yak](tool_review.yak) | `aim.InvokeReAct` × 双协议；wrong_tool/wrong_params 返回所属循环、零辅助构参、显式修正、人工改参再次审核、直接回答；真实只读来源 |
 | [recon.yak](recon.yak) | 内置侦察模式双协议；预加载零执行、移除六类隐式动作、显式读取本地来源、静态缓存前缀稳定；不发起扫描 |
 | [retry.yak](retry.yak) | `aim.InvokeReAct`、`liteforge.Execute`、`ai.FunctionCall` × 两种协议；回放真实 DSML 格式错误后重试，核对原始 arguments/content、中文纠正、schema 和缓存前缀不变，采样六份重试提示 |
-| [liteforge.yak](liteforge.yak) | `liteforge.Execute`、`ai.FunctionCall` × 默认文本/显式原生/显式文本；HTTP/SSE 首字节屏障、arguments/text 增量流、tools/tool_choice、开放 map/任意 JSON；抽取/分类/总结 × 父循环双协议 × aim/public 两个入口，验证 aim 辅助请求始终为文本流，共 18 次请求 |
+| [liteforge.yak](liteforge.yak) | `liteforge.Execute`、`ai.FunctionCall` × 默认文本/显式原生/显式文本；HTTP/SSE 首字节屏障、arguments/text 增量流、tools/tool_choice、开放 map/任意 JSON；抽取/分类/总结 × 父循环双协议 × aim/public 两个入口，验证 aim 辅助请求继承会话协议，共 18 次请求 |
 | [liteforgeapp.yak](liteforgeapp.yak) | 迁移后的公共应用入口，两种协议各一次请求，未知键及嵌套任意 JSON |
 | [rag_applications.yak](rag_applications.yak) | 真实文件读取、问题索引、知识分片、临时入库、关联与检索；模型和 embedding 使用 mock |
 | [planning.yak](planning.yak) | 自由探索生成、preset、mocker × 两种协议；读来源、Evidence、文档和任务修改、无效 DAG 原子回滚、稳定 task ID、编辑后一次审核；停在批准后的交接点，不启动业务 worker |
@@ -69,6 +73,7 @@ yak common/ai/aismoking/forge.yak
 
 - [live/memory_protocol.yak](live/memory_protocol.yak)：沿用配置中的轻量模型，对比记忆筛选与 Timeline 摘要的 function call / 文本流；覆盖短约束、已有记忆不重复收录、临时日志、长期约束、范围纠正、待返回调用、引用中的旧协议和 DAG 衔接，默认重复 3 轮。设置 `AISMOKING_OUTPUT` 保存无认证头的实际请求、完整响应体、分别还原的 content / function call arguments、finish reason、评分及语义断言；每次响应和最终结果均落盘，超时、协议失败与语义错误分别记录。`AISMOKING_MEMORY_SOURCE` 可附加已脱敏历史回放，`AISMOKING_MEMORY_KIND=triage/summary`、`AISMOKING_MEMORY_CASE`、`AISMOKING_MEMORY_MODE=function-call/text-stream` 可单独复测；`AISMOKING_MEMORY_EXAMPLES=0` 关闭原生参数示例以做对照，`AISMOKING_MEMORY_SPEED=0` 使用主模型。脚本不持久化记忆；请求或语义检查失败会返回非零，并保留失败采样。
 - [live/default_task.yak](live/default_task.yak)：普通对账任务，使用 `aim.InvokeReAct`，校验金额、去重、异常及报告，采样 usage/cache。要求 `LITEFORGE_SMOKE_API_KEY`，模型和输出目录由脚本列出的环境变量设置。
+- [live/subagent_evidence.yak](live/subagent_evidence.yak)：真实 DS 4.1 F 长任务，两个独立调查各读取 12 个分片，随后核验四份执行回执并交付五份产物；检查受理、演练与业务执行的区别，采样父子请求、显式证据、事件和服务端 usage。沿用已配置的 provider 和 `YAKIT_HOME`，所有角色固定 `deepseek-v4.1-flash`；设置新的 `AISMOKING_OUTPUT`、专用且全新的 `AISMOKING_SUBAGENT_WORKDIR`，以 `AISMOKING_SUBAGENT_MODE=multi/default` 选择模式，`AISMOKING_VARIANT` 标注版本，`AISMOKING_SUBAGENT_SEED` 固定材料。直接 `yak common/ai/aismoking/live/subagent_evidence.yak`，最多 20 分钟、2 个并发子任务；不模拟模型动作，不进入离线套件或 CI。默认工具目录保留，文件工具预加载不是白名单，实际 Bash/文件工具选择也会采样。两版对照固定任务、seed、work 路径及运行参数，首轮结束后先归档整个 work，再以原路径创建新夹具；`node common/ai/aismoking/live/subagent_evidence_analyze.cjs <实验根目录>` 可离线分析 `baseline/current` 子目录，不请求模型。[2026-11-08 实测摘要](live/observations/subagent_evidence_20261108.json) 保留了总 token 略增、主循环 token 增加及单次样本的限制，不把提前回传等同于节约 token。
 - [live/tool_protocol.yak](live/tool_protocol.yak)：通过 `aim.InvokeReAct` 执行文件对账、计划确认、依赖任务、Evidence 与验收报告；原样转发并断言生产原生请求的 `tool_choice` 为 `auto`，不由测试代理覆盖。采样实际请求、完整响应、非法函数名、重试和 usage。沿用本地已配置的 provider，设置 `AISMOKING_OUTPUT` 为新的采样目录；`AISMOKING_TOOL_MODEL` 可指定模型，`AISMOKING_TOOL_CHOICES=auto,text` 可选定组合。脚本仅确认自己的隔离测试计划，不持久化认证头。直接运行 `yak common/ai/aismoking/live/tool_protocol.yak`，仅供本地开发。
 - [live/model_cache.yak](live/model_cache.yak)：沿用本地已配置的 provider，对照 DeepSeek/Qwen 的真实缓存用量。设置新的 `AISMOKING_OUTPUT` 后直接运行；`CACHE_PHASE=runtime` 用 `aim.InvokeReAct` 完成六批文件核对，`boundaries` 对照显式/隐式、独立 message/同 message 内 content block，`replay` 将 `CACHE_REPLAY_SOURCE` 中同一串真实原生请求重放到两个模型，仅观察响应，不执行返回的工具。`CACHE_MODELS` 可覆盖逗号分隔的模型名。`analyze` 离线重算已有目录，不请求模型。`summary.json` 分开主循环与辅助请求，按 provider token 加权，并单列剔除首轮的结果及缺失 usage；认证头不落盘。仅供本地开发，不进 CI。
 - [live/coordinator.yak](live/coordinator.yak)：读取本地目录与 README，使用已配置的 provider，自动计划/执行/报告。
@@ -81,7 +86,6 @@ yak common/ai/aismoking/forge.yak
 - [cache/run_react.yak](cache/run_react.yak)、[cache/analyze.yak](cache/analyze.yak)：实际模型缓存实验及已有 dump/usage 分析，参数可用 `--help` 查看。分析库为 [cache/lib.inc](cache/lib.inc)。
 - `live/video/`：2 个视频切片、Omni 理解和知识库案例，需 ffmpeg、输入视频及对应 provider；可用脚本参数控制只切片。
 - `live/focused/loop_report_generating/`：7 个报告案例，包含初稿、修改、偏移、grep 引用、代码分析与多文件。
-- `live/focused/loop_knowledge_enhance/`：7 个知识搜索/过滤/压缩/文档和 benchmark 案例，需要对应知识库和已配置 provider。
 - `live/focused/loop_write_python_script/`：2 个 Python 脚本案例，需要 Python 执行环境与 provider。
 - `live/focused/loop_infosec_recon/`：原提示词稳定性观测，保留其目标及输出要求，供专门实验使用。
 
@@ -90,6 +94,16 @@ yak common/ai/aismoking/forge.yak
 - [http_packet_history.yak](http_packet_history.yak)：`aim.InvokeReAct` 的文本流和 function-call 两种协议依次调用项目列表、HTTP 历史查询、精确 ID 获取及文件 grep，核对默认工具展示、Skill 自动加载、原始请求和完整大响应导出。使用 `AISMOKING_CASE=http_packet_history` 从总入口运行，仅供本地开发。
 
 ## 收集与清理范围
+
+设置 `AISMOKING_UNRESTRICTED_KNOWLEDGE=1` 运行 `live/knowledge_callers.yak`，可在保留其他内置工具目录的情况下复测三种 loop 的自然语言问答，验证实际工具选择。MCP 与蓝图使用脚本既有的关闭设置；查询范围、预算、隐藏事实、报告文件和完成卡片断言仍执行。
+
+`live/knowledge_natural.yak` 仅用自然语言提出管理任务，提示中不提供工具名或 JSON 参数。真实 AI 在普通/知识增强模式、文本/原生协议下分别完成建库与限量列库、增添知识与文件构建、隐蔽随机事实问答、更新元信息和稳定 ID 条目、双库查询、删条目、删库七个步骤，共四条完整流程。逐步核对实际工具 artifacts、SDK 数据状态、显式范围和 token 预算，并保留对照库；只操作随机命名夹具，退出时核对已清理。设置新的 `AISMOKING_OUTPUT` 后运行；可用 `NATURAL_KNOWLEDGE_FOCUS=default/knowledge_enhance`、`AISMOKING_FUNCTION_CALL=0/1` 单独诊断。文本流程测试直接切块，原生流程测试真实 AI 问题索引构建。
+
+`live/knowledge_callers.yak` 使用真实 AI 和 embedding 运行普通、报告、侦察三种模式的同一组 `aim.InvokeReAct` 任务。设置新的 `AISMOKING_OUTPUT` 后直接执行脚本；逐一核验两种请求协议、精确附加库名、只读约束、实际查询预算、隐藏随机事实和报告文件/卡片。报告模式沿用现有文本 AITag 协议。测试只创建随机命名的自有夹具库并在退出时删除，保存逐例 summary 与事件，真实服务失败不会计为通过。
+
+`live/knowledge_plan.yak` 用真实模型执行相同的三段 Plan 任务：创建并构建文件知识、查询隐藏事实并修改条目与库描述、删条目后确认文件知识仍在、删除测试库并保留对照库。检查三个 worker 的执行/结算、一次计划审批、共享证据、真实工具 artifacts、查询预算、报告和数据库状态。设置新的 `AISMOKING_OUTPUT`；`AISMOKING_FUNCTION_CALL=0/1` 可单独复测协议。只操作自有随机测试库，退出时清理。
+
+`live/knowledge_base_management.yak` 使用真实配置模型和 embedding，在普通通用 loop 中通过 Skill 引导的两个工具执行创建、AI 问题索引构建、显式 names 数组/单库名的预算语义和关键词查询、元信息更新，并用直接 API 核验实际入库。测试将工具范围限定为这两个内置工具；只创建随机命名测试库，退出时清理。设置 `AISMOKING_OUTPUT` 为新目录；`AISMOKING_FUNCTION_CALL=0` 可切换文本协议。保存事件、工具 artifacts 路径与 summary，不保存认证头；真实服务失败不会计为通过。仅供本地开发，不进入 CI。
 
 已收集原 Coordinator 的 6 个 Yak 入口、Go `live_runner` 的综合实验、LiteForge 的注入式及直接入口、liteforgeapp 的应用案例、Forge 全流程案例、缓存脚本、17 个循环示例、2 个视频案例和 3 个 AI engine benchmark。注入式 `.yak` 和 Go live runner 已删除；原内部断言保留为普通 Go 回归，公共调用矩阵由此套件承接。VM 配置绑定仍有窄范围 Go 单元测试，不再用外部注入式业务脚本执行计划。
 

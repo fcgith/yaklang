@@ -7,6 +7,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/syntaxflow/sfpattern"
+	"github.com/yaklang/yaklang/common/utils/filesys"
 	"github.com/yaklang/yaklang/common/yak/ssaapi"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/sfreport"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
@@ -67,8 +68,13 @@ type ScanTaskCallback struct {
 	// scanModes is the product-stage filter (source/struct/ssa). Empty means all.
 	scanModes []string `json:"-"`
 
-	parsedCustomRules     []*schema.SyntaxFlowRule
-	parsedCustomRulesDone bool
+	// scanRuntime is the control point of one scan. It owns the risk collect
+	// and the registered consumers (database saver, report writer). Every
+	// stage of a project scan shares one runtime so a later mode can replace
+	// an earlier finding.
+	scanRuntime *ssaapi.ScanRuntime `json:"-"`
+
+	rulePreparation *rulePreparation
 }
 
 const (
@@ -82,6 +88,13 @@ const (
 var WithReporter = ssaconfig.SetOption(reporterKey, func(c *Config, reporter sfreport.IReport) {
 	c.Reporter = reporter
 })
+
+// WithScanRuntime shares one scan runtime across every stage of a scan.
+func WithScanRuntime(rt *ssaapi.ScanRuntime) ssaconfig.Option {
+	return ssaconfig.SetOption("syntaxflow-scan/scanRuntime", func(c *Config, v *ssaapi.ScanRuntime) {
+		c.scanRuntime = v
+	})(rt)
+}
 
 var WithPauseFunc = ssaconfig.SetOption(pauseFuncKey, func(c *Config, pause func() bool) {
 	c.pauseCheck = pause
@@ -210,14 +223,15 @@ func WithSourceFiles(name string, files map[string]string) ssaconfig.Option {
 // targetDir = code under scan; select rules via RuleFilter (e.g. Tag=source for builtin mode:source).
 func WithSourceDir(name, targetDir string) ssaconfig.Option {
 	return func(c *ssaconfig.Config) error {
-		files, err := sfpattern.LoadFilesFromDir(targetDir)
+		opt := sfpattern.DefaultLoadOptions()
+		store, err := sfpattern.OpenStreamingSource(filesys.NewUnifiedFS(filesys.NewRelLocalFs(targetDir)), &opt, sfpattern.DefaultSourceInFlight)
 		if err != nil {
 			return err
 		}
 		if name == "" {
 			name = filepath.Base(targetDir)
 		}
-		return WithSourceFiles(name, files)(c)
+		return WithQueryTargets(ssaapi.NewSourceQueryTargetFromStore(name, store))(c)
 	}
 }
 

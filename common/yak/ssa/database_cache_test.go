@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/dbcache"
 	"github.com/yaklang/yaklang/common/utils/filesys"
@@ -153,7 +154,10 @@ func TestCompileUnitWriterFlushKeepsFunctionBoundaryResident(t *testing.T) {
 	prog.Cache.FlushInstructionSaver()
 
 	require.True(t, prog.Cache.hasResidentInstruction(builder.Function.GetId()), "compile-unit function metadata must stay resident for later cross-unit calls")
-	require.True(t, prog.Cache.hasResidentInstruction(param.GetId()), "compile-unit parameters must stay resident for later cross-unit call argument binding")
+	require.False(t, prog.Cache.hasResidentInstruction(param.GetId()), "a finished private function reloads its parameter by id")
+	reloadedParam := prog.Cache.GetInstruction(param.GetId())
+	require.NotNil(t, reloadedParam)
+	require.Equal(t, param.GetId(), reloadedParam.GetId())
 	require.False(t, prog.Cache.hasResidentInstruction(bin.GetId()), "ordinary expression instructions should still be flushed and released at unit boundary")
 
 	require.NoError(t, prog.Cache.SaveToDatabase())
@@ -210,7 +214,9 @@ func TestFinalFlushAfterFinishEvictsDeferredTail(t *testing.T) {
 	builder.Finish()
 	prog.Cache.FlushCompileUnit("unit-first")
 
-	secondBuilder := prog.GetAndCreateFunctionBuilder("deferred", string(MainFunctionName))
+	secondBuilder := prog.GetAndCreateFunctionBuilder("", "deferred")
+	require.NotEqual(t, builder.Function.GetId(), secondBuilder.Function.GetId(),
+		"the deferred tail must belong to a different compile-unit function")
 	second := secondBuilder.EmitUndefined("second")
 	secondBuilder.Finish()
 	require.True(t, prog.Cache.hasResidentInstruction(second.GetId()),
@@ -228,7 +234,32 @@ func TestFinalFlushAfterFinishEvictsDeferredTail(t *testing.T) {
 	require.NoError(t, prog.Cache.SaveToDatabase())
 	require.NotNil(t, ssadb.GetIrCodeItemById(ssadb.GetDB(), programName, second.GetId()))
 }
-func TestTypeFlushUpsertsExistingTypeRows(t *testing.T) {
+func TestTypeStoreUsesSingleTableSchemaFromSSADatabase(t *testing.T) {
+	db := ssadb.GetDB()
+	programName := uuid.NewString()
+	defer ssadb.DeleteProgram(db, programName)
+	cfg, err := ssaconfig.New(ssaconfig.ModeSSACompile, ssaconfig.WithSetProgramName(programName))
+	require.NoError(t, err)
+	prog := NewProgram(cfg, ProgramCacheDBWrite, Application, filesys.NewVirtualFs(), "", 1)
+	require.NotNil(t, prog.Cache.types.db)
+	typ := CreateStringType()
+	typ.AddFullTypeName("single.integration")
+	prog.Cache.rememberType(typ)
+	require.NoError(t, prog.Cache.types.flush())
+	require.Equal(t, int64(1), countIrTypeRowsForProgram(t, db, programName))
+	loaded := ssadb.GetIrTypeItemById(db, programName, typ.GetId())
+	require.NotNil(t, loaded)
+	require.Contains(t, loaded.ExtraInformation, "single.integration")
+}
+
+func countIrTypeRowsForProgram(t *testing.T, db *gorm.DB, programName string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(&ssadb.IrType{}).Where("program_name = ?", programName).Count(&count).Error)
+	return count
+}
+
+func TestTypeFlushUpsertsExistingTypeIDs(t *testing.T) {
 	programName := uuid.NewString()
 	defer ssadb.DeleteProgram(ssadb.GetDB(), programName)
 
@@ -237,29 +268,25 @@ func TestTypeFlushUpsertsExistingTypeRows(t *testing.T) {
 	cfg.SetCompileUnitSplit(true)
 
 	prog := NewProgram(cfg, ProgramCacheDBWrite, Application, filesys.NewVirtualFs(), "", 1)
+	storeDB := ssadb.GetDB()
 	typ := CreateStringType()
 	typ.AddFullTypeName("string")
 	prog.Cache.rememberType(typ)
 	require.NoError(t, prog.Cache.types.flush())
+
 	var first ssadb.IrType
-	require.NoError(t, ssadb.GetDB().Where("program_name = ? AND type_id = ?", programName, typ.GetId()).First(&first).Error)
+	require.NoError(t, storeDB.Where("program_name = ? AND type_id = ?", programName, typ.GetId()).First(&first).Error)
 	require.NoError(t, prog.Cache.types.flush())
 	var unchanged ssadb.IrType
-	require.NoError(t, ssadb.GetDB().Where("program_name = ? AND type_id = ?", programName, typ.GetId()).First(&unchanged).Error)
-	require.Equal(t, first.ID, unchanged.ID, "an unchanged type must not be deleted and reinserted at each batch")
+	require.NoError(t, storeDB.Where("program_name = ? AND type_id = ?", programName, typ.GetId()).First(&unchanged).Error)
+	require.Equal(t, first.ID, unchanged.ID, "an unchanged type id must keep its row")
+	require.Equal(t, int64(1), countIrTypeRowsForProgram(t, storeDB, programName))
 
 	typ.AddFullTypeName("java.lang.String")
 	require.NoError(t, prog.Cache.types.flush())
+	require.Equal(t, int64(1), countIrTypeRowsForProgram(t, storeDB, programName))
 
-	var count int
-	err = ssadb.GetDB().
-		Model(&ssadb.IrType{}).
-		Where("program_name = ? AND type_id = ?", programName, typ.GetId()).
-		Count(&count).Error
-	require.NoError(t, err)
-	require.Equal(t, 1, count)
-
-	loaded := ssadb.GetIrTypeItemById(ssadb.GetDB(), programName, typ.GetId())
+	loaded := ssadb.GetIrTypeItemById(storeDB, programName, typ.GetId())
 	require.NotNil(t, loaded)
 	require.Contains(t, loaded.ExtraInformation, "string")
 	require.Contains(t, loaded.ExtraInformation, "java.lang.String")

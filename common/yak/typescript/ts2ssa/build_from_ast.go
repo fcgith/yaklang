@@ -33,8 +33,11 @@ func (b *builder) VisitSourceFile(sourcefile *ast.SourceFile) interface{} {
 
 	prog := b.GetProgram()
 
-	fileName := b.GetEditor().GetFilename()
-	folderPath := b.GetEditor().GetGlobalFolderPath()
+	// Compile units can run concurrently. Keep the editor attached to this
+	// file's builder instead of reading the application's shared editor stack.
+	sourceEditor := b.GetEditor()
+	fileName := sourceEditor.GetFilename()
+	folderPath := sourceEditor.GetGlobalFolderPath()
 	fileUrl := path.Join([]string{folderPath, fileName}...)
 	if fileUrl == "" || fileUrl == "." {
 		fileUrl = "/"
@@ -46,19 +49,19 @@ func (b *builder) VisitSourceFile(sourcefile *ast.SourceFile) interface{} {
 			lib = prog.NewLibrary(fileUrl, []string{fileUrl})
 		}
 
-		lib.PushEditor(prog.GetCurrentEditor())
+		lib.PushEditor(sourceEditor)
 
 		subBuilder := lib.GetAndCreateFunctionBuilder(fileName, string(ssa.MainFunctionName))
 
 		if subBuilder != nil {
 			subBuilder.SetBuildSupport(b.FunctionBuilder)
-			subBuilder.SetEditor(prog.GetApplication().GetCurrentEditor())
+			subBuilder.SetEditor(sourceEditor)
 			currentBuilder := b.FunctionBuilder
 			b.FunctionBuilder = subBuilder
 			defer func() {
-				for _, e := range subBuilder.GetProgram().GetErrors() {
-					currentBuilder.GetProgram().AddError(e)
-				}
+				// Library programs share the application's error list; re-adding the
+				// whole list here doubled it on every built file.
+				currentBuilder.GetProgram().CopyErrorsFrom(subBuilder.GetProgram())
 				b.FunctionBuilder = currentBuilder
 			}()
 		}
@@ -118,13 +121,13 @@ func (b *builder) VisitSourceFile(sourcefile *ast.SourceFile) interface{} {
 
 	if subBuilder != nil {
 		subBuilder.SetBuildSupport(b.FunctionBuilder)
-		subBuilder.SetEditor(prog.GetApplication().GetCurrentEditor())
+		subBuilder.SetEditor(sourceEditor)
 		currentBuilder := b.FunctionBuilder
 		b.FunctionBuilder = subBuilder
 		defer func() {
-			for _, e := range subBuilder.GetProgram().GetErrors() {
-				currentBuilder.GetProgram().AddError(e)
-			}
+			// Library programs share the application's error list; re-adding the
+			// whole list here doubled it on every built file.
+			currentBuilder.GetProgram().CopyErrorsFrom(subBuilder.GetProgram())
 			b.FunctionBuilder = currentBuilder
 		}()
 	}
@@ -1057,9 +1060,9 @@ func (b *builder) VisitClassDeclaration(node *ast.ClassDeclaration) ssa.Value {
 
 	if isExport {
 		if !isDefault {
-			b.GetProgram().ExportType[className] = blueprint
+			b.GetProgram().SetExportType(className, blueprint)
 		} else {
-			b.GetProgram().ExportType["default"] = blueprint
+			b.GetProgram().SetExportType("default", blueprint)
 		}
 	}
 
@@ -1193,7 +1196,7 @@ func (b *builder) VisitVariableDeclaration(decl *ast.VariableDeclaration, declTy
 		identifier := b.VisitIdentifier(name.AsIdentifier())
 		if b.PreHandler() {
 			if isExport {
-				b.GetProgram().ExportValue[identifier] = b.EmitUndefined(identifier)
+				b.GetProgram().SetExportValue(identifier, b.EmitUndefined(identifier))
 			}
 			return nil
 		}
@@ -1228,14 +1231,21 @@ func (b *builder) VisitVariableDeclaration(decl *ast.VariableDeclaration, declTy
 		}
 		b.AssignVariable(variable, initValue)
 		if isExport {
-			ssa.ReplaceAllValue(b.GetProgram().ExportValue[identifier], initValue)
-			b.GetProgram().ExportValue[identifier] = initValue
+			ssa.ReplaceAllValue(b.GetProgram().GetExportValue(identifier), initValue)
+			b.GetProgram().SetExportValue(identifier, initValue)
 		}
 
 	case ast.IsBindingPattern(name): // 解构模式: let {a, b} = obj 或 let [x, y] = arr
-		// 检查是否有初始化值
-		if initValue == nil {
+		// Prehandling deliberately does not evaluate initializers. Check the
+		// declaration's syntax, not the deferred SSA value, for a missing RHS.
+		if decl.Initializer == nil {
 			b.NewError(ssa.Error, TAG, BindPatternDeclarationWithoutInitializer())
+			return nil
+		}
+		if b.PreHandler() {
+			if isExport {
+				b.predeclareBindingPatternExports(name)
+			}
 			return nil
 		}
 
@@ -1508,20 +1518,20 @@ func (b *builder) VisitExportAssignment(node *ast.ExportAssignment) interface{} 
 
 	if b.PreHandler() {
 		if !node.IsExportEquals { // export default expression; // ES写法
-			b.GetProgram().ExportValue["default"] = b.EmitUndefined("default")
+			b.GetProgram().SetExportValue("default", b.EmitUndefined("default"))
 		} else { // export = expression; // TS写法
-			b.GetProgram().ExportValue[EXPORT_EQUAL_VALUE] = b.EmitUndefined(EXPORT_EQUAL_VALUE)
+			b.GetProgram().SetExportValue(EXPORT_EQUAL_VALUE, b.EmitUndefined(EXPORT_EQUAL_VALUE))
 		}
 
 	} else {
 		runTimeValue := b.VisitRightValueExpression(node.Expression)
 		if !utils.IsNil(runTimeValue) {
 			if !node.IsExportEquals { // export default expression; // ES写法
-				ssa.ReplaceAllValue(b.GetProgram().ExportValue["default"], runTimeValue)
-				b.GetProgram().ExportValue["default"] = runTimeValue
+				ssa.ReplaceAllValue(b.GetProgram().GetExportValue("default"), runTimeValue)
+				b.GetProgram().SetExportValue("default", runTimeValue)
 			} else { // export = expression; // TS写法
-				ssa.ReplaceAllValue(b.GetProgram().ExportValue[EXPORT_EQUAL_VALUE], runTimeValue)
-				b.GetProgram().ExportValue[EXPORT_EQUAL_VALUE] = runTimeValue
+				ssa.ReplaceAllValue(b.GetProgram().GetExportValue(EXPORT_EQUAL_VALUE), runTimeValue)
+				b.GetProgram().SetExportValue(EXPORT_EQUAL_VALUE, runTimeValue)
 			}
 		}
 	}
@@ -1726,7 +1736,7 @@ func (b *builder) VisitNamedExports(namedExports *ast.NamedExports) interface{} 
 		}
 		// set undefined as placeholder for value top-def seek
 		if b.PreHandler() {
-			b.GetProgram().ExportValue[exportName] = b.EmitUndefined(exportedItemName)
+			b.GetProgram().SetExportValue(exportName, b.EmitUndefined(exportedItemName))
 			log.Infof("NamedExport: ExportName as %s mapped LocalName as %s from %s", exportName, exportedItemName, b.GetProgram().Name)
 			return nil
 		}
@@ -1734,10 +1744,10 @@ func (b *builder) VisitNamedExports(namedExports *ast.NamedExports) interface{} 
 		runtimeValue := b.VisitRightValueExpression(element.AsExportSpecifier().Name())
 		if !utils.IsNil(runtimeValue) {
 			if bp, ok := ssa.ToBluePrintType(runtimeValue.GetType()); ok {
-				b.GetProgram().ExportType[exportName] = bp
+				b.GetProgram().SetExportType(exportName, bp)
 			}
-			ssa.ReplaceAllValue(b.GetProgram().ExportValue[exportName], runtimeValue)
-			b.GetProgram().ExportValue[exportName] = runtimeValue
+			ssa.ReplaceAllValue(b.GetProgram().GetExportValue(exportName), runtimeValue)
+			b.GetProgram().SetExportValue(exportName, runtimeValue)
 		}
 	}
 	return nil
@@ -1882,10 +1892,11 @@ func (b *builder) VisitExpression(node *ast.Expression, isLval bool) (*ssa.Varia
 				return nil, externValue
 			} else if isNameSpaceImport { // wildcard import as *
 				container := b.EmitEmptyContainer()
-				for name, value := range lib.ExportValue {
+				lib.ExportValue.ForEach(func(name string, value ssa.Value) bool {
 					vari := b.CreateMemberCallVariable(container, b.EmitConstInst(name))
 					b.AssignVariable(vari, value)
-				}
+					return true
+				})
 				vari := b.CreateVariable(identifierName)
 				b.AssignVariable(vari, container)
 				return nil, container
@@ -1894,7 +1905,7 @@ func (b *builder) VisitExpression(node *ast.Expression, isLval bool) (*ssa.Varia
 				vari := b.CreateVariable(identifierName)
 				valToBeReplaced := b.EmitUndefined(identifierName)
 				b.AssignVariable(vari, valToBeReplaced)
-				lib.ExportValue[identifierName] = valToBeReplaced
+				lib.SetExportValue(identifierName, valToBeReplaced)
 				return nil, valToBeReplaced
 			}
 		}
@@ -2967,9 +2978,9 @@ func (b *builder) VisitFunctionDeclaration(node *ast.FunctionDeclaration) interf
 		}
 
 		if !isDefault {
-			b.GetProgram().ExportValue[funcName] = b.EmitUndefined(fmt.Sprintf("func_%s", funcName))
+			b.GetProgram().SetExportValue(funcName, b.EmitUndefined(fmt.Sprintf("func_%s", funcName)))
 		} else {
-			b.GetProgram().ExportValue["default"] = b.EmitUndefined(fmt.Sprintf("func_%s", funcName))
+			b.GetProgram().SetExportValue("default", b.EmitUndefined(fmt.Sprintf("func_%s", funcName)))
 		}
 
 		return nil
@@ -3016,11 +3027,11 @@ func (b *builder) VisitFunctionDeclaration(node *ast.FunctionDeclaration) interf
 	})
 	if isExport {
 		if !isDefault {
-			ssa.ReplaceAllValue(b.GetProgram().ExportValue[funcName], newFunc)
-			b.GetProgram().ExportValue[funcName] = newFunc
+			ssa.ReplaceAllValue(b.GetProgram().GetExportValue(funcName), newFunc)
+			b.GetProgram().SetExportValue(funcName, newFunc)
 		} else {
-			ssa.ReplaceAllValue(b.GetProgram().ExportValue["default"], newFunc)
-			b.GetProgram().ExportValue["default"] = newFunc
+			ssa.ReplaceAllValue(b.GetProgram().GetExportValue("default"), newFunc)
+			b.GetProgram().SetExportValue("default", newFunc)
 		}
 	}
 	// 在当前作用域中创建函数变量
@@ -4053,6 +4064,41 @@ func (b *builder) VisitPropertyName(propertyName *ast.PropertyName) ssa.Value {
 	return nil
 }
 
+// predeclareBindingPatternExports registers only binding names. Reading members,
+// computed keys or defaults here would emit executable IR during prehandling.
+func (b *builder) predeclareBindingPatternExports(name *ast.Node) {
+	if name == nil {
+		return
+	}
+	if ast.IsIdentifier(name) {
+		identifier := name.AsIdentifier().Text
+		b.GetProgram().SetExportValue(identifier, b.EmitUndefined(identifier))
+		return
+	}
+	if !ast.IsBindingPattern(name) {
+		return
+	}
+	pattern := name.AsBindingPattern()
+	if pattern.Elements == nil {
+		return
+	}
+	for _, element := range pattern.Elements.Nodes {
+		if element != nil && !ast.IsOmittedExpression(element) {
+			b.predeclareBindingPatternExports(element.AsBindingElement().Name())
+		}
+	}
+}
+
+func (b *builder) resolveBindingPatternExport(name string, value ssa.Value) {
+	prog := b.GetProgram()
+	placeholder := prog.GetExportValue(name)
+	// Another file in this compile unit may already have read a member of
+	// the export placeholder. Resolve those member reads as well as its users.
+	ssa.ReplaceMemberCall(placeholder, value)
+	ssa.ReplaceAllValue(placeholder, value)
+	prog.SetExportValue(name, value)
+}
+
 // ProcessObjectBindingPattern 处理对象解构模式
 func (b *builder) ProcessObjectBindingPattern(pattern *ast.BindingPattern, sourceObj ssa.Value, isLocal bool, isExport bool) {
 	if pattern == nil || sourceObj == nil || b.IsStop() {
@@ -4088,6 +4134,9 @@ func (b *builder) ProcessObjectBindingPattern(pattern *ast.BindingPattern, sourc
 				}
 				// 直接赋值整个对象
 				b.AssignVariable(restVar, sourceObj)
+				if isExport {
+					b.resolveBindingPatternExport(restName, sourceObj)
+				}
 			} else {
 				b.NewError(ssa.Error, TAG, RestElementRequiresIdentifier())
 			}
@@ -4134,11 +4183,10 @@ func (b *builder) ProcessObjectBindingPattern(pattern *ast.BindingPattern, sourc
 			varName := bindingElement.Name().AsIdentifier().Text
 			if isExport {
 				if b.PreHandler() {
-					b.GetProgram().ExportValue[varName] = b.EmitUndefined(varName)
+					b.GetProgram().SetExportValue(varName, b.EmitUndefined(varName))
 				} else {
 					if !utils.IsNil(propValue) {
-						ssa.ReplaceAllValue(b.GetProgram().ExportValue[varName], propValue)
-						b.GetProgram().ExportValue[varName] = propValue
+						b.resolveBindingPatternExport(varName, propValue)
 					}
 				}
 			}
@@ -4210,6 +4258,9 @@ func (b *builder) ProcessArrayBindingPattern(pattern *ast.BindingPattern, source
 					restVar = b.CreateJSVariable(restName)
 				}
 				b.AssignVariable(restVar, sourceArr)
+				if isExport {
+					b.resolveBindingPatternExport(restName, sourceArr)
+				}
 			}
 			continue
 		} else {
@@ -4233,11 +4284,10 @@ func (b *builder) ProcessArrayBindingPattern(pattern *ast.BindingPattern, source
 			varName := bindingElement.Name().AsIdentifier().Text
 			if isExport {
 				if b.PreHandler() {
-					b.GetProgram().ExportValue[varName] = b.EmitUndefined(varName)
+					b.GetProgram().SetExportValue(varName, b.EmitUndefined(varName))
 				} else {
 					if !utils.IsNil(elementValue) {
-						ssa.ReplaceAllValue(b.GetProgram().ExportValue[varName], elementValue)
-						b.GetProgram().ExportValue[varName] = elementValue
+						b.resolveBindingPatternExport(varName, elementValue)
 					}
 				}
 			}
@@ -4661,9 +4711,9 @@ func (b *builder) VisitEnumDeclaration(node *ast.EnumDeclaration) interface{} {
 	// 处理导出 - 在PreHandle阶段就设置导出值
 	if isExport {
 		if !isDefault {
-			b.GetProgram().ExportType[enumName] = enumBlueprint
+			b.GetProgram().SetExportType(enumName, enumBlueprint)
 		} else {
-			b.GetProgram().ExportType["default"] = enumBlueprint
+			b.GetProgram().SetExportType("default", enumBlueprint)
 		}
 	}
 
@@ -4821,9 +4871,9 @@ func (b *builder) VisitInterfaceDeclaration(node *ast.InterfaceDeclaration) inte
 	// 处理导出 - 在PreHandle阶段就设置导出值
 	if isExport {
 		if !isDefault {
-			b.GetProgram().ExportType[interfaceName] = interfaceBlueprint
+			b.GetProgram().SetExportType(interfaceName, interfaceBlueprint)
 		} else {
-			b.GetProgram().ExportType["default"] = interfaceBlueprint
+			b.GetProgram().SetExportType("default", interfaceBlueprint)
 		}
 	}
 

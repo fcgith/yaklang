@@ -20,6 +20,8 @@ import (
 // "from ..pkg import y"), parenthesized/multi-line and semicolon-separated
 // forms, and literal dynamic imports (importlib.import_module("a.b") /
 // __import__("a.b")).
+func (*SSABuilder) SupportsConcurrentUnitBuild() bool { return true }
+
 func (*SSABuilder) CompileUnitDependencies(fs filesys_interface.FileSystem, units []*ssa.CompileUnit) []ssa.UnitRef {
 	pathToKey := pythonImportPathIndex(fs, units)
 	var edges []ssa.UnitRef
@@ -203,12 +205,14 @@ func resolvePyDynamicImport(
 	if !strings.HasPrefix(mod, ".") {
 		return ssa.ResolvePathImport(pathToKey, strings.ReplaceAll(mod, ".", "/"))
 	}
-	// Split the leading dots from the module suffix.
-	dots := mod[:strings.IndexFunc(mod, func(r rune) bool { return r != '.' })]
-	if dots == "" {
-		dots = mod
+	// Split the leading dots from the module suffix. A module of only dots
+	// (import_module(".") / import_module("..")) has no suffix; IndexFunc
+	// returns -1 for that input and slicing with it panics.
+	cut := strings.IndexFunc(mod, func(r rune) bool { return r != '.' })
+	dots, suffix := mod, ""
+	if cut > 0 {
+		dots, suffix = mod[:cut], mod[cut:]
 	}
-	suffix := strings.TrimPrefix(mod, dots)
 	base := ""
 	if pkg != "" {
 		// package= anchors the resolution: one dot = pkg, two = pkg's parent, ...
@@ -287,13 +291,18 @@ var (
 	// into module names by splitPyImportNames.
 	pyPlainImportRe = regexp.MustCompile(`^import[ \t]+(.*)$`)
 	// pyDynamicImportRe captures an optional dotted receiver, the callee name and
-	// the string-literal argument, plus an optional package= literal. Go's regexp
-	// has no lookbehind, so a leading non-word/non-dot guard is matched
-	// explicitly and the receiver is validated in code.
+	// the string-literal argument, plus an optional package= literal. The literal
+	// must be the whole first argument: after its closing quote only a comma or
+	// the call's closing paren may follow. That rejects expressions such as
+	// import_module(".".join(parts)), which are not plain string literals. The
+	// package bridge stops at ')' and ';' so a following statement on the same
+	// line cannot donate its package= to this call.
+	// Go's regexp has no lookbehind, so a leading non-word/non-dot guard is
+	// matched explicitly and the receiver is validated in code.
 	pyDynamicImportRe = regexp.MustCompile(
 		`(?:^|[^\w.])((?:[A-Za-z_][A-Za-z0-9_]*[ \t]*\.[ \t]*)?)(?:__import__|import_module)` +
-			`[ \t]*\([ \t]*('[^'\n]*'|"[^"\n]*")` +
-			`(?:[^)\n]*?package[ \t]*=[ \t]*('[^'\n]*'|"[^"\n]*"))?`)
+			`[ \t]*\([ \t]*('[^'\n]*'|"[^"\n]*")[ \t]*(?:,|\))` +
+			`(?:[^);\n]*?package[ \t]*=[ \t]*('[^'\n]*'|"[^"\n]*"))?`)
 )
 
 // scanPyImportEdges collects the import edges of a single source file without

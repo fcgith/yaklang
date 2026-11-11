@@ -221,8 +221,9 @@ func marshalExtraInformation(raw Instruction) map[string]any {
 		params["errorcatch_exception"] = ret.Exception
 		params["errorcatch_catch"] = ret.CatchBody
 	case *ExternLib:
-		log.Warnf("TBD: marshal ExternLib: %v", ret)
-		// return nil, utils.Errorf("BUG: ConstInst should not be marshaled")
+		// Name, opcode, and member relations use the generic instruction
+		// record. This branch intentionally adds no extra fields and must
+		// not warn: every persisted import otherwise repeats the same TBD.
 	case *If:
 		if ret.Cond > 0 {
 			params["if_cond"] = ret.Cond
@@ -292,6 +293,9 @@ func marshalExtraInformation(raw Instruction) map[string]any {
 		// params["member_call_obj"] = ret.GetObject()
 	case *Phi:
 		params["phi_edges"] = ret.Edge
+		if len(ret.LoopCarriedEdges) > 0 {
+			params["phi_loop_carried_edges"] = ret.LoopCarriedEdges
+		}
 		if ret.CFGEntryBasicBlock > 0 {
 			params["cfg_entry"] = ret.CFGEntryBasicBlock
 		}
@@ -320,6 +324,12 @@ func marshalExtraInformation(raw Instruction) map[string]any {
 		params["undefined_kind"] = ret.Kind
 	case *ConstInst:
 		params["const_value"] = ret.Const.GetRawValue()
+		if ret.Unary != 0 {
+			params["const_unary"] = ret.Unary
+		}
+		if ret.isIdentify {
+			params["const_identify"] = true
+		}
 		if ret.Origin > 0 {
 			params["const_origin"] = ret.Origin
 		}
@@ -440,6 +450,7 @@ func unmarshalExtraInformation(cache *ProgramCache, inst Instruction, ir *ssadb.
 		ret.MemberCallKey = utils.MapGetInt64(params, "member_call_key")
 	case *Phi:
 		ret.Edge = utils.MapGetInt64Slice(params, "phi_edges")
+		ret.LoopCarriedEdges = utils.MapGetInt64Slice(params, "phi_loop_carried_edges")
 		ret.CFGEntryBasicBlock = utils.MapGetInt64(params, "cfg_entry")
 	case *Return:
 		ret.Results = utils.MapGetInt64Slice(params, "return_results")
@@ -468,6 +479,12 @@ func unmarshalExtraInformation(cache *ProgramCache, inst Instruction, ir *ssadb.
 			c = newConstCreate(i)
 		}
 		ret.Const = c
+		ret.ConstType = ConstType(ir.ConstType)
+		if ret.ConstType == "" {
+			ret.ConstType = ConstTypeNormal
+		}
+		ret.Unary = utils.MapGetInt(params, "const_unary")
+		ret.isIdentify = utils.MapGetBool(params, "const_identify")
 		ret.Origin = utils.MapGetInt64(params, "const_origin")
 	case *If:
 		ret.Cond = utils.MapGetInt64(params, "if_cond")

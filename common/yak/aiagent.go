@@ -14,8 +14,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/coordinator"
-	// blank-import aive 触发价值评估 submitter 的 init() 注册 (默认开启).
-	// 关键词: aive blank import, RegisterValueFeedbackSubmitter 触发
+	// Register the durable, session-scoped trajectory evaluator.
 	_ "github.com/yaklang/yaklang/common/ai/aid/aive"
 	// blank-import aistats 触发命中统计 (UserAIStats) recorder 的 init() 注册 (默认开启).
 	// 关键词: aistats blank import, RegisterStatsRecorder 触发
@@ -137,6 +136,7 @@ func yakTool2AITool(aitools []*schema.AIYakTool, invokeForgeHandle bool) []*aito
 			aitool.WithVerboseName(aiTool.VerboseName),
 			aitool.WithVerboseNameZh(aiTool.VerboseNameZh),
 			aitool.WithUsage(aiTool.Usage),
+			aitool.WithDefaultAsync(aiTool.DefaultAsync),
 			aitool.WithCallback(func(ctx context.Context, params aitool.InvokeParams, runtimeConfig *aitool.ToolRuntimeConfig, stdout io.Writer, stderr io.Writer) (any, error) {
 				ctx, cancel := context.WithCancel(ctx)
 				defer cancel()
@@ -170,9 +170,10 @@ func yakTool2AITool(aitools []*schema.AIYakTool, invokeForgeHandle bool) []*aito
 				for k, v := range params {
 					switch ret := v.(type) {
 					case bool:
-						if ret {
-							args = append(args, "--"+k)
-						}
+						// Pass false too. "Set the switch to false" and "leave the
+						// switch alone" must not look the same to the script: a
+						// plugin whose declared default is true would keep it.
+						args = append(args, "--"+k, fmt.Sprintf("%v", ret))
 					default:
 						args = append(args, "--"+k, nativeYakPluginArgString(ret))
 					}
@@ -234,7 +235,11 @@ func yakTool2AITool(aitools []*schema.AIYakTool, invokeForgeHandle bool) []*aito
 					)
 					bindMemorySearchToEngine(ae, ctx, runtimeConfig)
 					bindAIHistoryToEngine(ae, ctx, runtimeConfig)
+					bindAIDetachToEngine(ae, runtimeConfig)
+					bindAIToolSleep(ae, ctx)
 					bindDBHistoryToEngine(ae, ctx, runtimeConfig)
+					bindMCPToEngine(ae, ctx, runtimeConfig)
+					bindAIKnowledgeToEngine(ae, ctx, runtimeConfig)
 					return nil
 				})
 
@@ -336,6 +341,7 @@ var AIAgentExport = map[string]any{
 	"systemFileOperator":           aicommon.WithSystemFileOperator,
 	"omniSearchTool":               aicommon.WithOmniSearchTool,
 	"debugPrompt":                  aicommon.WithDebugPrompt,
+	"networkDebug":                 aicommon.WithNetworkDebug,
 	"debug":                        aicommon.WithDebug,
 	"appendPersistentMemory":       aicommon.WithAppendPersistentContext,
 	"timelineContentLimit":         aicommon.WithTimelineContentLimit,

@@ -12,6 +12,9 @@ import (
 )
 
 type PreHandlerAnalyzer interface {
+	// WrapWithPreprocessedFS gives the compile the filesystem it reads. The bool
+	// is the caller's decision to allow archive expansion at all; a frontend
+	// without archives ignores it.
 	WrapWithPreprocessedFS(fi.FileSystem, bool) fi.FileSystem
 
 	InitHandler(builder *FunctionBuilder)
@@ -260,9 +263,6 @@ func (b *PreHandlerBase) CreateAntlrCache(lexer []int32, parser []int32) *AntlrC
 	if cache.Empty() {
 		return nil
 	}
-	b.antlrMutex.Lock()
-	b.Caches = append(b.Caches, cache)
-	b.antlrMutex.Unlock()
 	return cache
 }
 

@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/user"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +23,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/yaklang/yaklang/common/gmsm/gmtls"
 	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/utils/yakitenv"
 	"golang.org/x/net/http2"
 )
 
@@ -249,20 +249,7 @@ func InGithubActions() bool {
 }
 
 func InTestcase() bool {
-	if len(os.Args) > 0 {
-		if strings.HasSuffix(strings.ToLower(os.Args[0]), ".test") {
-			return true
-		}
-	}
-	for _, v := range os.Args {
-		if strings.Contains(v, "-test.v") {
-			return true
-		}
-		if strings.Contains(v, "-test.run") {
-			return true
-		}
-	}
-	return false
+	return yakitenv.InTest()
 }
 
 func Debug(f func()) {
@@ -763,15 +750,17 @@ func debugMockHTTPServerWithTLSConfig(ctx context.Context, addr string, https, h
 }
 
 func DebugMockHTTPWithTimeout(du time.Duration, rsp []byte) (string, int) {
-	addr := GetRandomLocalAddr()
-	time.Sleep(time.Millisecond * 300)
-	host, port, _ := ParseStringToHostPort(addr)
+	// Bind before returning the port. Closing a :0 listener and rebinding after
+	// a delay lets a concurrent test claim the same ephemeral port.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	host, port, _ := ParseStringToHostPort(lis.Addr().String())
+	addr := HostPort(host, port)
 
 	go func() {
-		lis, err := net.Listen("tcp", addr)
-		if err != nil {
-			panic(err)
-		}
+		defer lis.Close()
 		go func() {
 			time.Sleep(du)
 			lis.Close()
@@ -794,8 +783,8 @@ func DebugMockHTTPWithTimeout(du time.Duration, rsp []byte) (string, int) {
 		lis.Close()
 	}()
 
-	err := WaitConnect(addr, 3)
-	if err != nil {
+	if err = WaitConnect(addr, 3); err != nil {
+		lis.Close()
 		panic(err)
 	}
 	return host, port

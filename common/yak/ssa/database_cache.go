@@ -7,7 +7,7 @@ import (
 
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/utils/dbcache"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 	"go.uber.org/atomic"
@@ -127,6 +127,10 @@ func (c *ProgramCache) CloseWithoutSave() {
 	c.types = nil
 	c.indexes = nil
 	c.sources = nil
+	if c.program != nil {
+		c.program.initConcurrentMaps()
+		c.program.variableRanges.Clear()
+	}
 }
 
 func (c *ProgramCache) SetInstruction(inst Instruction) {
@@ -139,6 +143,15 @@ func (c *ProgramCache) SetInstruction(inst Instruction) {
 	}
 	if c != nil && c.instructions != nil {
 		c.instructions.Set(inst)
+	}
+}
+
+// MarkInstructionDirty publishes changes made directly to exported IR fields.
+// Normal instruction setters and relation mutators do this automatically.
+func (c *ProgramCache) MarkInstructionDirty(inst Instruction) {
+	if c != nil && c.instructions != nil && c.instructions.residentCache != nil && inst != nil {
+		bindInstructionPersistence(inst)
+		c.instructions.residentCache.Set(inst.GetId(), inst)
 	}
 }
 
@@ -217,10 +230,11 @@ func (c *ProgramCache) SaveToDatabase(cb ...func(int)) error {
 	}
 	log.Infof("[ssa-ir-cache-save] program=%s SaveToDatabase started", progName)
 	// Final barrier enter log (v3 §A.5)
-	enterRemaining := int64(c.CountInstruction())
-	enterPersisted := int64(c.InstructionPersistedCount())
+	enterAccounting := c.GetFlushAccounting()
+	enterRemaining := enterAccounting.RemainingDirty
+	enterPersisted := enterAccounting.AlreadyPersisted
 	enterTotal := enterRemaining + enterPersisted
-	log.Infof("[ssa-persist-final-barrier] event=enter program=%s instructions_total=%d already_persisted=%d remaining_dirty=%d", progName, enterTotal, enterPersisted, enterRemaining)
+	log.Infof("[ssa-persist-final-barrier] event=enter program=%s instructions_total=%d already_persisted=%d remaining_dirty=%d resident=%d", progName, enterTotal, enterPersisted, enterRemaining, enterAccounting.Resident)
 	heapSnapshot("SaveToDatabase.enter")
 
 	steps := []func() error{
@@ -265,10 +279,9 @@ func (c *ProgramCache) SaveToDatabase(cb ...func(int)) error {
 		},
 		func() error {
 			if c.instructions != nil {
-				remaining := c.CountInstruction()
-				persisted := c.InstructionPersistedCount()
-				log.Infof("[ssa-ir-cache-save] program=%s step3: closing instruction store (resident=%d persisted=%d total=%d)",
-					progName, remaining, persisted, remaining+persisted)
+				accounting := c.GetFlushAccounting()
+				log.Infof("[ssa-ir-cache-save] program=%s step3: closing instruction store (resident=%d persisted=%d total=%d remaining_dirty=%d)",
+					progName, accounting.Resident, accounting.AlreadyPersisted, accounting.InstructionsTotal, accounting.RemainingDirty)
 				heapSnapshot("step3_instructions.close.enter")
 				start := time.Now()
 				if err := c.instructions.Close(progress); err != nil {
@@ -302,11 +315,14 @@ func (c *ProgramCache) SaveToDatabase(cb ...func(int)) error {
 					avgBatch = float64(persistStats.WriteOperations) / float64(persistStats.BatchCount)
 				}
 				// Writer summary (v3 §A.3)
-				log.Infof("[ssa-persist-writer-summary] program=%s request=%d enqueued=%d completed=%d write_ops=%d unique_persisted=%d resident=%d pending=%d persisted_instructions=%d batch_count=%d avg_batch=%.2f queue_depth_current=%d pending_current=%d errors=0",
+				log.Infof("[ssa-persist-writer-summary] program=%s request=%d enqueued=%d completed=%d write_ops=%d unique_persisted=%d resident=%d pending=%d persisted_instructions=%d batch_count=%d avg_batch=%.2f queue_depth_current=%d pending_current=%d unchanged_skipped=%d resident_released=%d errors=0",
 					progName, persistStats.Requests, persistStats.Enqueued, persistStats.Completed,
 					persistStats.WriteOperations, persistStats.UniquePersisted, persistStats.Resident,
 					persistStats.Pending, persistStats.WriteOperations, persistStats.BatchCount, avgBatch,
-					persistStats.Resident, persistStats.Pending)
+					persistStats.Resident, persistStats.Pending, persistStats.UnchangedSkipped, persistStats.ResidentReleased)
+				insertRows, updateRows, updateStatements := ssadb.IrCodeWriteBreakdown(progName)
+				log.Infof("[ssa-ir-code-writes] program=%s insert_rows=%d update_rows=%d update_statements=%d",
+					progName, insertRows, updateRows, updateStatements)
 			}
 			return nil
 		},
@@ -331,6 +347,7 @@ func (c *ProgramCache) SaveToDatabase(cb ...func(int)) error {
 	var typeRemaining, typeSaved int64
 	var indexRemaining, indexSaved int64
 	if c.sources != nil {
+		sourceRemaining = int64(c.sources.PayloadCount())
 		sourceSaved = int64(c.sources.PersistedCount())
 	}
 	// typeStore and indexStore don't expose persistedCount in a simple way;
@@ -373,13 +390,12 @@ func (c *ProgramCache) FlushCompileUnit(unitKey string) {
 		log.Debugf("[ssa-persist-flush] event=request reason=unit unit_key=%s mode=%s heap_before=%.1fMB resident_before=%d persisted_before=%d",
 			unitSample, c.InstructionCacheMode(), float64(m.HeapInuse)/(1024*1024), residentBefore, persistedBefore)
 	}
-	// Per-batch flush bounds memory by spilling ORDINARY instructions to DB
-	// (flushCompileUnitWriter keeps BasicBlocks + Function/Parameter/FreeValue
-	// boundary instructions resident, so block ScopeTable survives for lazy
-	// builds). Stores (indexes/types/sources) are intentionally NOT flushed
-	// per batch: flushing them mid-project breaks cross-unit resolution
-	// (SyntaxFlow `#->` over-resolves imported symbols — see TestImportClass).
-	// They stay resident and are persisted by the final SaveToDatabase flush.
+	// Per-batch flush bounds memory by spilling ordinary instructions and
+	// finished private-function blocks to DB. Unfinished and cross-unit
+	// boundary instructions stay resident so their scopes survive lazy builds.
+	// Index/type maps are not cleared here: they carry cross-unit identities
+	// and mutations. Batch cleanup persists them through FlushAuxSavers,
+	// which also hands source payloads to their background saver.
 	//
 	// The instruction saver is asynchronous: this method only enqueues the
 	// selected instructions. The completion callback above is the only place
@@ -416,6 +432,17 @@ func (c *ProgramCache) FlushInstructionSaver() {
 	c.instructions.FlushSaver()
 }
 
+// InstructionCacheStats reports the instruction writer's residency count and
+// async-saver counters (batch count/size, pending depth, save loop time).
+// Read-only telemetry for the compile-batch barrier log; it must not disturb
+// the cache.
+func (c *ProgramCache) InstructionCacheStats() dbcache.CacheStats {
+	if c == nil || c.instructions == nil {
+		return dbcache.CacheStats{}
+	}
+	return c.instructions.Stats()
+}
+
 func (c *ProgramCache) CountReleasedEditors() int {
 	if c == nil {
 		return 0
@@ -424,11 +451,10 @@ func (c *ProgramCache) CountReleasedEditors() int {
 }
 
 // FlushAuxSavers drains the auxiliary async/resident DB savers (index, offset,
-// type). It does NOT spill instructions and does NOT clear any resident maps
-// (index variable/member/class/consts, type resident), so it is safe to call
-// between compile batches: cross-unit SyntaxFlow resolution keeps using the
-// resident maps (TestImportClass), and BasicBlocks stay resident
-// (TestPython_ImportWithInit, TestJsp_To_Java_Range). typeStore.flush marshals
+// type, source). It does NOT spill instructions or clear index/type maps,
+// so cross-unit resolution keeps using stable resident identities. Unfinished
+// and protected BasicBlocks also keep their original lexical scopes.
+// typeStore.flush marshals
 // and persists resident types but leaves them resident so later-units / lazy
 // builds / cross-unit queries still resolve. It exists to spread IrIndex/
 // IrOffset/IrType writes across the whole compile instead of one giant final
@@ -440,48 +466,37 @@ func (c *ProgramCache) FlushAuxSavers() {
 	if c == nil || !c.HaveDatabaseBackend() {
 		return
 	}
+	var nameMs, indexMs, typeMs, sourceMs int64
+	// Name ids are referenced by index rows. Persist the batch assigned in
+	// memory before those rows, and never while holding the name-cache lock
+	// across the instruction writer's transaction.
+	if c.program != nil && c.program.NameCache != nil {
+		started := time.Now()
+		if err := c.program.NameCache.Flush(); err != nil {
+			log.Errorf("FlushAuxSavers: name cache flush failed: %v", err)
+		}
+		nameMs = time.Since(started).Milliseconds()
+	}
 	if c.indexes != nil {
+		started := time.Now()
 		if err := c.indexes.Flush(); err != nil {
 			log.Errorf("FlushAuxSavers: index store flush failed: %v", err)
 		}
+		indexMs = time.Since(started).Milliseconds()
 	}
 	if c.types != nil {
+		started := time.Now()
 		if err := c.types.flush(); err != nil {
 			log.Errorf("FlushAuxSavers: type store flush failed: %v", err)
 		}
-	}
-}
-
-// flushAuxStores clears only the non-instruction stores (types, sources) after
-// a compile-unit flush. The instruction store is not touched: its
-// compile-unit-split flush path already persisted ordinary instructions while
-// keeping function/parameter/free-value boundary instructions resident for
-// later cross-unit calls.
-//
-// Currently unused: FlushCompileUnit no longer clears aux stores (that broke
-// cross-unit resolution). Retained for the future re-enable of full per-batch
-// flush once the dbcache FeedBlock + cross-unit bugs are fixed.
-func (c *ProgramCache) flushAuxStores() (cleared int) {
-	if c == nil {
-		return 0
-	}
-
-	if c.types != nil && c.types.resident != nil {
-		c.types.resident = utils.NewSafeMapWithKey[int64, Type]()
-		cleared += 100
+		typeMs = time.Since(started).Milliseconds()
 	}
 	if c.sources != nil {
-		c.sources.mu.Lock()
-		beforeSize := len(c.sources.payloads) + len(c.sources.editors)
-		c.sources.payloads = make(map[string]*ssadb.IrSource)
-		c.sources.persisted = make(map[string]struct{})
-		c.sources.editors = make(map[string]*memedit.MemEditor)
-		c.sources.editorsByURL = make(map[string]*memedit.MemEditor)
-		c.sources.visitedURLs = make(map[string]*memedit.MemEditor)
-		c.sources.mu.Unlock()
-		cleared += beforeSize
+		started := time.Now()
+		c.sources.FlushAsync()
+		sourceMs = time.Since(started).Milliseconds()
 	}
-	return cleared
+	log.Infof("[ssa-flush-aux] names=%dms indexes=%dms types=%dms sources=%dms", nameMs, indexMs, typeMs, sourceMs)
 }
 
 func (c *ProgramCache) CountInstruction() int {
@@ -553,6 +568,13 @@ func (c *ProgramCache) findByVariableEx(mod ssadb.MatchMode, checkValue func(str
 		return nil
 	}
 	return c.indexes.FindByVariableEx(mod, checkValue, c.GetInstruction)
+}
+
+func (c *ProgramCache) findByVariableName(mod ssadb.MatchMode, name string) []Instruction {
+	if c == nil || c.indexes == nil {
+		return nil
+	}
+	return c.indexes.FindByVariableName(mod, name, c.GetInstruction)
 }
 
 // setAtomicMaxIfGreater updates the atomic counter only when the new value is

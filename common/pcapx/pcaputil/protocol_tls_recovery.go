@@ -1,0 +1,155 @@
+package pcaputil
+
+import "errors"
+
+func tlsAuthenticationError(err error) bool {
+	var p *ProtocolError
+	return errors.As(err, &p) && p.Kind == ErrAuthenticationFailed
+}
+
+// Authenticate each candidate before committing sequence or key-epoch state.
+// This only recovers at an already framed record boundary: never scan random
+// TCP bytes for a header, and never deliver unauthenticated candidate plaintext.
+func (f *binFlow) openTLSRecord(dir int, w []byte, info map[string]any) ([]byte, byte, error) {
+	t := f.tls
+	wasGap := t.recordGap[dir]
+	plain, typ, err := t.open(dir, w)
+	if err == nil {
+		if wasGap {
+			info["Record Recovery Verified"] = true
+			info["Recovery State"] = "record authentication resumed; earlier plaintext remains unavailable"
+		}
+		t.recordGap[dir] = false
+		t.recoveryFailures[dir] = 0
+		return plain, typ, nil
+	}
+	if !tlsAuthenticationError(err) || f.transportFlow == nil && !f.orderedTLSCarrier {
+		return nil, 0, err
+	}
+	commit := func(trial binTLS, p []byte, kind byte, missing, epochChanged bool) ([]byte, byte, error) {
+		// Missing old-epoch handshake bytes cannot be joined to an authenticated
+		// new epoch. Retire them only after the candidate record authenticates;
+		// failed trials retain the live state. Application gap policy is unchanged.
+		if epochChanged && len(trial.handshake[dir]) != 0 {
+			info["Discarded Handshake Fragment Bytes"] = len(trial.handshake[dir])
+			trial.handshake[dir] = nil
+			trial.handshakeAuthenticated[dir] = false
+			if kind == 22 {
+				// Authentication recovers a record boundary, not a handshake
+				// boundary. The new bytes may be the missing message's suffix;
+				// even plausible framing cannot establish where it starts.
+				trial.handshakeGap[dir] = true
+				info["Handshake Boundary"] = "unavailable after authenticated key-epoch recovery"
+			}
+		}
+		*t = trial
+		t.recordGap[dir] = false
+		t.recoveryFailures[dir] = 0
+		info["Record Recovery Verified"], info["Recovered Record Sequence"] = true, t.seq[dir]-1
+		info["Missing Earlier Plaintext"] = missing
+		info["Recovery State"] = "record sequence/epoch authenticated; missing plaintext is not reconstructed"
+		return p, kind, nil
+	}
+	// Missing complete records can change the implicit sequence counter. The
+	// finite window bounds CPU; a failed trial cannot mutate the live state.
+	if wasGap {
+		for skip := uint64(1); skip <= 16 && t.seq[dir] <= ^uint64(0)-skip; skip++ {
+			trial := *t
+			trial.seq[dir] += skip
+			p, k, e := trial.open(dir, w)
+			if e == nil {
+				return commit(trial, p, k, true, false)
+			}
+		}
+	}
+	if t.version == 0x304 {
+		trial := *t
+		if !t.app[dir] {
+			trial.app[dir] = true
+			trial.keys[dir] = nil
+			trial.seq[dir] = 0
+			if ok, e := trial.loadKey(dir, f.a.tlsSecrets); e == nil && ok {
+				for n := uint64(0); n <= 16; n++ {
+					candidate := trial
+					candidate.seq[dir] = n
+					p, k, e := candidate.open(dir, w)
+					if e == nil {
+						info["Application Epoch Inferred From Authenticated Record"] = true
+						candidate.handshakeGap[dir] = false
+						return commit(candidate, p, k, n > 0 || t.child != nil, true)
+					}
+				}
+			}
+		} else if len(t.secret[dir]) > 0 {
+			if next, e := quicHKDFExpandLabel(t.secret[dir], "traffic upd", len(t.secret[dir])); e == nil && trial.install13(dir, next) == nil {
+				for n := uint64(0); n <= 16; n++ {
+					candidate := trial
+					candidate.seq[dir] = n
+					p, k, e := candidate.open(dir, w)
+					if e == nil {
+						info["Unobserved KeyUpdate Inferred From Authentication"] = true
+						candidate.handshakeGap[dir] = false
+						return commit(candidate, p, k, true, true)
+					}
+				}
+			}
+		}
+	}
+	return nil, 0, err
+}
+
+func (f *binFlow) markTLSInnerGap(dir int) {
+	f.plaintextGap[dir] = true
+	if t := f.tls; t != nil {
+		t.notePHAGap(dir)
+		// A later authenticated octet cannot complete an alert across missing
+		// plaintext or an inferred epoch. Its message alignment is unknown.
+		t.alert[dir], t.alertPending[dir], t.alertAuthenticated[dir] = 0, false, false
+	}
+	if t := f.tls; t != nil && t.child != nil {
+		child := t.child
+		child.plaintextGap[dir] = true
+		d := &child.directions[dir]
+		d.stopped, d.tlsPlaintextGap = true, true
+		// Keep one already charged, validated prefix until the owning TLS
+		// record has been published. No plaintext crosses the gap, and no
+		// extra queue or buffer copy is allocated while awaiting that callback.
+		if child.httpIncompleteHeader(dir, d.buffer) != nil {
+			d.tlsGapHTTPPending = true
+		} else {
+			child.release(d)
+			d.http = nil
+		}
+	}
+}
+func (f *binFlow) noteTLSRecordFailure(dir int, info map[string]any) {
+	f.noteTLSRecordGap(dir, info, true)
+}
+
+// An impossible envelope has no authenticated sequence. Keep the current
+// candidate and let a later intact record authenticate any bounded skip.
+func (f *binFlow) noteTLSEnvelopeFailure(dir int, info map[string]any) {
+	f.noteTLSRecordGap(dir, info, false)
+}
+
+func (f *binFlow) noteTLSRecordGap(dir int, info map[string]any, advance bool) {
+	if f.transportFlow == nil && !f.orderedTLSCarrier || f.tls == nil {
+		return
+	}
+	t := f.tls
+	t.handshake[dir] = nil
+	t.handshakeGap[dir] = true
+	t.recordGap[dir] = true
+	// Shape rejection performs no authentication trial. It must not exhaust
+	// the separate cryptographic recovery budget before an intact record.
+	if advance && t.recoveryFailures[dir] < 4 {
+		t.recoveryFailures[dir]++
+	}
+	if advance && t.seq[dir] != ^uint64(0) {
+		t.seq[dir]++
+	}
+	f.markTLSInnerGap(dir)
+	info["Record Failure Isolated"] = true
+	info["Recovery State"] = "one record rejected; exact-boundary authentication recovery allowed"
+	info["Inner Application Status"] = "missing plaintext; this direction is not dissected across the gap"
+}

@@ -8,9 +8,30 @@ import (
 	"sync"
 )
 
+// timelineCompressionCompletion is one compression commit's memory receipt.
+// done is closed when the parsed memory entities are available. notified is
+// closed after memory observers have been invoked.
+type timelineCompressionCompletion struct {
+	done     chan struct{}
+	notified chan struct{}
+	retryKey string
+	output   *TimelineCompressionSelection
+	err      error
+}
+
+func newTimelineCompressionCompletion(selection *TimelineCompressionSelection) *timelineCompressionCompletion {
+	completion := &timelineCompressionCompletion{
+		done:     make(chan struct{}),
+		notified: make(chan struct{}),
+		output:   selection,
+	}
+	close(completion.done)
+	return completion
+}
+
 // Session candidates are extraction history, not verified or persisted memory
 // entities. Forks share this append-only ledger without sharing ordinary history.
-// Only successful, committed compression responses enter it. Pending streams are
+// Only successful, committed compression responses enter it. Pending receipts are
 // runtime-only; snapshots persist completed candidates and tolerate older dumps.
 type timelineSessionMemory struct {
 	mu                sync.Mutex
@@ -33,7 +54,7 @@ func (m *Timeline) IsSessionTimeline() bool {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return !m.branchTimeline && m.sessionMemory != nil && m.sessionMemory.owner == m
+	return !m.branchTimeline.Load() && m.sessionMemory != nil && m.sessionMemory.owner == m
 }
 
 func newTimelineSessionMemory(owner *Timeline, items []any) *timelineSessionMemory {
@@ -107,6 +128,16 @@ func (h *timelineSessionMemory) wait(ctx context.Context) error {
 }
 
 func (h *timelineSessionMemory) waitWithProgress(ctx context.Context, onWait func()) error {
+	return h.waitForCompletions(ctx, onWait, true)
+}
+
+// A reduction needs all earlier model output, not completion of external
+// observers. Finalization uses waitWithProgress to await delivery as well.
+func (h *timelineSessionMemory) waitForModelTail(ctx context.Context, onWait func()) error {
+	return h.waitForCompletions(ctx, onWait, false)
+}
+
+func (h *timelineSessionMemory) waitForCompletions(ctx context.Context, onWait func(), waitNotifications bool) error {
 	if h == nil {
 		return nil
 	}
@@ -135,7 +166,7 @@ func (h *timelineSessionMemory) waitWithProgress(ctx context.Context, onWait fun
 		if err := wait(completion.done); err != nil {
 			return err
 		}
-		if completion.notified != nil {
+		if waitNotifications && completion.notified != nil {
 			if err := wait(completion.notified); err != nil {
 				return err
 			}

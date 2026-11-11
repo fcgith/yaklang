@@ -3,6 +3,7 @@ package ssaapi
 import (
 	"context"
 	"sort"
+	"sync"
 	goatomic "sync/atomic"
 	"time"
 
@@ -50,6 +51,11 @@ type Program struct {
 	// *Value graph ops (GetCalled / GetUsers) can filter without sfvm.Config.
 	structBound      *structBound
 	structScanActive bool
+
+	// structBoundCache keeps one immutable path filter per compile unit.
+	// A struct query used to rebuild the unit's file-path set for every rule,
+	// which made the same map live once per concurrent query.
+	structBoundCache sync.Map
 }
 
 // resetInterRuleStateCacheThreshold is the default nodeId2ValueCache entry
@@ -176,8 +182,8 @@ func (p *Program) IsIncrementalCompile() bool {
 		return false
 	}
 	if p.irProgram != nil {
-		// 使用 IsOverlay 或 BaseProgramName 来判断是否是增量编译
-		return p.irProgram.IsOverlay || p.irProgram.BaseProgramName != "" || len(p.irProgram.FileHashMap) > 0
+		// 增量类型的判定收口在 ssadb 的行谓词上（IsIncrementalKind）
+		return p.irProgram.IsIncrementalKind()
 	}
 	// 如果没有 irProgram，检查是否有 BaseProgramName 或 FileHashMap（向后兼容）
 	if p.Program != nil {
@@ -194,7 +200,7 @@ func (p *Program) IsBaseProgram() bool {
 	}
 	// base program 是增量编译的，但 BaseProgramName 为空
 	if p.irProgram != nil {
-		return p.irProgram.BaseProgramName == ""
+		return p.irProgram.IsBaseProgramKind()
 	}
 	if p.Program != nil {
 		return p.Program.BaseProgramName == ""

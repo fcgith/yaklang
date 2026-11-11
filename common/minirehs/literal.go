@@ -4,6 +4,7 @@ import (
 	"regexp/syntax"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // extractRequiredLiterals 从 RE2 语法树提取"必需字面量"集合: 任何命中都必然包含其中
@@ -100,17 +101,10 @@ func extractRequiredLiteralFactors(re *syntax.Regexp, minLen int) [][]string {
 func requiredLiteralFactorsOf(re *syntax.Regexp) [][]string {
 	switch re.Op {
 	case syntax.OpLiteral:
-		if len(re.Rune) == 0 {
-			return nil
+		if lits := requiredLiteralNode(re); len(lits) > 0 {
+			return [][]string{lits}
 		}
-		if re.Flags&syntax.FoldCase != 0 {
-			for _, r := range re.Rune {
-				if r > 127 {
-					return nil
-				}
-			}
-		}
-		return [][]string{{string(re.Rune)}}
+		return nil
 	case syntax.OpConcat:
 		var all [][]string
 		for _, sub := range re.Sub {
@@ -156,20 +150,7 @@ func flattenLiteralFactors(factors [][]string) []string {
 func requiredLiterals(re *syntax.Regexp) []string {
 	switch re.Op {
 	case syntax.OpLiteral:
-		if len(re.Rune) == 0 {
-			return nil
-		}
-		// prefilter 在 ASCII 小写域比较 (字面量与数据都做 ASCII 小写), 保证大小写无关时
-		// 不漏报. 但非 ASCII 字符的大小写折叠会改变字节, ASCII 小写无法覆盖, 可能漏报;
-		// 因此 FoldCase 且含非 ASCII 字符时放弃提取, 退化为 always-on (正确性优先).
-		if re.Flags&syntax.FoldCase != 0 {
-			for _, r := range re.Rune {
-				if r > 127 {
-					return nil
-				}
-			}
-		}
-		return []string{string(re.Rune)}
+		return requiredLiteralNode(re)
 
 	case syntax.OpConcat:
 		var best []string
@@ -223,6 +204,116 @@ func requiredLiterals(re *syntax.Regexp) []string {
 		// OpStar / OpQuest / OpAnyChar / OpCharClass / OpEmptyMatch / 锚点 等: 无必需字面量.
 		return nil
 	}
+}
+
+func requiredLiteralNode(re *syntax.Regexp) []string {
+	lit := asciiSafeLiteral(re)
+	if len(lit) >= 2 || isRareAnchorLiteral(lit) || re.Flags&syntax.FoldCase == 0 {
+		if lit == "" {
+			return nil
+		}
+		return []string{lit}
+	}
+	// A short literal may have no useful safe fragment ("SK" or "sk-").
+	// Preserve filtering by listing its finite Unicode forms.
+	// Cap expansion; longer ambiguous literals safely remain always-on.
+	if len(re.Rune) == 0 || re.Flags&syntax.FoldCase == 0 {
+		return nil
+	}
+	forms := []string{""}
+	for _, r := range re.Rune {
+		var variants []string
+		switch r {
+		case 'k', 'K':
+			variants = []string{"k", "K"}
+		case 's', 'S':
+			variants = []string{"s", "ſ"}
+		default:
+			if r > 127 {
+				if lit != "" {
+					return []string{lit}
+				}
+				return nil
+			}
+			variants = []string{asciiLowerString(string(r))}
+		}
+		if len(forms) > 64/len(variants) {
+			if lit != "" {
+				return []string{lit}
+			}
+			return nil
+		}
+		next := make([]string, 0, len(forms)*len(variants))
+		for _, prefix := range forms {
+			for _, v := range variants {
+				next = append(next, prefix+v)
+			}
+		}
+		forms = next
+	}
+	return forms
+}
+
+// A byte trigger cannot require the UTF-8 encoding of RuneError: RE2 decodes
+// invalid bytes as that rune, and the PCRE compatibility wrapper normalizes them.
+// ASCII case folding also cannot represent long s or the Kelvin sign.
+func asciiSafeLiteral(re *syntax.Regexp) string {
+	if re.Flags&syntax.FoldCase == 0 {
+		literal := string(re.Rune)
+		if !strings.ContainsRune(literal, unicode.ReplacementChar) {
+			return literal
+		}
+		best := ""
+		for _, fragment := range strings.Split(literal, string(unicode.ReplacementChar)) {
+			if len(fragment) > len(best) {
+				best = fragment
+			}
+		}
+		return best
+	}
+	start, bestStart, bestEnd := 0, 0, 0
+	for i, r := range re.Rune {
+		if !asciiFoldSafe(r) {
+			if i-start > bestEnd-bestStart {
+				bestStart, bestEnd = start, i
+			}
+			start = i + 1
+		}
+	}
+	if len(re.Rune)-start > bestEnd-bestStart {
+		bestStart, bestEnd = start, len(re.Rune)
+	}
+	return string(re.Rune[bestStart:bestEnd])
+}
+
+func asciiFoldSafe(r rune) bool {
+	if r > 127 {
+		return false
+	}
+	for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+		if folded > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+// ASCII byte preconditions cannot constrain these folds. Localization instead
+// uses literalTriggerBounds to account for every fragment occurrence and width.
+func hasNonASCIIFold(re *syntax.Regexp) bool {
+	if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 {
+		for _, r := range re.Rune {
+			if !asciiFoldSafe(r) {
+				return true
+			}
+		}
+	}
+	for _, sub := range re.Sub {
+		if hasNonASCIIFold(sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // isRareAnchorLiteral 报告单字符字面量 l 是否属于"稀有锚字节": 在真实 HTTP 流量中出现稀疏

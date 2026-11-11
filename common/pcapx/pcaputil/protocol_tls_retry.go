@@ -9,13 +9,13 @@ import (
 var tlsRetryRandom = sha256.Sum256([]byte("HelloRetryRequest"))
 
 type tlsHelloView struct {
-	prefix, session, suites []byte
-	suite                   uint16
-	ext                     map[uint16][]byte
-	order                   []uint16
+	prefix, session, suites, compression []byte
+	suite                                uint16
+	ext                                  map[uint16][]byte
+	order                                []uint16
 }
 
-func tlsHello(body []byte, client bool) (*tlsHelloView, error) {
+func tlsHello(body []byte, client bool, limits ...int) (*tlsHelloView, error) {
 	bad := func() (*tlsHelloView, error) { return nil, protocolError(ErrMalformedMessage, "TLS hello structure") }
 	if len(body) < 35 || body[34] > 32 {
 		return bad()
@@ -24,7 +24,7 @@ func tlsHello(body []byte, client bool) (*tlsHelloView, error) {
 	if p > len(body) {
 		return bad()
 	}
-	h := &tlsHelloView{session: body[35:p], ext: map[uint16][]byte{}}
+	h := &tlsHelloView{session: body[35:p]}
 	if client {
 		if p+2 > len(body) {
 			return bad()
@@ -44,22 +44,84 @@ func tlsHello(body []byte, client bool) (*tlsHelloView, error) {
 		if n == 0 || n > len(body)-p {
 			return bad()
 		}
+		h.compression = body[p : p+n]
 		p += n
 	} else {
 		if len(body)-p < 3 {
 			return bad()
 		}
 		h.suite = binary.BigEndian.Uint16(body[p:])
+		h.compression = body[p+2 : p+3]
 		p += 3
 	}
 	h.prefix = body[:p]
 	if p == len(body) {
+		h.ext = map[uint16][]byte{}
 		return h, nil
 	}
 	if len(body)-p < 2 || int(binary.BigEndian.Uint16(body[p:])) != len(body)-p-2 {
 		return bad()
 	}
 	p += 2
+	if len(limits) > 0 {
+		// Validate the whole extension vector before admitting its collection.
+		// The fixed bitset detects duplicate 16-bit types without allocating
+		// the output map/order or retaining a rejected Hello as retry state.
+		var seen [1024]uint64
+		count := 0
+		var psk, versions, modes []byte
+		var certificatePSK tlsCertificatePSKHelloExtensions
+		for q := p; q < len(body); {
+			if len(body)-q < 4 {
+				return bad()
+			}
+			kind, n := binary.BigEndian.Uint16(body[q:]), int(binary.BigEndian.Uint16(body[q+2:]))
+			q += 4
+			bit := uint64(1) << (kind % 64)
+			if n > len(body)-q || seen[kind/64]&bit != 0 {
+				return bad()
+			}
+			if err := tlsHelloExtensionDataStructure(kind, body[q:q+n], client, q+n == len(body)); err != nil {
+				return nil, err
+			}
+			seen[kind/64] |= bit
+			switch kind {
+			case 33:
+				certificatePSK.present = true
+			case 42:
+				certificatePSK.early = true
+			case 51:
+				certificatePSK.share = body[q : q+n]
+			case 41:
+				psk = body[q : q+n]
+			case 43:
+				versions = body[q : q+n]
+			case 45:
+				modes = body[q : q+n]
+			}
+			count++
+			q += n
+		}
+		certificatePSK.psk, certificatePSK.versions, certificatePSK.modes = psk, versions, modes
+		if err := certificatePSK.check(client); err != nil {
+			return nil, err
+		}
+		if client && certificatePSK.early && psk == nil {
+			return nil, protocolError(ErrMalformedMessage, "TLS early_data offer requires pre_shared_key")
+		}
+		if client && psk != nil {
+			if err := tlsPSKClientRequirements(versions, modes); err != nil {
+				return nil, err
+			}
+			if binary.BigEndian.Uint16(body) != 0x303 || !bytes.Equal(h.compression, []byte{0}) {
+				return nil, protocolError(ErrMalformedMessage, "TLS 1.3 PSK ClientHello legacy parameters")
+			}
+		}
+		if count > limits[0] {
+			return nil, protocolError(ErrResourceExceeded, "TLS hello extension count")
+		}
+	}
+	h.ext = map[uint16][]byte{}
 	for p < len(body) {
 		if len(body)-p < 4 {
 			return bad()
@@ -74,6 +136,90 @@ func tlsHello(body []byte, client bool) (*tlsHelloView, error) {
 		p += n
 	}
 	return h, nil
+}
+
+func tlsSNIName(v []byte) ([]byte, error) {
+	if len(v) < 5 || int(binary.BigEndian.Uint16(v)) != len(v)-2 || v[2] != 0 || int(binary.BigEndian.Uint16(v[3:])) != len(v)-5 {
+		return nil, protocolError(ErrMalformedMessage, "TLS SNI length")
+	}
+	return v[5:], nil
+}
+
+// Validate known extension grammar before applying a new inner collection cap.
+// Resource refusal must not hide an existing structural error in another entry.
+func tlsHelloExtensionStructure(h *tlsHelloView, client bool) error {
+	for i, kind := range h.order {
+		if err := tlsHelloExtensionDataStructure(kind, h.ext[kind], client, i == len(h.order)-1); err != nil {
+			return err
+		}
+	}
+	_, present := h.ext[33]
+	_, early := h.ext[42]
+	if client && early {
+		if _, present := h.ext[41]; !present {
+			return protocolError(ErrMalformedMessage, "TLS early_data offer requires pre_shared_key")
+		}
+	}
+	return (tlsCertificatePSKHelloExtensions{present: present, early: early,
+		psk: h.ext[41], share: h.ext[51], modes: h.ext[45], versions: h.ext[43]}).check(client)
+}
+
+func tlsHelloExtensionDataStructure(kind uint16, v []byte, client, last bool) error {
+	if err := tlsResumptionExtensionStructure(kind, v, client, last); err != nil {
+		return err
+	}
+	switch kind {
+	case 33:
+		if len(v) != 0 {
+			return protocolError(ErrMalformedMessage, "TLS certificate-with-external-PSK flag must be empty")
+		}
+	case 0:
+		if client {
+			_, err := tlsSNIName(v)
+			return err
+		}
+	case 16:
+		_, err := tlsALPNName(v, !client)
+		return err
+	case 43:
+		if !client && len(v) != 2 {
+			return protocolError(ErrMalformedMessage, "TLS selected version length")
+		}
+	case 49:
+		if !client || len(v) != 0 {
+			return protocolError(ErrMalformedMessage, "TLS post_handshake_auth must be an empty ClientHello extension")
+		}
+	}
+	return nil
+}
+
+// tlsALPNName admits the complete vector before exposing its first name.
+// The client advertises a list; the server must select exactly one name.
+func tlsALPNName(v []byte, server bool, limits ...int) ([]byte, error) {
+	if len(v) < 3 || int(binary.BigEndian.Uint16(v)) != len(v)-2 {
+		return nil, protocolError(ErrMalformedMessage, "TLS ALPN vector")
+	}
+	var first []byte
+	count := 0
+	for p := 2; p < len(v); {
+		n := int(v[p])
+		p++
+		if n == 0 || n > len(v)-p {
+			return nil, protocolError(ErrMalformedMessage, "TLS ALPN length")
+		}
+		if count == 0 {
+			first = v[p : p+n]
+		}
+		count++
+		p += n
+	}
+	if server && count != 1 {
+		return nil, protocolError(ErrMalformedMessage, "TLS selected ALPN count")
+	}
+	if len(limits) > 0 && count > limits[0] {
+		return nil, protocolError(ErrResourceExceeded, "TLS ALPN protocol count")
+	}
+	return first, nil
 }
 
 func tlsContains16(v []byte, n uint16) bool {
@@ -112,18 +258,34 @@ func tlsClientShares(v []byte) (map[uint16]bool, error) {
 
 // Validate the HRR branch separately from the final ServerHello. This remains a
 // passive record decoder, not a certificate or PSK-binder verifier (RFC 8446 4.1).
-func (t *binTLS) observeHello(dir int, typ byte, body []byte) (bool, error) {
-	h, err := tlsHello(body, typ == 1)
+func (t *binTLS) observeHello(dir int, typ byte, body []byte, limits ...int) (bool, error) {
+	h, err := tlsHello(body, typ == 1, limits...)
 	if err != nil {
 		return false, err
 	}
 	bad := func(why string) (bool, error) { return false, protocolError(ErrMalformedMessage, "TLS retry: "+why) }
+	if err := tlsHelloExtensionStructure(h, typ == 1); err != nil {
+		return false, err
+	}
+	if typ == 2 {
+		if err := tls13ServerHelloLocations(body, h); err != nil {
+			return false, err
+		}
+		if err := tlsServerHelloGREASE(body, h); err != nil {
+			return false, err
+		}
+	}
+	if alpn, present := h.ext[16]; present {
+		if _, err := tlsALPNName(alpn, typ == 2, limits...); err != nil {
+			return false, err
+		}
+	}
 	if typ == 1 {
 		if t.retrySeen {
 			if t.retryClientSeen || dir != t.client {
 				return bad("unexpected ClientHello2")
 			}
-			first, err := tlsHello(t.firstHello, true)
+			first, err := tlsHello(t.firstHello, true, limits...)
 			if err != nil {
 				return false, err
 			}
@@ -135,9 +297,6 @@ func (t *binTLS) observeHello(dir int, typ byte, body []byte) (bool, error) {
 			}
 			if !bytes.Equal(h.ext[44], t.retryCookie) {
 				return bad("cookie mismatch")
-			}
-			if first.ext[41] != nil || h.ext[41] != nil {
-				return false, protocolError(ErrUnsupportedFeature, "TLS HRR PSK binder changes")
 			}
 			if t.retryGroup != 0 {
 				shares, err := tlsClientShares(h.ext[51])
@@ -174,17 +333,75 @@ func (t *binTLS) observeHello(dir int, typ byte, body []byte) (bool, error) {
 				}
 			}
 			t.retryClientSeen = true
+			// Final ServerHello PSK indices refer to ClientHello2, which may
+			// remove incompatible identities and recompute ages/binders.
+			t.firstHello = bytes.Clone(body)
 		} else if t.firstHello == nil {
 			t.firstHello = bytes.Clone(body)
 		}
+		// Final ServerHello releases firstHello. Keep the complete, admitted
+		// client's PHA offer as connection state across that release and KU.
+		t.earlyDataOfferKnown = true
+		_, t.earlyDataOffered = h.ext[42]
+		t.phaOfferKnown = true
+		_, t.phaOffered = h.ext[49]
+		// EncryptedExtensions follows final ServerHello, which releases the
+		// complete retry body. Keep only the admitted ALPN offer needed to
+		// qualify the later server selection; absence is also known evidence.
+		t.alpnOfferKnown = true
+		t.alpnOffer = bytes.Clone(h.ext[16])
+		t.observeKeyExchangeOffers(h)
 		return false, nil
 	}
 	retry := bytes.Equal(body[2:34], tlsRetryRandom[:])
+	if !retry && !t.retrySeen && t.firstHello != nil && t.client >= 0 {
+		// A complete owned ClientHello makes these observations provable.
+		// Server-only captures retain their existing partial-context behavior.
+		first, err := tlsHello(t.firstHello, true, limits...)
+		if err != nil {
+			return false, err
+		}
+		if dir == t.client {
+			return bad("ServerHello from observed client direction")
+		}
+		if !tlsContains16(first.suites, h.suite) {
+			return bad("ServerHello cipher was not offered")
+		}
+		if bytes.IndexByte(first.compression, h.compression[0]) < 0 {
+			return bad("ServerHello compression was not offered")
+		}
+		if binary.BigEndian.Uint16(body) > binary.BigEndian.Uint16(t.firstHello) {
+			return bad("ServerHello version exceeds observed client version")
+		}
+		if alpn, present := h.ext[16]; present {
+			selected, err := tlsALPNName(alpn, true, limits...)
+			if err != nil {
+				return false, err
+			}
+			offered, present := first.ext[16]
+			if !present {
+				return bad("ServerHello ALPN was not offered")
+			}
+			if _, err := tlsALPNName(offered, false, limits...); err != nil {
+				return false, err
+			}
+			found := false
+			for v := offered[2:]; len(v) > 0; {
+				n := int(v[0])
+				v = v[1:]
+				found = found || bytes.Equal(v[:n], selected)
+				v = v[n:]
+			}
+			if !found {
+				return bad("ServerHello ALPN was not offered")
+			}
+		}
+	}
 	if retry || t.retrySeen {
 		if t.firstHello == nil || t.client < 0 {
 			return false, protocolError(ErrContextRequired, "TLS HRR requires first ClientHello")
 		}
-		first, err := tlsHello(t.firstHello, true)
+		first, err := tlsHello(t.firstHello, true, limits...)
 		if err != nil {
 			return false, err
 		}
@@ -248,6 +465,7 @@ func (t *binTLS) observeHello(dir int, typ byte, body []byte) (bool, error) {
 		}
 	}
 	t.finalHello = true
+	t.serverHelloDirectionKnown, t.serverHelloDirection = true, int8(dir)
 	t.firstHello, t.retryCookie = nil, nil
 	return false, nil
 }

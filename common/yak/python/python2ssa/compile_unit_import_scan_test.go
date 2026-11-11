@@ -137,6 +137,14 @@ func TestScanPyImportEdgesDynamicGuards(t *testing.T) {
 	requireScan(t, "mod = compat.__import__(\"db.engine\")\n")
 	requireScan(t, "value = 1\nimport_moduleX(\"db.engine\")\n")
 	requireScan(t, "mod = import_module(\"db.engine\")  # import_module(\"other\")\n", "dynamic||db.engine|")
+	// A quote followed by an operator is an expression, not a module literal.
+	// Hue hits this as import_module(".".join(...)) and __import__(".".join(...)).
+	requireScan(t, "mod = import_module(\".\".join(parts))\n")
+	requireScan(t, "c = getattr(__import__(\".\".join(modules[0:-1])), m)\n")
+	requireScan(t, "mod = import_module(\"a\" + \"b\")\n")
+	// A pure-dot literal is a real relative import and must be kept.
+	requireScan(t, "mod = importlib.import_module(\".\", package=\"pkg\")\n", "dynamic||.|pkg")
+	requireScan(t, "mod = import_module(\"..\")\n", "dynamic||..|")
 }
 
 // TestScanPyImportEdgesStatementForms covers statement shapes the scanner walks
@@ -223,4 +231,16 @@ func TestScanPyImportEdgesCorpusParity(t *testing.T) {
 	if missing != 0 || extra != 0 {
 		t.Fatalf("corpus parity broken: missing=%d extra=%d", missing, extra)
 	}
+}
+
+// Two dynamic imports on one line are two statements. A package= argument
+// belongs to the call it is written in; the scanner must not reach across the
+// ';' and attach it to the previous call.
+func TestScanPyImportEdgesDynamicImportStopsAtStatementBoundary(t *testing.T) {
+	requireScan(t, `a = import_module("alpha"); b = import_module("beta", package="pkg")`,
+		"dynamic||alpha|", "dynamic||beta|pkg")
+	requireScan(t, `a = import_module(".local"); b = import_module(".other", package="pkg")`,
+		"dynamic||.local|", "dynamic||.other|pkg")
+	requireScan(t, `a = __import__("alpha"); b = __import__("beta", globals(), locals(), [], 0); c = import_module("gamma")`,
+		"dynamic||alpha|", "dynamic||beta|", "dynamic||gamma|")
 }

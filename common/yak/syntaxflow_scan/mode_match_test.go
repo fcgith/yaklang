@@ -21,11 +21,13 @@ func TestRuleMatchesQueryTarget(t *testing.T) {
 	ssaRule := &schema.SyntaxFlowRule{Mode: schema.SFR_MODE_SSA}
 
 	require.True(t, ruleMatchesQueryTarget(sourceRule, sourceTarget))
-	require.False(t, ruleMatchesQueryTarget(sourceRule, prog))
-	require.False(t, ruleMatchesQueryTarget(structRule, prog))
 	require.False(t, ruleMatchesQueryTarget(structRule, sourceTarget))
-	require.True(t, ruleMatchesQueryTarget(ssaRule, prog))
 	require.False(t, ruleMatchesQueryTarget(ssaRule, sourceTarget))
+	// A Program is a multi-mode target: Program.Query dispatches a rule by the
+	// mode it declares, so every mode is accepted there.
+	require.True(t, ruleMatchesQueryTarget(sourceRule, prog))
+	require.True(t, ruleMatchesQueryTarget(structRule, prog))
+	require.True(t, ruleMatchesQueryTarget(ssaRule, prog))
 }
 
 func TestStartScan_SkipsSourceRuleOnSSAProgram(t *testing.T) {
@@ -48,6 +50,30 @@ alert $hit`,
 	)
 	require.NoError(t, err)
 	require.False(t, failed, "source rule on SSA program must be skipped, not failed")
+}
+
+func TestDeterministicRuleSkip(t *testing.T) {
+	sourceTarget := ssaapi.NewSourceQueryTarget("src", map[string]string{"a.env": "x"})
+	prog, err := ssaapi.Parse("a = 1")
+	require.NoError(t, err)
+
+	structRule := &schema.SyntaxFlowRule{Mode: schema.SFR_MODE_STRUCT, RuleName: "struct"}
+	reason, skip := deterministicRuleSkip(false, structRule, sourceTarget)
+	require.True(t, skip)
+	require.Equal(t, "skipped: target-mode mismatch", reason)
+
+	javaRule := &schema.SyntaxFlowRule{Mode: schema.SFR_MODE_SSA, Language: ssaconfig.JAVA, RuleName: "java"}
+	reason, skip = deterministicRuleSkip(false, javaRule, prog)
+	require.True(t, skip)
+	require.Equal(t, "skipped: language mismatch", reason)
+	_, skip = deterministicRuleSkip(true, javaRule, prog)
+	require.False(t, skip, "ignore-language keeps a cross-language SSA rule runnable")
+
+	sourceRule := &schema.SyntaxFlowRule{Mode: schema.SFR_MODE_SOURCE, Language: ssaconfig.JAVA, RuleName: "source"}
+	_, skip = deterministicRuleSkip(false, sourceRule, sourceTarget)
+	require.False(t, skip, "source rules stay language-agnostic and are not pre-skipped")
+	_, skip = deterministicRuleSkip(false, nil, prog)
+	require.False(t, skip)
 }
 
 func TestRuleFilterModesInfersFromTargets(t *testing.T) {

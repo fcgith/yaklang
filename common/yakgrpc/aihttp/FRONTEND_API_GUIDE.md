@@ -195,6 +195,7 @@
   "AIService": "aibalance",
   "AIModelName": "glm-4-flash-free",
   "ReviewPolicy": "manual",
+  "RuntimeContextSizeLimit": 0,
   "SelectedProviderID": 1,
   "SelectedModelName": "glm-4-flash-free",
   "SelectedModelTier": "intelligent"
@@ -216,11 +217,17 @@
   "ai_service": "openai",
   "selected_provider_id": 3,
   "selected_model_name": "gpt-4o-mini",
-  "review_policy": "manual"
+  "review_policy": "manual",
+  "runtime_context_size_limit": 131072
 }
 ```
 
 响应：完整保存后的设置（PascalCase 键名）。
+
+`RuntimeContextSizeLimit` 是运行时上下文的压缩阈值，默认 `0`，表示交给服务端使用默认值。
+启用默认配置时，启动请求的 `Params.RuntimeContextSizeLimit` 优先；请求未设置（为 `0`）
+且聊天设置的新字段为正数时，才从该设置补齐。请求与设置均未指定时使用服务端默认
+`300 * 1024`。旧 `TimelineContentSizeLimit` 不转换、不回填到新字段。
 
 ---
 
@@ -370,6 +377,8 @@
   "ModelName": ["gpt-4o", "gpt-4o-mini"]
 }
 ```
+
+OpenAI 兼容服务的 `/models` 返回 404、405 或 501 时，接口正常返回空模型列表。调用方应允许手动填写模型名称，并继续通过 `/setting/aiconfig/healthcheck` 检测该模型；空列表本身不表示对话接口不可用。鉴权、限流、服务异常和网络错误仍正常报错。
 
 ### `POST /setting/aifocus/get`
 

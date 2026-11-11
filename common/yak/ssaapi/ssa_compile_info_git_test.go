@@ -11,12 +11,8 @@ import (
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
-	"github.com/yaklang/yaklang/common/utils/filesys"
-	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/utils/yakgit"
-	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssagitworkdir"
 )
@@ -167,52 +163,6 @@ func TestIncrementalGitFallbackUsesIndependentCleanup(t *testing.T) {
 	require.Empty(t, readDirectoryNames(t, managedRoot))
 }
 
-func TestIncrementalCompileEntryCleansGitFallbackWorkspace(t *testing.T) {
-	repositoryRoot := createGitSourceRepository(t)
-	managedRoot := filepath.Join(t.TempDir(), "managed-git-workspaces")
-	t.Setenv(ssagitworkdir.WorkDirEnv, managedRoot)
-	t.Setenv(ssagitworkdir.MinFreeBytesEnv, "0")
-
-	baseProgramName := "git-fallback-base-" + uuid.NewString()
-	diffProgramName := "git-fallback-diff-" + uuid.NewString()
-	t.Cleanup(func() {
-		ProgramCache.Remove(baseProgramName)
-		ProgramCache.Remove(diffProgramName)
-		ssadb.DeleteProgram(ssadb.GetDB(), baseProgramName)
-		ssadb.DeleteProgram(ssadb.GetDB(), diffProgramName)
-	})
-	baseProgram, err := ParseFromReader(
-		strings.NewReader("println(40 + 2)\n"),
-		ssaconfig.WithCodeSourceKind(ssaconfig.CodeSourceGit),
-		ssaconfig.WithCodeSourceURL(repositoryRoot),
-		WithLanguage(ssaconfig.Yak),
-		WithProgramName(baseProgramName),
-	)
-	require.NoError(t, err)
-	require.NotNil(t, baseProgram)
-	SetProgramCache(baseProgram)
-	require.Empty(t, readDirectoryNames(t, managedRoot))
-
-	originalBuild := buildFileSystemFromProgramNameForIncremental
-	buildFileSystemFromProgramNameForIncremental = func(string) (fi.FileSystem, error) {
-		return nil, errors.New("force Git config fallback")
-	}
-	t.Cleanup(func() { buildFileSystemFromProgramNameForIncremental = originalBuild })
-
-	updatedFS := filesys.NewVirtualFs()
-	updatedFS.AddFile("main.yak", "println(43)\n")
-	programs, err := ParseProjectWithIncrementalCompile(
-		updatedFS,
-		baseProgramName,
-		diffProgramName,
-		ssaconfig.Yak,
-		WithEnableIncrementalCompile(true),
-	)
-	require.NoError(t, err)
-	require.NotEmpty(t, programs)
-	require.Empty(t, readDirectoryNames(t, managedRoot))
-}
-
 func createGitSourceRepository(t *testing.T) string {
 	t.Helper()
 	repositoryRoot := t.TempDir()
@@ -257,4 +207,41 @@ func readDirectoryNames(t *testing.T, dir string) []string {
 		names = append(names, entry.Name())
 	}
 	return names
+}
+
+func TestGitSourcePinsHistoricalCommitAndRejectsMissingCommit(t *testing.T) {
+	source := createGitSourceRepository(t)
+	repository, err := git.PlainOpen(source)
+	require.NoError(t, err)
+	head, err := repository.Head()
+	require.NoError(t, err)
+	tree, err := repository.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(source, "main.yak"), []byte("println(99)\n"), 0600))
+	_, err = tree.Add("main.yak")
+	require.NoError(t, err)
+	_, err = tree.Commit("change source", &git.CommitOptions{Author: &object.Signature{Name: "CI fixture", Email: "ci@example.invalid", When: time.Unix(2, 0)}})
+	require.NoError(t, err)
+	for _, commit := range []string{head.Hash().String(), strings.Repeat("a", 40), "not-a-sha"} {
+		t.Run(commit, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv(ssagitworkdir.WorkDirEnv, root)
+			t.Setenv(ssagitworkdir.MinFreeBytesEnv, "0")
+			cfg, err := ssaconfig.New(ssaconfig.ModeSSACompile, ssaconfig.WithCodeSourceKind(ssaconfig.CodeSourceGit), ssaconfig.WithCodeSourceURL(source), ssaconfig.WithCodeSourceCommit(commit))
+			require.NoError(t, err)
+			config := &Config{Config: cfg}
+			defer config.Cleanup()
+			local, err := cloneGitSourceDir(config)
+			if commit != head.Hash().String() {
+				require.Error(t, err)
+				require.Empty(t, readDirectoryNames(t, root))
+				return
+			}
+			require.NoError(t, err)
+			data, err := os.ReadFile(filepath.Join(local, "main.yak"))
+			require.NoError(t, err)
+			require.Contains(t, string(data), "40 + 2")
+			require.NotContains(t, string(data), "99")
+		})
+	}
 }

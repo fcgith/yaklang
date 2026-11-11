@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/jsonextractor"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
@@ -20,6 +22,9 @@ import (
 	"github.com/yaklang/yaklang/common/utils/lowhttp/poc"
 )
 
+// ListChatModels discovers models when the provider supports the models endpoint.
+// Unsupported discovery returns an empty list; callers should still allow an
+// explicitly configured model to be used and checked through the chat endpoint.
 func ListChatModels(url string, opt func() ([]poc.PocConfigOption, error)) ([]*ModelMeta, error) {
 	opts, err := opt()
 	if err != nil {
@@ -49,6 +54,18 @@ func ListChatModels(url string, opt func() ([]poc.PocConfigOption, error)) ([]*M
 	rsp, _, err := poc.DoGET(url, opts...)
 	if err != nil {
 		return nil, utils.Errorf("request get to %v：%v", url, err)
+	}
+	statusCode := rsp.GetStatusCode()
+	switch statusCode {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		// Model discovery is optional for OpenAI-compatible providers. An
+		// unavailable /models endpoint says nothing about whether a configured
+		// model can answer chat or health-check requests.
+		log.Infof("AI model listing is unavailable (HTTP %d); use a manually configured model", statusCode)
+		return nil, nil
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return nil, utils.Errorf("list AI models failed: HTTP %d: %.4096s", statusCode, rsp.GetBody())
 	}
 
 	// body like  {"object":"list","data":[{"id":"qwq:latest","object":"model","created":1741877931,"owned_by":"library"},{"id":"gemma3:27b","object":"model","created":1741875247,"owned_by":"library"},{"id":"deepseek-r1:32b","object":"model","created":1738946811,"owned_by":"library"},{"id":"deepseek-r1:70b","object":"model","created":1738939603,"owned_by":"library"},{"id":"qwen2.5:32b","object":"model","created":1727615210,"owned_by":"library"},{"id":"qwen2.5:latest","object":"model","created":1727613786,"owned_by":"library"}]}
@@ -1263,6 +1280,10 @@ func executeChatBaseRequest(
 		poc.WithAppendHeader("Accept-Encoding", "gzip, deflate, br"), // enable compression for better network performance
 	}
 	opts = append(defaultOpts, opts...) // User options come AFTER defaults, so they can override
+	if rpm, _ := consts.ModelRequestLimit(); rpm > 0 || consts.IsAIRetryForeverEnabled() {
+		// The host admits every retry; transport retries must not bypass its queue.
+		opts = append(opts, poc.WithRetryTimes(0), poc.WithRedirectTimes(0))
+	}
 	opts = append(opts, poc.WithReplaceHttpPacketBody(raw, false))
 
 	var pr, reasonPr, toolCallArgsReader io.Reader
@@ -1395,7 +1416,7 @@ func executeChatBaseRequest(
 				cancel()
 			}
 		}
-		return body.String(), utils.Errorf("request post to %v：%v", url, finalErr)
+		return body.String(), utils.Errorf("request post to %v：%w", url, finalErr)
 	}
 	return body.String(), nil
 }

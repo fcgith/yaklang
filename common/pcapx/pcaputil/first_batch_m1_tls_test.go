@@ -14,6 +14,7 @@ import (
 )
 
 func TestFirstBatchT09(t *testing.T) {
+	tlsAlertOwnedQueries(t)
 	keylog, err := trafficfixture.ReadFile("testdata/protocol-sessions/first-batch-m1/tls-h2-bidi.keys")
 	require.NoError(t, err)
 	keys, err := ParseTLSKeyLog(string(keylog))
@@ -36,6 +37,10 @@ func TestFirstBatchT09(t *testing.T) {
 					for _, e := range events {
 						require.Empty(t, e.Error, "%s %s", e.Protocol, e.Summary)
 						if e.Protocol == "tls" {
+							if e.Session["Secret Lookup Status"] == "missing-key" {
+								require.Contains(t, []uint16{0x303, 0x304}, e.Session["Negotiated Version"], "missing keys cannot erase observed negotiation")
+								require.Equal(t, "m1.example", e.Session["SNI"])
+							}
 							if v, ok := e.Session["Negotiated Version"].(uint16); ok {
 								versions[v] = true
 							}
@@ -91,6 +96,15 @@ func TestFirstBatchT09(t *testing.T) {
 		for _, e := range events {
 			require.NotEqual(t, "decrypted", e.SourceBytes.Kind)
 			if e.ExpertCode == string(ErrAuthenticationFailed) {
+				result, err := e.Decode()
+				require.Nil(t, result)
+				var pe *ProtocolError
+				require.ErrorAs(t, err, &pe)
+				require.Equal(t, ErrAuthenticationFailed, pe.Kind)
+				fields, err := e.GetFields()
+				require.Nil(t, fields)
+				require.ErrorAs(t, err, &pe)
+				require.Equal(t, ErrAuthenticationFailed, pe.Kind)
 				fail++
 			}
 		}

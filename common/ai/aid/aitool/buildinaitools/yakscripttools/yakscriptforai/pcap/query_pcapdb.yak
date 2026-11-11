@@ -1,0 +1,186 @@
+__DESC__ = "Query a pcapdb capture by persistent dataset ID or auto-import a local PCAP/PCAPNG path. Return bounded packet/protocol/session/stream evidence, source-observed MAC/IP endpoints, real protocol fields, previews and indexed associations so the caller can answer traffic questions."
+__VERBOSE_NAME__ = "Query PCAP Database"
+__VERBOSE_NAME_ZH__ = "查询 PCAP 流量库"
+__KEYWORDS__ = "pcap,pcapng,pcapdb,keylog,tls,https,query,流量分析,协议字段,mac,ip,主机,session,stream,密钥日志,解密"
+__INPUT_CONSTRAINTS__ = '{"oneOf":[{"required":["id"],"not":{"required":["pcapfile"]}},{"required":["pcapfile"],"not":{"required":["id"]}}]}'
+__USAGE__ = <<<USAGE
+id 为 load_pcapfile 返回的 dataset_id；或传 pcapfile 自动导入/按内容复用，并开启协议和 stream 分析。只能传一个身份参数，后续优先使用返回的 dataset_id。
+使用 pcapfile 自动导入且用户提供授权 NSS keylog 时，可同时传 tls_keylog_file；该参数不能和 id 一起使用。keylog 内容只供本次协议重放，不回显或持久化。已有库的 metadata.tls_keylog_applied 表示其分析是否使用过 keylog。
+query_type: metadata / packets / protocols(default) / macs / endpoint_bindings / fields / sessions / streams / details / body_summary / packet_data / protocol_data / stream_data / protocol_packets / chunk_packets / packet_sessions。
+这是 PCAP/PCAPNG 应用层分析的首选工具。不要因为缺少 tshark 而自行解析 pcapng 或猜 HTTP 字段：protocols 摘要包含 transaction_id/response_to，response_to 指向对应请求的消息 ID。先用 protocol=http 获取摘要，再用 details 核对 URL、Host、Method、Path、状态码和正文边界。包级摘要不能替代这类协议字段和证据查询。
+macs 先按捕获域汇总源 MAC、源 IP 数和包数；endpoint_bindings 展开源 MAC/IP 观测边并返回首末时间、首末包号。它们只表示帧内共同出现的源地址，不代表路由/NAT 后的地址归属。需要主机或用户身份时，先用 IP 与时间范围缩小候选，再查询协议和详情，不要逐包读取原始帧或自行解析以太网头。
+body_summary 用 record_id 选择一条 HTTP/1 消息，在后端完成完整读取、传输解码、Content-Encoding 解码、SHA256 和内容统计，只返回长度、完整性、编码/压缩/二进制特征、敏感类别和哈希，不返回正文或正文前缀。需要正文哈希、上传是否完整、压缩/二进制判断或敏感内容提示时必须用它，不要用 protocol_data 预览或导出到 shell 自行计算。
+details、body_summary、*_data、protocol_packets、chunk_packets、packet_sessions 必须给正整数 record_id，其类型分别是消息/包/消息/流/消息/块/包。其余模式不传 record_id。
+details/body_summary/packet_data/protocol_data 只传身份、query_type、record_id 和预算；省略 protocol、field_path、transport、IP/端口、时间和 session/stream 条件。切换模式后重新选择参数，不要复制上一轮筛选。详情示例：{"id":"dataset-uuid","query_type":"details","record_id":1,"result_bytes":16384}。
+筛选：packets/sessions/packet_sessions 支持 transport、source_ip/destination_ip、source_port/destination_port；macs/endpoint_bindings 支持 source_ip、source_mac 和时间范围；protocols/fields 支持 transport、protocol 和一个 field 条件；packets/protocols/fields/sessions/packet_sessions 支持 time_start_ns/time_end_ns（十进制字符串，[start,end)）；sessions 按首包时间。packets/protocols/fields/sessions/streams/packet_sessions 支持 session_id/stream_id。其他模式拒绝这些筛选。
+field_path 从 fields 的真实发现结果中选择，details 核实值，然后用 query_type=protocols + field 条件取命中消息。fields 只返回采样字段目录（occurrences 是页内出现次数），不能当消息命中列表。field_op=eq/exists/missing；eq 的 field_type=string/integer/real/boolean/null，field_value 总是字符串（整数用精确十进制；布尔只用 true/false；null 不传值）。Field 条件从 Fields 根开始，不搜索 Session 快照；不支持任意 SQL、LIKE、OR、范围或字段通配符。
+返回结构化 result。先检查 error，再判断 has_more；after=上次 next_cursor，保持身份、模式、record_id 和筛选条件一致。limit 1–1000，result_bytes 4096–65536，preview_bytes 0–4096。macs/endpoint_bindings 的游标是当前筛选和排序下的派生序号，不是包号；改变筛选条件后不能复用。fields 是有界采样，scanned/skipped/sampled/truncated 必须保留；protocol_count 是消息数。Data 的 JSON 编码为 base64；截断预览不能作为完整流，stream_data 游标为块 ID。
+metadata 返回库状态、精确计数、能力及捕获概况。protocols 是协议种类计数，statuses 是解析状态计数，transports 是协议消息传输层计数，另有首末时间、链路类型、Section/Interface 数量和截断标记；protocol_message_count 等价于兼容字段 protocol_count，protocol_kind_count 是协议种类数。状态语义：decoded 已完成；incomplete 缺完整边界；malformed 已识别但报文非法；unrecognized 无法归属协议，不能据此断言不存在；context-required 是协议族已识别但阶段不支持或缺协商上下文。unrecognized/context-required 都计入 protocol_message_count，不存在独立的 unsupported 消息状态。需要协议消息证据时再查 protocols，不要用消息翻页重建概况。普通页不含完整 BLOB/JSON。details 超预算报错；不返回半棵字段树。错误或能力缺失不能解释为无流量。没有隐含粘性参数、任意全文查询或跨调用固定快照。
+[[- if .FunctionCallMode -]]
+arguments 示例：
+```json
+{"id":"dataset-uuid","query_type":"protocols","protocol":"http","limit":10}
+```
+[[- else -]]
+文本流 action：
+```json
+{"@action":"directly_call_tool","directly_call_tool_name":"query_pcapdb","directly_call_tool_params":{"id":"dataset-uuid","query_type":"protocols","protocol":"http","limit":10}}
+```
+[[- end -]]
+USAGE
+id = cli.String("id", cli.setHelp("持久流量库 DatasetID；与 pcapfile 二选一"))
+pcapfile = cli.String("pcapfile", cli.setHelp("自动导入/复用的捕获文件路径；与 id 二选一"))
+tlsKeylogFile = cli.String("tls_keylog_file", cli.setHelp("自动导入时可选：授权 NSS keylog 文件路径；与 id 模式互斥"))
+mode = cli.String("query_type", cli.setDefault("protocols"), cli.setHelp("metadata/packets/protocols/macs/endpoint_bindings/fields/sessions/streams/details/body_summary/packet_data/protocol_data/stream_data/protocol_packets/chunk_packets/packet_sessions"))
+recordID = cli.Int("record_id", cli.setDefault(0), cli.setHelp("详情、预览或关联的目标记录 ID，类型由 query_type 决定"))
+limit = cli.Int("limit", cli.setDefault(20), cli.setHelp("本页记录数 1–1000；fields 为采样消息数"))
+after = cli.Int("after", cli.setDefault(0), cli.setHelp("前一页 next_cursor，首次为 0；不是页号"))
+resultBytes = cli.Int("result_bytes", cli.setDefault(8192), cli.setHelp("完整紧凑结果 JSON 预算，4096–65536 字节"))
+previewBytes = cli.Int("preview_bytes", cli.setDefault(128), cli.setHelp("每个 BLOB 预览 0–4096 字节；不是完整内容"))
+protocol = cli.String("protocol", cli.setHelp("仅 protocols/fields 可传实际协议名；details/preview 必须省略"))
+transport = cli.String("transport", cli.setHelp("支持模式的传输协议精确匹配，如 tcp/udp"))
+sourceIP = cli.String("source_ip", cli.setHelp("包或会话的源 IP 精确匹配"))
+sourceMAC = cli.String("source_mac", cli.setHelp("macs/endpoint_bindings 的源 MAC 精确匹配；接受常见冒号或短横线格式"))
+destinationIP = cli.String("destination_ip", cli.setHelp("包或会话的目标 IP 精确匹配"))
+sourcePort = cli.Int("source_port", cli.setDefault(-1), cli.setHelp("源端口 0–65535；-1 不限制"))
+destinationPort = cli.Int("destination_port", cli.setDefault(-1), cli.setHelp("目标端口 0–65535；-1 不限制"))
+sessionID = cli.Int("session_id", cli.setDefault(0), cli.setHelp("网络会话关联 ID；0 不限制"))
+streamID = cli.Int("stream_id", cli.setDefault(0), cli.setHelp("方向流关联 ID；0 不限制"))
+timeStart = cli.String("time_start_ns", cli.setHelp("起始纳秒时间十进制字符串；需同时给 time_end_ns"))
+timeEnd = cli.String("time_end_ns", cli.setHelp("结束纳秒时间十进制字符串，排他边界"))
+fieldPath = cli.String("field_path", cli.setHelp("protocols/fields 的已核实 Fields JSON 路径"))
+fieldOp = cli.String("field_op", cli.setDefault("eq"), cli.setHelp("eq/exists/missing；需要 field_path"))
+fieldType = cli.String("field_type", cli.setDefault("string"), cli.setHelp("eq 值类型：string/integer/real/boolean/null"))
+fieldValue = cli.String("field_value", cli.setHelp("eq 条件的文本值；允许空字符串，integer 保留精确十进制"))
+cli.check()
+
+assert (id != "") != (pcapfile != ""), "Provide exactly one of id or pcapfile"
+if tlsKeylogFile != "" { assert pcapfile != "", "tls_keylog_file requires pcapfile" }
+assert mode in ["metadata","packets","protocols","macs","endpoint_bindings","fields","sessions","streams","details","body_summary","packet_data","protocol_data","stream_data","protocol_packets","chunk_packets","packet_sessions"], "Unsupported query_type"
+assert limit >= 1 && limit <= 1000 && after >= 0, "Invalid limit/after"
+assert resultBytes >= 4096 && resultBytes <= 65536 && previewBytes >= 0 && previewBytes <= 4096, "Invalid output budget"
+assert sourcePort >= -1 && sourcePort <= 65535 && destinationPort >= -1 && destinationPort <= 65535, "Invalid port"
+assert sessionID >= 0 && streamID >= 0 && recordID >= 0, "Invalid association ID"
+recordModes = ["details","body_summary","packet_data","protocol_data","stream_data","protocol_packets","chunk_packets","packet_sessions"]
+assert (mode in recordModes) == (recordID > 0), "record_id is required only for detail/preview/reference queries"
+assert (timeStart == "") == (timeEnd == ""), "Both time boundaries are required"
+if protocol != "" || fieldPath != "" { assert mode in ["protocols","fields"], "Protocol/field filters require protocols or fields" }
+if sourceMAC != "" {
+    assert mode in ["macs","endpoint_bindings"], "source_mac requires macs or endpoint_bindings"
+}
+if sourceIP != "" {
+    assert mode in ["packets","sessions","packet_sessions","macs","endpoint_bindings"], "source_ip is unsupported for this query"
+}
+if destinationIP != "" || sourcePort >= 0 || destinationPort >= 0 {
+    assert mode in ["packets","sessions","packet_sessions"], "Endpoint filters require packet/session queries"
+}
+if transport != "" || timeStart != "" {
+    assert mode in ["packets","protocols","fields","sessions","packet_sessions","macs","endpoint_bindings"], "Transport/time filter is unsupported for this query"
+}
+if transport != "" { assert mode in ["packets","protocols","fields","sessions","packet_sessions"], "Transport filter is unsupported for endpoint summaries" }
+if sessionID > 0 || streamID > 0 {
+    assert mode in ["packets","protocols","fields","sessions","streams","packet_sessions"], "Association filter is unsupported for this query"
+}
+if mode in ["metadata","details","packet_data","protocol_data"] { assert after == 0, "This query does not accept a cursor" }
+if fieldPath == "" {
+    assert fieldOp == "eq" && fieldType == "string" && fieldValue == "", "Field options require field_path"
+}
+if fieldOp in ["exists","missing"] {
+    assert fieldType == "string" && fieldValue == "", "exists/missing do not accept a typed value"
+}
+
+options = [pcapdb.limit(limit),pcapdb.after(after),pcapdb.resultBytes(resultBytes),pcapdb.previewBytes(previewBytes)]
+if protocol != "" { options = append(options,pcapdb.protocol(protocol)) }
+if transport != "" { options = append(options,pcapdb.transport(transport)) }
+if sourceIP != "" { options = append(options,pcapdb.sourceIP(sourceIP)) }
+if sourceMAC != "" { options = append(options,pcapdb.sourceMAC(sourceMAC)) }
+if destinationIP != "" { options = append(options,pcapdb.destinationIP(destinationIP)) }
+if sourcePort >= 0 { options = append(options,pcapdb.sourcePort(sourcePort)) }
+if destinationPort >= 0 { options = append(options,pcapdb.destinationPort(destinationPort)) }
+if sessionID > 0 { options = append(options,pcapdb.session(sessionID)) }
+if streamID > 0 { options = append(options,pcapdb.stream(streamID)) }
+if timeStart != "" {
+    start = atoi(timeStart)~
+    end = atoi(timeEnd)~
+    assert end >= start, "Inverted time range"
+    options = append(options,pcapdb.timeRange(start,end))
+}
+if fieldPath != "" {
+    switch fieldOp {
+    case "exists": options = append(options,pcapdb.fieldExists(fieldPath))
+    case "missing": options = append(options,pcapdb.fieldMissing(fieldPath))
+    case "eq":
+        value = nil
+        switch fieldType {
+        case "string": value = fieldValue
+        case "integer": value = atoi(fieldValue)~
+        case "real":
+            assert re.Match("^-?(0|[1-9][0-9]*)([.][0-9]+)?([eE][+-]?[0-9]+)?$",fieldValue), "Invalid real value"
+            value = json.New(fieldValue)~.Value()
+        case "boolean":
+            assert fieldValue in ["true","false"], "Boolean value must be true or false"
+            value = fieldValue == "true"
+        case "null": assert fieldValue == "", "Null has no field_value"
+        default: die("Unsupported field_type")
+        }
+        options = append(options,pcapdb.field(fieldPath,value))
+    default: die("Unsupported field_op")
+    }
+}
+
+db = nil
+if id != "" {
+    db = pcapdb.OpenPCAPDatabase(id)~
+} else {
+    importOptions = [pcapdb.withProtocols(true),pcapdb.withStreams(true)]
+    if tlsKeylogFile != "" {
+        keylogRaw, readErr := file.ReadFile(tlsKeylogFile)
+        if readErr != nil { die("read tls_keylog_file: " + string(readErr)) }
+        importOptions = append(importOptions,pcapdb.withTLSKeyLog(string(keylogRaw)))
+    }
+    db = pcapdb.GetOrCreatePCAPDatabase(pcapfile,importOptions...)~
+}
+defer db.Close()
+RESULT = nil
+page, err = nil, nil
+switch mode {
+case "metadata":
+    meta = db.Metadata()~
+    overview = db.CaptureOverview()~
+    RESULT = {
+        "dataset_id":db.ID,"state":meta.State,"format":meta.Format,
+        "schema_version":meta.SchemaVersion,"full_sha256":meta.FullSHA256,
+        "packet_count":meta.PacketCount,"protocol_count":meta.ProtocolCount,
+        "protocol_message_count":meta.ProtocolCount,"protocol_kind_count":overview.ProtocolKindCount,
+        "session_count":meta.SessionCount,"stream_count":meta.StreamCount,
+        "protocols_indexed":meta.ProtocolsIndexed,"streams_indexed":meta.StreamsIndexed,
+        "tls_keylog_applied":meta.TLSKeyLogSHA256 != "",
+        "first_timestamp_ns":overview.FirstTimestampNS,"last_timestamp_ns":overview.LastTimestampNS,
+        "protocols":overview.Protocols,"statuses":overview.Statuses,"transports":overview.Transports,
+        "link_types":overview.LinkTypes,"section_count":overview.SectionCount,"interface_count":overview.InterfaceCount,
+        "summary_truncated":overview.ProtocolsTruncated || overview.StatusesTruncated || overview.TransportsTruncated,
+        "protocols_truncated":overview.ProtocolsTruncated,"statuses_truncated":overview.StatusesTruncated,
+        "transports_truncated":overview.TransportsTruncated,
+    }
+case "packets": page,err = db.QueryPacketsPage(options...)
+case "protocols": page,err = db.QueryProtocolsPage(options...)
+case "macs": page,err = db.QueryMACSummariesPage(options...)
+case "endpoint_bindings": page,err = db.QueryEndpointBindingsPage(options...)
+case "fields": page,err = db.DiscoverProtocolFields(options...)
+case "sessions": page,err = db.QuerySessionsPage(options...)
+case "streams": page,err = db.QueryStreamsPage(options...)
+case "details": page,err = db.ProtocolDetailsPage(recordID,options...)
+case "body_summary": page,err = db.HTTPBodyProfilePage(recordID,options...)
+case "packet_data": page,err = db.ReadPacketPage(recordID,options...)
+case "protocol_data": page,err = db.ReadProtocolPage(recordID,options...)
+case "stream_data": page,err = db.ReadStreamPage(recordID,options...)
+case "protocol_packets": page,err = db.ProtocolPacketIDsPage(recordID,options...)
+case "chunk_packets": page,err = db.StreamChunkPacketIDsPage(recordID,options...)
+case "packet_sessions": page,err = db.PacketSessionsPage(recordID,options...)
+}
+if page != nil { RESULT = page }
+if err != nil {
+    // Preserve the structured page and error together for semantic inspection.
+    // Do not turn a failed query into an empty successful search.
+    if page == nil { die(err) }
+}

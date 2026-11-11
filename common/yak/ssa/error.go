@@ -3,6 +3,7 @@ package ssa
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/yaklang/yaklang/common/utils"
@@ -113,13 +114,67 @@ func (f *Function) NewError(kind ErrorKind, tag ErrorTag, format string) {
 	f.NewErrorWithPos(kind, tag, f.GetRange(), format)
 }
 
+func (prog *Program) errorOwner() *Program {
+	if app := prog.GetApplication(); app != nil {
+		return app
+	}
+	return prog
+}
+
 func (prog *Program) AddError(err *SSAError) {
-	app := prog.GetApplication()
+	app := prog.errorOwner()
+	app.errorsMu.Lock()
+	defer app.errorsMu.Unlock()
 	app.errors = append(app.errors, err)
 }
+
+// CopyErrorsFrom moves src's errors onto prog's error owner.
+// Sub programs share the application's error list, so the common case is a
+// no-op: cloning and re-appending the list there used to double the error
+// slice on every built file, which made memory use quadratic in a project's
+// error count. Only truly separated owners need a transfer.
+func (prog *Program) CopyErrorsFrom(src *Program) {
+	if prog == nil || src == nil {
+		return
+	}
+	srcOwner := src.errorOwner()
+	dstOwner := prog.errorOwner()
+	if srcOwner == dstOwner {
+		return
+	}
+	// Read the source header under its lock, then append the same pointers to
+	// the destination. The error values are immutable after AddError, so the
+	// header stays valid even if the source appends (and possibly reallocates)
+	// after the lock is released. Do not clone: a per-file copy of a growing
+	// list is quadratic in the project's error count.
+	srcOwner.errorsMu.Lock()
+	srcErrs := srcOwner.errors
+	srcOwner.errorsMu.Unlock()
+	if len(srcErrs) == 0 {
+		return
+	}
+	dstOwner.errorsMu.Lock()
+	dstOwner.errors = append(dstOwner.errors, srcErrs...)
+	dstOwner.errorsMu.Unlock()
+}
+
+// GetErrors returns the program's live error slice as a read-only view.
+// Callers must not modify the returned slice. The slice header is copied, so a
+// later AddError cannot change the caller's length; the error values are
+// immutable. Use GetErrorsSnapshot when an isolated copy is required.
 func (prog *Program) GetErrors() SSAErrors {
-	errs := prog.errors
-	return errs
+	app := prog.errorOwner()
+	app.errorsMu.Lock()
+	defer app.errorsMu.Unlock()
+	return app.errors
+}
+
+// GetErrorsSnapshot returns an isolated copy of the error slice.
+func (prog *Program) GetErrorsSnapshot() SSAErrors {
+	app := prog.errorOwner()
+	app.errorsMu.Lock()
+	defer app.errorsMu.Unlock()
+	return slices.Clone(app.errors)
 }
 
 func (errs SSAErrors) String() string {

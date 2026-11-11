@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -44,6 +45,9 @@ func TestTrafficWorkflowIsolation(t *testing.T) {
 		return w
 	}
 	essential := read("essential-tests")
+	if !slices.Contains(essential.On["pull_request"].Paths, "internal/trafficfixture/**") {
+		t.Fatal("central capture store and its loader must trigger Essential Tests")
+	}
 	for jobName, job := range essential.Jobs {
 		for _, suite := range job.Strategy.Matrix.Include {
 			if suite.Configs == "" {
@@ -82,13 +86,13 @@ func TestTrafficWorkflowIsolation(t *testing.T) {
 	for _, step := range job.Steps {
 		run += step.Run + "\n"
 	}
-	if !strings.Contains(run, "go test -json -count=1 -timeout=5m ./internal/trafficfixture/... ./common/bin-parser/... ./common/pcapx/... ./common/yak/cmd/yakcmds/shark-cli ./scripts/ci") {
+	if !strings.Contains(run, "go test -json -count=1 -timeout=15m ./internal/trafficfixture/... ./common/bin-parser/... ./common/pcapx/... ./common/yak/cmd/yakcmds/shark-cli ./scripts/ci") {
 		t.Fatal("isolated traffic job must run complete parser and pcapx packages, including capture CLI and workflow scope evidence")
 	}
 	if !strings.Contains(run, "go run ./internal/trafficfixture/cmd/corpus test") {
 		t.Fatal("traffic CI must execute the archived tooling and validator regressions")
 	}
-	if !strings.Contains(run, "corpus exec -- python3 @scripts/protocol-tests/check_go_test_json.py") || !strings.Contains(run, "--inventory @scripts/protocol-tests/required-tests-v31.json --tier full") {
+	if !strings.Contains(run, "corpus exec -- python3 @scripts/protocol-tests/check_go_test_json_v2.py") || !strings.Contains(run, "--inventory @scripts/protocol-tests/required-tests-traffic-unified-v191.json --tier full") {
 		t.Fatal("traffic test success requires the actual package-qualified test inventory")
 	}
 }

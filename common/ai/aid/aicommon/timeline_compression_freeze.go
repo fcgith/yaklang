@@ -133,15 +133,6 @@ func (m *Timeline) freezeBudgetGroupsLocked(useSizer bool) TimelineIntervalBlock
 }
 
 func (m *Timeline) freezeLocked(all bool) TimelineFreezeResult {
-	// A one-shot compression publishes its captured freeze and summary together.
-	// Writes remain append-only during generation, including exact-state deltas.
-	if m.compressionSnapshot != nil {
-		version := int64(0)
-		if m.freezeState != nil {
-			version = m.freezeState.Version
-		}
-		return TimelineFreezeResult{Version: version, ThroughID: m.frozenThroughLocked()}
-	}
 	if m.freezeState == nil {
 		m.freezeState = &TimelineFreezeState{}
 	}
@@ -202,11 +193,10 @@ func (m *Timeline) freezeLocked(all bool) TimelineFreezeResult {
 	return result
 }
 
-// frozenPromptBlocksLocked is read-only. Pending evidence/tool-cache events are
+// promptBlocksLocked is read-only. Pending evidence/tool-cache events are
 // rendered in place; frozen controls appear only in semi-dynamic snapshots.
-// Filtering occurs after bucket selection, so helper prompts share the same
-// freeze boundaries without receiving unrelated tool-cache schemas.
-func (m *Timeline) frozenPromptBlocksLocked(excludeToolCache bool, onlyUserInput bool, promoteUserInput bool) TimelineRenderableBlocks {
+// It builds the complete view; Open-tail capping happens in prompt assembly.
+func (m *Timeline) promptBlocksLocked(excludeToolCache bool, onlyUserInput bool, promoteUserInput bool) TimelineRenderableBlocks {
 	var blocks TimelineRenderableBlocks
 	if !onlyUserInput && m.compressedHead != nil && strings.TrimSpace(m.compressedHead.Text) != "" {
 		blocks = append(blocks, &TimelineCompressedHeadBlock{
@@ -228,7 +218,8 @@ func (m *Timeline) frozenPromptBlocksLocked(excludeToolCache bool, onlyUserInput
 			if promoteUserInput || !isTimelineUserInput(item) {
 				op = timelinePromotionForItem(item)
 			}
-			if onlyUserInput && (op == nil || (op.Kind != TimelinePromotedKindUserInput && op.Kind != TimelinePromotedKindEvidence)) {
+			if onlyUserInput && (op == nil || (op.Kind != TimelinePromotedKindUserInput &&
+				op.Kind != TimelinePromotedKindEvidence && op.Kind != TimelinePromotedKindSkillContent)) {
 				continue
 			}
 			if op != nil {
@@ -239,7 +230,8 @@ func (m *Timeline) frozenPromptBlocksLocked(excludeToolCache bool, onlyUserInput
 					filteredToolCache = true
 					continue
 				}
-				if op.Kind != TimelinePromotedKindEvidence && op.Kind != TimelinePromotedKindRecentTool && op.Kind != TimelinePromotedKindUserInput {
+				if op.Kind != TimelinePromotedKindEvidence && op.Kind != TimelinePromotedKindRecentTool &&
+					op.Kind != TimelinePromotedKindUserInput && op.Kind != TimelinePromotedKindSkillContent {
 					continue
 				}
 				// A detached prompt view preserves the journal, reducer exclusion and UI audit.

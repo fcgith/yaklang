@@ -50,6 +50,11 @@ func wrapCompileTimeline(t *testing.T, timeline *[]string, onStart func(cfg *ssa
 	t.Helper()
 	orig := syntaxflow_scan.CompileProject
 	t.Cleanup(func() { syntaxflow_scan.CompileProject = orig })
+	if orig == nil {
+		// Nothing registers the compiler any more: the default path is a plain
+		// function, so the timeline wrapper still has something to call.
+		orig = syntaxflow_scan.CompileProjectDefault
+	}
 	syntaxflow_scan.CompileProject = func(ctx context.Context, cfg *ssaconfig.Config, extra ...ssaconfig.Option) (*ssaapi.Program, error) {
 		*timeline = append(*timeline, "compile:start")
 		if onStart != nil {
@@ -93,7 +98,14 @@ func compileExtrasHaveStructRule(t *testing.T, extra []ssaconfig.Option) bool {
 		}
 		require.NoError(t, opt(dummy))
 	}
-	_, ok := dummy.GetExtraInfo("ssa_compile/struct_rule_raw")
+	// Struct rules reach the compile either as raw text (WithStructRuleRaw) or
+	// as rules the scan already compiled once (WithStructRules). ssaconfig
+	// stores options wrapped in ExtraOption, so only the key is inspected here;
+	// the stage assertions below prove the rules actually ran.
+	if _, ok := dummy.GetExtraInfo("ssa_compile/struct_rule_raw"); ok {
+		return true
+	}
+	_, ok := dummy.GetExtraInfo("ssa_compile/struct_rules")
 	return ok
 }
 

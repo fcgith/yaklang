@@ -4,14 +4,27 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 // TFTP is datagram-only and changes server TID after RRQ/WRQ. File bytes are
-// never accumulated: the transfer state retains sequence/digest metadata only.
+// are retained only by the explicit bounded octet-file profile; the default
+// transfer observer retains sequence/digest metadata only.
+type tftpPeerState uint8
+
+const (
+	tftpRefusedCandidate tftpPeerState = iota // current-generation routing evidence only
+	tftpRetiredPeer                           // cannot establish a fresh observed generation
+)
+
 type binTFTP struct {
+	unverified                       bool
+	futureAmbiguous                  bool
+	file                             *binTFTPFile
 	write                            bool
 	request                          [32]byte
 	filename, mode                   string
@@ -20,8 +33,19 @@ type binTFTP struct {
 	expected, block                  uint16
 	pending, final, done, negotiated bool
 	hasData                          bool
+	ambiguous                        bool
+	oack                             [32]byte
 	digest                           [32]byte
 	server                           string
+	// Exact refused candidates and retired TIDs share one charged, bounded
+	// history. A refused prefix is routing evidence, not a negotiated server;
+	// complete OACK/DATA in this generation may still recover. Only retired
+	// entries prohibit fresh-generation ownership.
+	retired map[string]tftpPeerState
+}
+
+func (s *binTFTP) retiredTID(peer string) bool {
+	return s.retired[peer] == tftpRetiredPeer
 }
 
 func tftpStrings(w []byte, max int) ([]string, error) {
@@ -70,11 +94,30 @@ func probeTFTP(w []byte, max int) bool {
 	_, err = tftpOptions(p[2:])
 	return err == nil
 }
-func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
+func (s *binTFTP) consume(dir int, w []byte, max int, evidence ...tftpFileEvidence) (result map[string]any, err error) {
+	source := tftpFileEvidence{}
+	if len(evidence) > 0 {
+		source = evidence[0]
+	}
+	defer func() {
+		var typed *ProtocolError
+		if err != nil && !errors.As(err, &typed) {
+			err = protocolError(ErrMalformedMessage, "%s", err)
+		}
+	}()
 	if len(w) < 2 {
 		return nil, fmt.Errorf("tftp: missing opcode")
 	}
 	op := binary.BigEndian.Uint16(w)
+	if s.unverified && op >= 3 && op <= 6 {
+		return nil, protocolError(ErrContextRequired, "TFTP generation is unverified after refused input")
+	}
+	if s.file != nil && s.mode != "" && s.mode != "octet" {
+		return nil, protocolError(ErrUnsupportedFeature, "TFTP file profile requires octet mode")
+	}
+	if s.ambiguous && (op == 3 || op == 4 || op == 6) {
+		return nil, protocolError(ErrContextRequired, "TFTP negotiation is ambiguous")
+	}
 	out := map[string]any{"Opcode": op, "Filename": s.filename, "Mode": s.mode}
 	switch op {
 	case 1, 2:
@@ -103,6 +146,14 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 			}
 			out["Retransmission"] = true
 		} else {
+			if s.file != nil && mode != "octet" {
+				return nil, protocolError(ErrUnsupportedFeature, "TFTP file profile requires octet mode")
+			}
+			if s.file != nil {
+				if err := s.file.context(source, max, false); err != nil {
+					return nil, err
+				}
+			}
 			s.filename, s.mode, s.options, s.request, s.write, s.blockSize, s.expected = parts[0], mode, opts, digest, op == 2, 512, 1
 			if s.write {
 				s.pending = true
@@ -126,6 +177,7 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 			return nil, err
 		}
 		bs := 512
+		canonical := make([]string, 0, len(opts))
 		for k, v := range opts {
 			asked, ok := s.options[k]
 			if !ok {
@@ -135,6 +187,7 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 			if err != nil {
 				return nil, fmt.Errorf("tftp: invalid option value")
 			}
+			canonical = append(canonical, k+"="+strconv.FormatUint(n, 10))
 			switch k {
 			case "blksize":
 				a, e := strconv.ParseUint(asked, 10, 32)
@@ -158,11 +211,31 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 				return nil, protocolError(ErrUnsupportedFeature, "TFTP option "+k)
 			}
 		}
-		if s.hasData {
+		sort.Strings(canonical)
+		digest := sha256.Sum256([]byte(strings.Join(canonical, "\x00")))
+		if s.negotiated {
+			if digest != s.oack {
+				s.ambiguous = true
+				return nil, protocolError(ErrDesynchronized, "TFTP OACK changed negotiated options")
+			}
+			// OACK can be retransmitted after ACK0 was captured. Preserve every
+			// observed DATA/ACK transition; negotiation is not restarted.
+			out["Packet Name"] = "OACK"
+			out["Options"] = cloneSessionStringMap(opts)
+			out["Retransmission"] = true
+			return out, nil
+		}
+		if s.hasData || s.done {
 			return nil, fmt.Errorf("tftp: OACK after transfer started")
+		}
+		if s.file != nil {
+			if err := s.file.context(source, max, true); err != nil {
+				return nil, err
+			}
 		}
 		s.blockSize = bs
 		s.negotiated = true
+		s.oack = digest
 		s.pending = !s.write
 		s.block = 0
 		out["Packet Name"] = "OACK"
@@ -190,6 +263,12 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 			if s.done || s.pending || block != s.expected {
 				return nil, protocolError(ErrContextRequired, "TFTP DATA missing preceding exchange")
 			}
+			if s.file != nil {
+				if err := s.file.append(w[4:], source, max); err != nil {
+					s.ambiguous = true
+					return nil, err
+				}
+			}
 			s.block, s.digest, s.pending, s.final = block, digest, true, size < s.blockSize
 			s.hasData = true
 		}
@@ -216,6 +295,9 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 			s.expected = block + 1
 			if s.final {
 				s.done = true
+				if s.file != nil {
+					s.file.complete(out)
+				}
 			}
 		}
 		out["Packet Name"] = "ACK"
@@ -229,6 +311,9 @@ func (s *binTFTP) consume(dir int, w []byte, max int) (map[string]any, error) {
 		out["Error Code"] = binary.BigEndian.Uint16(w[2:])
 		out["Error Message"] = string(w[4 : len(w)-1])
 		s.done = true
+		if s.file != nil {
+			s.file.abort()
+		}
 	default:
 		return nil, fmt.Errorf("tftp: unknown opcode")
 	}
@@ -240,4 +325,60 @@ func cloneSessionStringMap(m map[string]string) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// A rejected, wire-observed candidate is history too. Forgetting its TID on a
+// later RRQ can turn its delayed DATA into a supposedly fresh transfer. Retain
+// only the endpoint identity, reserving it before insertion. Refusal to retain
+// new history quarantines future generations without killing the live owner.
+func (f *binFlow) rememberTFTPCandidate(peer string) error {
+	return f.rememberTFTPPeer(peer, tftpRetiredPeer)
+}
+
+func (f *binFlow) rememberTFTPPeer(peer string, state tftpPeerState) error {
+	s := f.tftp
+	if previous, seen := s.retired[peer]; seen {
+		if state == tftpRetiredPeer && previous != tftpRetiredPeer {
+			s.retired[peer] = tftpRetiredPeer
+		}
+		return nil
+	}
+	if len(s.retired) >= min(128, sessionCollectionLimit(f.a.budget.MaxCollectionElements)) {
+		s.futureAmbiguous = true
+		return protocolError(ErrResourceExceeded, "TFTP candidate transfer ID history budget")
+	}
+	if err := f.reserveSession(f.sessionBytes + 128); err != nil {
+		s.futureAmbiguous = true
+		return err
+	}
+	if s.retired == nil {
+		s.retired = map[string]tftpPeerState{}
+	}
+	s.retired[strings.Clone(peer)] = state
+	return nil
+}
+
+func tftpCandidatePrefix(w []byte) bool {
+	if len(w) < 2 {
+		return false
+	}
+	op := binary.BigEndian.Uint16(w)
+	return op >= 3 && op <= 6
+}
+
+// The initial request identifies a client TID and server address, not every UDP
+// port on that server. Without a concrete observed/retired peer, only a TFTP
+// reply prefix may enter that negotiation. Decline unrelated service bytes
+// before changing IDs, clocks, LRU state, ambiguity or assembled file contents.
+func tftpUDPHasPeerEvidence(f *binFlow, e *ProtocolEvent, w []byte, dir int) bool {
+	if f == nil || f.tftp == nil {
+		return false
+	}
+	peer := e.Source
+	if dir == 0 {
+		peer = e.Destination
+	}
+	t := f.tftp
+	_, observedPeer := t.retired[peer]
+	return peer == f.endpoints[1] || t.server != "" && peer == t.server || observedPeer || tftpCandidatePrefix(w)
 }

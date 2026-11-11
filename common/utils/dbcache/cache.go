@@ -126,13 +126,15 @@ func (c *ResidencyCacheWithKey[K, T]) GetResident(key K) (T, bool) {
 	// upgrade to the exclusive lock to cancel the stale queued persist.
 	c.mu.RLock()
 	if item, exists := c.data[key]; exists {
-		if item.pending && !item.persisting {
-			// Needs mutation (cancel pending persist): drop the shared lock and
-			// redo under the exclusive lock.
+		if item.pending && !item.persisting && item.reason == utils.EvictionReasonExpired {
+			// A TTL eviction is cancelled when the value is read again, so
+			// FinishPersist does not drop a hot entry. A flush (capacity or
+			// delete) must keep pending: cancelling it leaves the object
+			// resident after the row is saved.
 			c.mu.RUnlock()
 			c.mu.Lock()
 			item2, exists2 := c.data[key]
-			if exists2 && item2.pending && !item2.persisting {
+			if exists2 && item2.pending && !item2.persisting && item2.reason == utils.EvictionReasonExpired {
 				item2.pending = false
 				item2.updatedWhilePersisting = false
 				item2.persistSnapshot = *new(T)
@@ -157,6 +159,24 @@ func (c *ResidencyCacheWithKey[K, T]) GetResident(key K) (T, bool) {
 	}
 	c.mu.RUnlock()
 	return *new(T), false
+}
+
+// PeekResident reads a resident value without cancelling a queued save and
+// without refreshing the eviction TTL.
+func (c *ResidencyCacheWithKey[K, T]) PeekResident(key K) (T, bool) {
+	if c == nil {
+		var zero T
+		return zero, false
+	}
+	c.mu.RLock()
+	item, exists := c.data[key]
+	if !exists {
+		c.mu.RUnlock()
+		return *new(T), false
+	}
+	value := item.memoryItem
+	c.mu.RUnlock()
+	return value, true
 }
 
 func (c *ResidencyCacheWithKey[K, T]) Get(key K) (T, bool) {
@@ -248,13 +268,16 @@ func (c *ResidencyCacheWithKey[K, T]) FinishPersist(key K, generation uint64, su
 
 	if shouldTouch {
 		if c.evictionCache != nil && !c.IsSaveDisabled() {
-			var skip bool
+			var value T
+			exists := false
 			c.mu.RLock()
 			if item, ok := c.data[key]; ok {
-				skip = c.shouldSkipEviction(item.memoryItem)
+				value = item.memoryItem
+				exists = true
 			}
 			c.mu.RUnlock()
-			if skip {
+			// Predicate is caller code and may re-enter this cache.
+			if exists && c.shouldSkipEviction(value) {
 				c.evictionCache.Delete(key)
 			} else {
 				c.evictionCache.Set(key, struct{}{})
@@ -335,16 +358,33 @@ func (c *ResidencyCacheWithKey[K, T]) CoolDownKeys(keys []K, ttl time.Duration) 
 	if c == nil || len(keys) == 0 || ttl <= 0 {
 		return
 	}
+	type residentSnap struct {
+		key        K
+		value      T
+		generation uint64
+	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	snaps := make([]residentSnap, 0, len(keys))
 	for _, key := range keys {
 		item, ok := c.data[key]
-		if !ok || item.pending || c.shouldSkipEviction(item.memoryItem) {
+		if !ok || item.pending {
 			continue
 		}
-		if c.evictionCache != nil {
-			c.evictionCache.SetWithTTL(key, struct{}{}, ttl)
+		snaps = append(snaps, residentSnap{key: key, value: item.memoryItem, generation: item.generation})
+	}
+	c.mu.RUnlock()
+	for _, snap := range snaps {
+		if c.shouldSkipEviction(snap.value) {
+			continue
 		}
+		c.mu.RLock()
+		item, ok := c.data[snap.key]
+		unchanged := ok && !item.pending && item.generation == snap.generation
+		c.mu.RUnlock()
+		if !unchanged || c.evictionCache == nil {
+			continue
+		}
+		c.evictionCache.SetWithTTL(snap.key, struct{}{}, ttl)
 	}
 }
 
@@ -352,14 +392,33 @@ func (c *ResidencyCacheWithKey[K, T]) TrackKeys(keys []K) {
 	if c == nil || len(keys) == 0 || c.evictionCache == nil || c.IsSaveDisabled() {
 		return
 	}
+	type residentSnap struct {
+		key        K
+		value      T
+		generation uint64
+	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	snaps := make([]residentSnap, 0, len(keys))
 	for _, key := range keys {
 		item, ok := c.data[key]
-		if !ok || item.pending || c.shouldSkipEviction(item.memoryItem) {
+		if !ok || item.pending {
 			continue
 		}
-		c.evictionCache.Set(key, struct{}{})
+		snaps = append(snaps, residentSnap{key: key, value: item.memoryItem, generation: item.generation})
+	}
+	c.mu.RUnlock()
+	for _, snap := range snaps {
+		if c.shouldSkipEviction(snap.value) {
+			continue
+		}
+		c.mu.RLock()
+		item, ok := c.data[snap.key]
+		unchanged := ok && !item.pending && item.generation == snap.generation
+		c.mu.RUnlock()
+		if !unchanged {
+			continue
+		}
+		c.evictionCache.Set(snap.key, struct{}{})
 	}
 }
 
@@ -558,6 +617,27 @@ func (c *ResidencyCacheWithKey[K, T]) DeleteWithoutSave(key K) {
 	}
 }
 
+// DeleteIfSettled drops a clean resident copy without starting another DB
+// write. A pending item may contain an update that has not reached the saver,
+// so it must be left for FinishPersist instead.
+func (c *ResidencyCacheWithKey[K, T]) DeleteIfSettled(key K) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	item, ok := c.data[key]
+	if !ok || item.pending {
+		c.mu.Unlock()
+		return false
+	}
+	delete(c.data, key)
+	c.mu.Unlock()
+	if c.evictionCache != nil {
+		c.evictionCache.Delete(key)
+	}
+	return true
+}
+
 func (c *ResidencyCacheWithKey[K, T]) ForEach(f func(K, T) bool) {
 	if c == nil || f == nil {
 		return
@@ -650,69 +730,90 @@ func (c *ResidencyCacheWithKey[K, T]) restoreEvictionTracking() {
 		return
 	}
 
-	keys := make([]K, 0)
+	type residentSnap struct {
+		key   K
+		value T
+	}
 	c.mu.RLock()
+	snaps := make([]residentSnap, 0, len(c.data))
 	for key, item := range c.data {
-		if item.pending || c.shouldSkipEviction(item.memoryItem) {
+		if item.pending {
 			continue
 		}
-		keys = append(keys, key)
+		snaps = append(snaps, residentSnap{key: key, value: item.memoryItem})
 	}
 	c.mu.RUnlock()
 
-	for _, key := range keys {
-		c.evictionCache.Set(key, struct{}{})
+	for _, snap := range snaps {
+		if c.shouldSkipEviction(snap.value) {
+			continue
+		}
+		c.evictionCache.Set(snap.key, struct{}{})
 	}
 }
 
 func (c *ResidencyCacheWithKey[K, T]) handleEviction(key K, reason utils.EvictionReason) {
-	if c == nil {
+	if c == nil || c.evictionCache == nil || c.IsSaveDisabled() {
 		return
 	}
-	if c.evictionCache == nil {
-		return
-	}
-
-	if c.IsSaveDisabled() {
-		return
-	}
-
-	var generation uint64
-	c.mu.Lock()
-	item, ok := c.data[key]
-	if !ok {
+	for {
+		c.mu.Lock()
+		item, ok := c.data[key]
+		if !ok {
+			c.mu.Unlock()
+			return
+		}
+		value := item.memoryItem
+		generation := item.generation
+		pending := item.pending
 		c.mu.Unlock()
-		return
-	}
-	if c.shouldSkipEviction(item.memoryItem) {
-		c.mu.Unlock()
-		if c.evictionCache != nil {
+
+		// Re-read after the predicate. Set increments generation, so a
+		// concurrent replacement is not judged by the value we just saw.
+		if c.shouldSkipEviction(value) {
+			c.mu.Lock()
+			item, ok = c.data[key]
+			stale := !ok || item.generation != generation
+			c.mu.Unlock()
+			if stale {
+				continue
+			}
 			c.evictionCache.Delete(key)
+			return
+		}
+		if pending {
+			return
+		}
+
+		c.mu.Lock()
+		item, ok = c.data[key]
+		if !ok || item.pending || item.generation != generation {
+			c.mu.Unlock()
+			if !ok {
+				return
+			}
+			continue
+		}
+		item.pending = true
+		item.persisting = false
+		item.updatedWhilePersisting = false
+		item.persistSnapshot = *new(T)
+		item.persistSnapshotSet = false
+		item.generation++
+		item.reason = reason
+		generation = item.generation
+		c.persistWG.Add(1)
+		c.pendingCount.Add(1)
+		c.mu.Unlock()
+
+		if c.enqueuePersist == nil {
+			c.FinishPersist(key, generation, true)
+			return
+		}
+		if !c.enqueuePersist(key, generation, reason) {
+			c.RejectPersist(key, generation)
 		}
 		return
-	}
-	if item.pending {
-		c.mu.Unlock()
-		return
-	}
-	item.pending = true
-	item.persisting = false
-	item.updatedWhilePersisting = false
-	item.persistSnapshot = *new(T)
-	item.persistSnapshotSet = false
-	item.generation++
-	item.reason = reason
-	generation = item.generation
-	c.persistWG.Add(1)
-	c.pendingCount.Add(1)
-	c.mu.Unlock()
-
-	if c.enqueuePersist == nil {
-		c.FinishPersist(key, generation, true)
-		return
-	}
-	if !c.enqueuePersist(key, generation, reason) {
-		c.RejectPersist(key, generation)
 	}
 }
 

@@ -1,13 +1,14 @@
 package minirehs
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"regexp/syntax"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
-	"github.com/yaklang/yaklang/common/utils"
 	regexp_utils "github.com/yaklang/yaklang/common/utils/regexp-utils"
 )
 
@@ -15,6 +16,26 @@ import (
 // 每个 goroutine 应独占一份 Scratch (非并发安全).
 type Scratch interface {
 	Close() error
+}
+
+// RestrictScratch limits the next Scan on this scratch to pattern IDs with
+// allow[id] == true. A nil slice scans every pattern. The slice is not copied
+// and must not be mutated until Scan returns. Engine and stdlib honor it;
+// other backends ignore it and keep scanning every pattern.
+func RestrictScratch(s Scratch, allow []bool) {
+	sc, _ := s.(*scratch)
+	if sc == nil {
+		return
+	}
+	sc.allow = allow
+}
+
+func patternAllowed(sc *scratch, id PatternID) bool {
+	if sc == nil || sc.allow == nil {
+		return true
+	}
+	i := int(id)
+	return i >= 0 && i < len(sc.allow) && sc.allow[i]
 }
 
 // BatchMatchHandler 接收批扫描中的记录下标及其匹配。ScanBatch 保证按 records
@@ -30,6 +51,12 @@ type batchMatch struct {
 
 // scratch 是 Scratch 的内部实现, 持有可复用缓冲区.
 type scratch struct {
+	verifierText   string // Immutable subject window, shared by one record's verification worker.
+	verifierTextLo int    // Absolute start of verifierText in the record.
+	// allow, when non-nil, is indexed by PatternID. False entries are not
+	// verified. nil means every pattern. The caller owns the slice.
+	allow []bool
+
 	lower      []byte                // ASCII 小写化数据缓冲 (供大小写无关的字面量预过滤复用)
 	hits       []litHit              // 字面量预过滤命中缓冲 (含位置)
 	cpairs     []int32               // CGO 预过滤输出的 (end,litID) 对缓冲 (NoCGO 不使用)
@@ -124,20 +151,28 @@ type scratch struct {
 	// scratch 与结果通道均由每个 Scratch 独占；短生命周期 worker 返回前必收拢。
 	alwaysMergedScratch *scratch
 	alwaysAssertScratch *scratch
-	alwaysMergedRes     chan []int
+	alwaysMergedRes     chan nativeMergedResult
 	alwaysAssertRes     chan []byte
 
 	// RE2-only 存在性模式下，把字面量命中循环中的 gated/assert 立即验证移出调用线程，
 	// 与窗口及 anchored 阶段重叠；worker 使用独占 Scratch，handler 仍只在调用线程执行。
 	gateTasks        []gateTask
+	gateMinEnd       []int32 // minimum trigger end per localized gate, independent of event order
+	gateTouched      []int32 // only these minima need clearing before the next record
 	gateAsyncScratch *scratch
 	gateAsyncOut     []byte
-	gateAsyncRes     chan []byte
+	gateAsyncRes     chan gatedResult
 
 	anchoredAsyncScratch *scratch
 	anchoredAnchorOut    []byte
 	anchoredBiOut        []byte
 	anchoredAsyncRes     chan anchoredResult
+
+	// Only Group's cache uses these capacity snapshots. Updating touched
+	// range owners on return accounts for historical bursts without scanning
+	// every rule or adding work to Database.Scan's per-hit append loops.
+	groupRangeCaps  []groupRangeCapacity
+	groupRangeBytes uint64
 
 	// ScanBatch 使用最多四个独占子 Scratch 并行处理动态记录块。结果按 lane 复用，扫描
 	// 收拢后再按 record 顺序串行重放 handler，避免并发回调改变现有使用习惯。
@@ -159,15 +194,17 @@ type gateTask struct {
 }
 
 type anchoredResult struct {
-	anchor []byte
-	bi     []byte
+	anchor    []byte
+	bi        []byte
+	completed int // anchor items followed by bi items; includes a failing item
+	err       error
 }
 
 type alwaysMergedTask struct {
 	kernel  *mvsKernel
 	data    []byte
 	scratch *scratch
-	result  chan<- []int
+	result  chan<- nativeMergedResult
 }
 
 type alwaysAssertTask struct {
@@ -184,7 +221,13 @@ type gatedWorkerTask struct {
 	tasks   []gateTask
 	scratch *scratch
 	out     []byte
-	result  chan<- []byte
+	result  chan<- gatedResult
+}
+
+type gatedResult struct {
+	out       []byte
+	completed int // includes the failing item when err is nonnil
+	err       error
 }
 
 type anchoredWorkerTask struct {
@@ -197,6 +240,7 @@ type anchoredWorkerTask struct {
 }
 
 func (s *scratch) Close() error {
+	s.clearVerifierText()
 	s.workerCloseOnce.Do(func() {
 		for i := range s.batchLanes {
 			if s.batchLanes[i] != nil {
@@ -218,22 +262,29 @@ func (s *scratch) Close() error {
 
 // Database 是编译产物, 不可变、并发安全 (只读), 可被多 goroutine 共享.
 type Database interface {
+	// MarshalImage exports an MVS database for LoadImage, including its Go fallback.
+	// Other backends return ErrUnsupportedImage.
+	MarshalImage() ([]byte, error)
 	// NewScratch 分配一份与该 db 绑定的可复用扫描临时区.
 	NewScratch() (Scratch, error)
 	// Scan 对完整 data 做 block 扫描, 每命中一次调用 handler; handler 返回 false 提前终止.
+	// data 在调用返回前保持只读；每个并行或嵌套 Scan 应使用独立 Scratch。
+	// 执行失败可用 errors.As 提取 *ScanError；之前的回调不撤销，结果不可当作完整结果使用。
 	Scan(data []byte, s Scratch, handler MatchHandler) error
 	// ScanBatch 以 1-4 个独占 lane 并行扫描多条独立记录。并行路径先完成全部扫描，再按
 	// records 输入顺序串行重放 handler；返回 false 仅停止后续回调，不取消已完成的扫描工作。
 	ScanBatch(records [][]byte, s Scratch, handler BatchMatchHandler) error
 	// Info 返回该 db 的元信息.
 	Info() DatabaseInfo
-	// Close 释放后端持有的本地资源 (纯 Go 后端为 no-op).
+	// Close 结束扫描生命周期并释放本地资源。调用方须先收拢所有 Scan/ScanBatch，
+	// 不在 handler 内调用 Close；关闭后扫描和 NewScratch 返回 ErrClosed。
 	Close() error
 }
 
 // compiledPattern 是一条经过特性 gate、字面量提取后的内部表示.
 type compiledPattern struct {
 	id       PatternID
+	flags    Flag
 	idx      int      // 在 supported 集合内的下标
 	expr     string   // 已带 flag 前缀的最终表达式 (供组合 gate 复用, 保证语义一致)
 	v        verifier // 命中判定与取偏移 (引擎与 oracle 共享, 保证一致)
@@ -267,41 +318,46 @@ func Compile(patterns []Pattern, opts ...Option) (Database, error) {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	return compileWithConfig(patterns, cfg)
+}
+
+func compileWithConfig(patterns []Pattern, cfg *config) (Database, error) {
+	if imageCompileHook != nil {
+		imageCompileHook()
+	}
 	if len(patterns) == 0 {
-		return nil, utils.Error("minirehs: no patterns to compile")
+		return nil, errors.New("minirehs: no patterns to compile")
 	}
 
 	var (
 		supported []*compiledPattern
 		reports   = make([]PatternReport, 0, len(patterns))
 	)
+	// Compile-only ownership: Auto/Engine/Stdlib do not retain analysis trees.
+	// Each cp is unique even for duplicate IDs/expressions/flags. The map never
+	// enters a published database, and the MVS loop drops entries as it consumes
+	// them. Executable regexp instances are still compiled independently.
+	var parsedPatterns map[*compiledPattern]*syntax.Regexp
+	if cfg.backend == BackendMVS && compileASTReuseEnabled {
+		parsedPatterns = make(map[*compiledPattern]*syntax.Regexp, len(patterns))
+		defer func() { clear(parsedPatterns) }()
+	}
 
 	for _, p := range patterns {
 		if p.Expr == "" {
-			return nil, utils.Errorf("minirehs: pattern id=%d has empty expr", p.ID)
+			return nil, fmt.Errorf("minirehs: pattern id=%d has empty expr", p.ID)
 		}
 
 		expr := buildExprWithFlags(p)
 
-		// 用 yaklang regexp-utils 做特性 gate: 优先标准库 RE2, 失败时回退 regexp2
-		// (支持 lookaround/backref). 二者都无法编译才视为不支持.
-		yak := regexp_utils.NewYakRegexpUtils(expr)
-		if !yak.CanUse() {
-			policy := effectivePolicy(p.OnUnsupported, cfg.defaultPolicy)
-			reason := "expression not compilable by RE2 nor regexp2"
-			if policy == Fallback {
-				// stdlib/regexp2 都不能编译, Fallback 无从降级.
-				cfg.logger.Warnf("minirehs: pattern id=%d unsupported and rejected: %s", p.ID, reason)
-			}
-			reports = append(reports, PatternReport{ID: p.ID, Disposition: "rejected", Reason: reason})
-			return nil, utils.Errorf("minirehs: pattern id=%d rejected: %s", p.ID, reason)
-		}
-
-		cp := &compiledPattern{id: p.ID, expr: expr}
+		cp := &compiledPattern{id: p.ID, flags: p.Flags, expr: expr}
 
 		// 尝试用标准库 RE2 编译并做字面量分析; 成功则走精确验证 + 预过滤路径.
 		if re, parsed, err := compileAndParse(expr); err == nil {
 			cp.v = &re2Verifier{re: re}
+			if parsedPatterns != nil {
+				parsedPatterns[cp] = parsed
+			}
 			cp.literals = extractRequiredLiterals(parsed, cfg.minLiteralLen)
 			if len(cp.literals) > 0 {
 				if w, ok := windowVerifiable(parsed); ok {
@@ -310,10 +366,20 @@ func Compile(patterns []Pattern, opts ...Option) (Database, error) {
 				}
 			}
 		} else {
-			// RE2 不可表达 (lookaround/backref 等), 用 regexp2 验证 (后端已全局切 go-pcre2-lite).
-			cp.v = &regexp2Verifier{yak: yak}
-			// route-B: 在不触碰 regexp2 AST 的前提下, 用"语言超集改写 + RE2 字面量提取"取必需字面量,
-			// 命中才验证, 避免每条记录都跑昂贵的 regexp2. 提不出则保持 always-on. (健全性见 literal_routeb.go)
+			// The successful RE2 path already validates the expression; avoid
+			// compiling it a second time through YakRegexpUtils.CanUse.
+			yak := regexp_utils.NewYakRegexpUtils(expr)
+			if !yak.CanUse() {
+				reason := "expression not compilable by RE2 nor PCRE2"
+				if effectivePolicy(p.OnUnsupported, cfg.defaultPolicy) == Fallback {
+					cfg.logger.Warnf("minirehs: pattern id=%d unsupported and rejected: %s", p.ID, reason)
+				}
+				return nil, fmt.Errorf("minirehs: pattern id=%d rejected: %s", p.ID, reason)
+			}
+			// RE2 不可表达 (lookaround/backref 等), 只用 VillanCh/go-pcre2-lite 验证。
+			cp.v = &pcre2Verifier{yak: yak}
+			// route-B: 用语言超集改写和 RE2 字面量提取必需字面量，命中后才交 PCRE2 确认。
+			// 提不出则保持 always-on；健全性见 literal_routeb.go。
 			cp.literals = extractRequiredLiteralsApprox(expr, cfg.minLiteralLen)
 		}
 
@@ -333,9 +399,17 @@ func Compile(patterns []Pattern, opts ...Option) (Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	primary, err := backend.compile(supported, cfg)
+	var primary compiledDB
+	if mvs, ok := backend.(*mvsBackend); ok {
+		primary, err = mvs.compileParsed(supported, cfg, parsedPatterns)
+	} else {
+		primary, err = backend.compile(supported, cfg)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if m, ok := primary.(*mvsDB); ok {
+		m.patternHash = imageIdentity(patterns, cfg, m.imageFlags)
 	}
 
 	info := DatabaseInfo{
@@ -356,11 +430,15 @@ func Compile(patterns []Pattern, opts ...Option) (Database, error) {
 
 // database 是对外的 Database 实现, 包裹具体后端的 compiledDB.
 type database struct {
+	closed  atomic.Bool
 	primary compiledDB
 	info    DatabaseInfo
 }
 
 func (d *database) NewScratch() (Scratch, error) {
+	if d == nil || d.closed.Load() {
+		return nil, ErrClosed
+	}
 	return &scratch{
 		lower:    make([]byte, 0, 4096),
 		hits:     make([]litHit, 0, 256),
@@ -370,6 +448,9 @@ func (d *database) NewScratch() (Scratch, error) {
 }
 
 func (d *database) Scan(data []byte, s Scratch, handler MatchHandler) error {
+	if d == nil || d.closed.Load() {
+		return closedScanError()
+	}
 	sc, ok := s.(*scratch)
 	if !ok || sc == nil {
 		ns, err := d.NewScratch()
@@ -383,10 +464,13 @@ func (d *database) Scan(data []byte, s Scratch, handler MatchHandler) error {
 		handler = func(Match) bool { return true }
 	}
 	_, err := d.primary.scan(data, sc, handler)
-	return err
+	return scanError(err)
 }
 
 func (d *database) ScanBatch(records [][]byte, s Scratch, handler BatchMatchHandler) error {
+	if d == nil || d.closed.Load() {
+		return closedScanError()
+	}
 	if len(records) == 0 {
 		return nil
 	}
@@ -417,7 +501,7 @@ func (d *database) ScanBatch(records [][]byte, s Scratch, handler BatchMatchHand
 				return true
 			})
 			if err != nil || stop {
-				return err
+				return scanErrorAtRecord(err, i)
 			}
 		}
 		return nil
@@ -441,6 +525,7 @@ func (d *database) ScanBatch(records [][]byte, s Scratch, handler BatchMatchHand
 	}
 	var wg sync.WaitGroup
 	var laneErr [maxBatchLanes]error
+	var laneErrRecord [maxBatchLanes]int
 	var nextRecord int64
 	const batchChunk = int64(8)
 	wg.Add(lanes)
@@ -464,7 +549,8 @@ func (d *database) ScanBatch(records [][]byte, s Scratch, handler BatchMatchHand
 						return true
 					})
 					if err != nil {
-						laneErr[lane] = err
+						laneErr[lane] = scanErrorAtRecord(err, i)
+						laneErrRecord[lane] = i
 						root.batchResults[lane] = out
 						return
 					}
@@ -478,17 +564,29 @@ func (d *database) ScanBatch(records [][]byte, s Scratch, handler BatchMatchHand
 	var resultPos [maxBatchLanes]int
 	for {
 		minLane := -1
+		minRecord := 0
+		nextIsError := false
 		for lane := 0; lane < lanes; lane++ {
 			if resultPos[lane] >= len(root.batchResults[lane]) {
+				// A lane stops at its first error, so all its callbacks precede
+				// this error. Merge that event by record with the other lanes.
+				if laneErr[lane] != nil && (minLane < 0 || laneErrRecord[lane] < minRecord) {
+					minLane, minRecord, nextIsError = lane, laneErrRecord[lane], true
+				}
 				continue
 			}
-			if minLane < 0 ||
-				root.batchResults[lane][resultPos[lane]].record < root.batchResults[minLane][resultPos[minLane]].record {
+			record := root.batchResults[lane][resultPos[lane]].record
+			if minLane < 0 || record < minRecord {
 				minLane = lane
+				minRecord = record
+				nextIsError = false
 			}
 		}
 		if minLane < 0 {
 			break
+		}
+		if nextIsError {
+			return laneErr[minLane]
 		}
 		next := root.batchResults[minLane][resultPos[minLane]]
 		resultPos[minLane]++
@@ -496,17 +594,19 @@ func (d *database) ScanBatch(records [][]byte, s Scratch, handler BatchMatchHand
 			return nil
 		}
 	}
-	for lane := 0; lane < lanes; lane++ {
-		if laneErr[lane] != nil {
-			return laneErr[lane]
-		}
-	}
 	return nil
 }
 
 func (d *database) Info() DatabaseInfo { return d.info }
 
-func (d *database) Close() error { return d.primary.close() }
+// Close requires callers to have joined their scans; it prevents subsequent
+// scans and releases the backend once. It must not be called inside a handler.
+func (d *database) Close() error {
+	if d == nil || !d.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return d.primary.close()
+}
 
 // buildExprWithFlags 把 Pattern.Flags 映射为 RE2 行内标志前缀.
 func buildExprWithFlags(p Pattern) string {
@@ -533,7 +633,7 @@ func compileAndParse(expr string) (*regexp.Regexp, *syntax.Regexp, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	parsed, err := syntax.Parse(expr, syntax.Perl)
+	parsed, err := parseRegexSyntax(expr, syntax.Perl)
 	if err != nil {
 		return nil, nil, err
 	}

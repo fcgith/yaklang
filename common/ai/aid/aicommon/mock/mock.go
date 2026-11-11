@@ -330,23 +330,32 @@ func (m *MockInvoker) AssembleLoopPrompt(tools []*aitool.Tool, input *aicommon.L
 		renderMockTitledBlock("Output Example", input.OutputExample),
 	))
 	semiDynamic := wrapMockPromptSection("semi-dynamic", joinMockPromptParts(
-		renderMockTitledBlock("Skills Context", input.SkillsContext),
+		renderMockTitledBlock("Skills Context", timeline.SkillsContext),
 		renderMockSchemaBlock(input.Schema),
 		timeline.TimelineFrozen,
 		timeline.PromotedUserInputHistory,
 	))
 	timelineOpen := wrapMockPromptSection("timeline-open", timeline.TimelineOpen)
 	dynamic := wrapMockPromptSectionWithNonce("dynamic", joinMockPromptParts(
+		input.AutoContext,
 		renderMockUserQueryBlock(input.Nonce, input.UserQuery),
 		renderMockTaggedBlock("EXTRA_CAPABILITIES", input.Nonce, input.ExtraCapabilities),
 		renderMockTaggedBlock("REACTIVE_DATA", input.Nonce, input.ReactiveData),
 		renderMockInjectedMemoryBlock(input.Nonce, input.InjectedMemory),
 		input.TodoCheckpoint,
 	), input.Nonce)
+	if input.PromptMode == aicommon.LoopPromptModeCompressContext {
+		dynamic = wrapMockPromptSectionWithNonce("dynamic", joinMockPromptParts(
+			input.CompressionGuide, input.AutoContext, input.ReactiveData, input.InjectedMemory, input.TodoCheckpoint,
+		), input.Nonce)
+	}
 
 	return &aicommon.LoopPromptAssemblyResult{
-		Prompt:   joinMockPromptParts(highStatic, semiDynamic, timelineOpen, dynamic),
-		Sections: nil,
+		Prompt:            joinMockPromptParts(highStatic, semiDynamic, timelineOpen, dynamic),
+		Mode:              input.PromptMode,
+		Sections:          nil,
+		TimelineThroughID: &timeline.TimelineThroughID,
+		TimelineItemIDs:   timeline.TimelineItemIDs,
 	}, nil
 }
 

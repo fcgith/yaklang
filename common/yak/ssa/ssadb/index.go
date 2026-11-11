@@ -16,8 +16,8 @@ const irIndexBatchChunk = 1000
 type IrIndex struct {
 	gorm.Model
 
-	ProgramName string `json:"program_name" gorm:"index;not null"`
-	ValueID     int64  `json:"value_id" gorm:"index;not null"`
+	ProgramName string `json:"program_name" gorm:"not null"`
+	ValueID     int64  `json:"value_id" gorm:"not null"`
 
 	VariableID *int64 `json:"variable_id" gorm:"index"`
 	ClassID    *int64 `json:"class_id" gorm:"index"`
@@ -28,9 +28,9 @@ type IrIndex struct {
 
 	// for object-key-member search
 	// owner id + field id -> member
-	OwnerValueID *int64 `json:"owner_value_id" gorm:"index"`
+	OwnerValueID *int64 `json:"owner_value_id"`
 
-	VersionID int64 `json:"version_id" gorm:"index"`
+	VersionID int64 `json:"version_id"`
 }
 
 func (i *IrIndex) TableName() string {
@@ -51,29 +51,20 @@ func SaveIrIndex(db *gorm.DB, idx *IrIndex) {
 	SaveIrIndexBatch(db, []*IrIndex{idx})
 }
 
-func SaveIrIndexBatch(db *gorm.DB, items []*IrIndex) {
+func SaveIrIndexBatch(db *gorm.DB, items []*IrIndex) error {
 	if db == nil || len(items) == 0 {
-		return
+		return nil
 	}
-	clean := make([]*IrIndex, 0, len(items))
-	for _, it := range items {
-		if it != nil {
-			clean = append(clean, it)
-		}
-	}
-	if len(clean) == 0 {
-		return
-	}
-
 	err := diagnostics.TrackLow("Database.SaveIRIndexBatch", func() error {
-		if r := db.CreateInBatches(clean, irIndexBatchChunk); r.Error != nil {
-			return r.Error
+		if err := db.CreateInBatches(items, irIndexBatchChunk).Error; err != nil {
+			return err
 		}
 		return nil
 	})
 	if err != nil {
 		fmt.Printf("SaveIrIndexBatch failed: %v\n", err)
 	}
+	return err
 }
 
 type IrVariable struct {

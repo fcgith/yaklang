@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
 )
 
@@ -29,6 +30,12 @@ type LoopActionHandlerOperator struct {
 	executedToolCallCount int
 
 	task aicommon.AIStatefulTask
+
+	// requestPrompt is the prompt of this call, used by compression callbacks.
+	requestPrompt            string
+	trajectoryResponse       aicommon.TrajectoryResponseReceipt
+	requestTimelineThroughID *int64
+	requestTimelineItemIDs   []int64
 
 	// dynamic async mode: handler can request async mode at runtime
 	requestedAsyncMode bool
@@ -131,11 +138,17 @@ func (l *LoopActionHandlerOperator) Fail(i any) {
 }
 
 func (l *LoopActionHandlerOperator) Feedback(i any) {
+	if l.feedbacks == nil {
+		l.feedbacks = new(bytes.Buffer)
+	}
 	_, _ = l.feedbacks.WriteString(utils.InterfaceToString(i))
 	l.feedbacks.WriteRune('\n')
 }
 
 func (l *LoopActionHandlerOperator) GetFeedback() *bytes.Buffer {
+	if l.feedbacks == nil {
+		l.feedbacks = new(bytes.Buffer)
+	}
 	return l.feedbacks
 }
 
@@ -163,14 +176,14 @@ func (l *LoopActionHandlerOperator) IsAsyncModeRequested() bool {
 	return l.requestedAsyncMode
 }
 
-// NextAction restricts the next model iteration to the named actions. The
-// constraint applies to one iteration only and is ignored if no named action
+// NextAction restricts the next business turn to the named actions. Maintenance
+// and its retries preserve it. It is ignored if no named action
 // exists after the loop's normal security filters run.
 func (l *LoopActionHandlerOperator) NextAction(actions ...string) {
 	l.nextActionMustUse = append(l.nextActionMustUse, actions...)
 }
 
-// RemoveNextAction hides the named actions from the next model iteration.
+// RemoveNextAction hides the named actions until the next business turn runs.
 func (l *LoopActionHandlerOperator) RemoveNextAction(actions ...string) {
 	l.nextActionDisabled = append(l.nextActionDisabled, actions...)
 }
@@ -264,7 +277,14 @@ func (o *OnPostIterationOperator) DeferAfterCallbacks(fn func()) {
 // Called by callOnPostIteration after the main callback chain completes.
 func (o *OnPostIterationOperator) RunDeferredFuncs() {
 	for _, fn := range o.deferredFuncs {
-		fn()
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Warnf("deferred post-iteration callback panicked and was skipped: %v", recovered)
+				}
+			}()
+			fn()
+		}()
 	}
 }
 

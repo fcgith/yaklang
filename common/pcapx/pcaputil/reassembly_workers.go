@@ -423,7 +423,7 @@ func (d *tcpWorkers) flushLoop() {
 		}
 		// Expiry during a backlog would mistake scheduling delay for TCP idle
 		// time. Only expire when all accepted packets have completed.
-		if d.stats.accepted.Load() == d.stats.processed.Load() && time.Since(d.lastSubmit) >= d.root.options.IdleTimeout {
+		if !d.root.options.captureReplay && d.stats.accepted.Load() == d.stats.processed.Load() && time.Since(d.lastSubmit) >= d.root.options.IdleTimeout {
 			for _, w := range d.workers {
 				w.pool.mu.Lock()
 				w.pool.flowCache.expire()
@@ -545,7 +545,8 @@ func (d *tcpWorkers) close() {
 func (p *TrafficPool) notePanic(value any) {
 	if p.parallel == nil {
 		p.singleDiagnostics.panics.Add(1)
-		p.reassemblyFailure(fmt.Sprintf("TCP callback panic: %v", value))
+		// AllowIncomplete tolerates missing input, not failed observers.
+		p.firstError.CompareAndSwap(nil, &reassemblyError{err: fmt.Errorf("TCP callback panic: %v", value)})
 		return
 	}
 	if p.counters == nil {
@@ -559,7 +560,7 @@ func (p *TrafficPool) notePanic(value any) {
 func (d *tcpWorkers) checkTruncation(ci gopacket.CaptureInfo) {
 	if ci.CaptureLength < ci.Length {
 		d.stats.truncated.Add(1)
-		d.fail(fmt.Errorf("capture contains truncated packets (captured %d of %d bytes)", ci.CaptureLength, ci.Length))
+		d.root.reassemblyFailure(fmt.Sprintf("capture contains truncated packets (captured %d of %d bytes)", ci.CaptureLength, ci.Length))
 	}
 }
 

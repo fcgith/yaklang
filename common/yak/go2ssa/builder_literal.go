@@ -588,7 +588,10 @@ func (b *astbuilder) buildFunctionTypeLiteral(stmt *gol.FunctionTypeContext) ssa
 	defer recoverRange()
 
 	if signature := stmt.Signature(); signature != nil {
-		paramt, rett := b.buildSignature(signature.(*gol.SignatureContext))
+		// A function type is only a type. buildSignature would emit Parameter
+		// instructions into whatever function is current, including @main and
+		// every callback parameter of a real function.
+		paramt, rett := b.functionTypeSignature(signature.(*gol.SignatureContext))
 		return ssa.NewFunctionType("", paramt, rett, false)
 	}
 
@@ -737,6 +740,12 @@ func (b *astbuilder) buildFieldDecl(stmt *gol.FieldDeclContext, structTyp *ssa.O
 	var ssatyp ssa.Type = nil
 	if typ := stmt.Type_(); typ != nil {
 		ssatyp = b.buildType(typ.(*gol.Type_Context))
+		// buildType historically resolves *T to T. Preserve the indirection
+		// for named fields, as we already do for embedded fields below: a
+		// pointer's zero value is nil, not a recursively initialized T.
+		if ssatyp != nil && strings.HasPrefix(typ.GetText(), "*") {
+			ssatyp = goPointerType(ssatyp)
+		}
 	}
 
 	if idlist := stmt.IdentifierList(); idlist != nil {
@@ -777,6 +786,13 @@ func (b *astbuilder) buildFieldDecl(stmt *gol.FieldDeclContext, structTyp *ssa.O
 				for _, fn := range fromLib.GetFullTypeNames() {
 					structTyp.AddFullTypeName(fn)
 				}
+			} else if forward, ok := parent.(*forwardNamedType); ok {
+				fieldType := parent
+				if strings.HasPrefix(typ.GetText(), "*") {
+					fieldType = goPointerType(parent)
+				}
+				structTyp.AddField(b.EmitConstInst(name), fieldType)
+				b.noteEmbeddedForward(structTyp, name, forward)
 			} else if notUse, ok := parent.(*ssa.BasicType); ok {
 				// b.NewError(ssa.Warn, TAG, Unreachable())
 				structTyp.AddField(b.EmitConstInst(name), notUse)
@@ -931,9 +947,7 @@ func coverType(ityp, iwantTyp ssa.Type) {
 	case ssa.StructTypeKind:
 		typ.FieldType = wantTyp.FieldType
 		typ.KeyTyp = wantTyp.KeyTyp
-		wantTyp.RangeMethod(func(s string, f *ssa.Function) {
-			typ.AddMethod(s, f)
-		})
+		typ.AddMethods(wantTyp.GetMethod())
 	}
 	for n, a := range wantTyp.AnonymousField {
 		typ.AnonymousField[n] = a
@@ -941,9 +955,30 @@ func coverType(ityp, iwantTyp ssa.Type) {
 	ityp.SetFullTypeNames(iwantTyp.GetFullTypeNames())
 }
 
+// Struct default construction expands fields recursively without dedup of
+// shared field types: a legal value-type graph can make the raw field tree
+// exponential (N levels of two same-typed fields -> 2^N nodes) or cyclic, and
+// such types used to never finish compiling. The recursion is bounded inline:
+// nesting past defaultValueDepthLimit, more than defaultValueNodeLimit struct
+// nodes within one construction, or a type re-entering itself (path table)
+// degrades that node to a typed Make placeholder, whose deep members are
+// created lazily on member access.
+const (
+	defaultValueDepthLimit = 64
+	defaultValueNodeLimit  = 1024
+)
+
 func (b *astbuilder) GetDefaultValue(ityp ssa.Type) ssa.Value {
+	nodes := 0
+	return b.getDefaultValue(ityp, 0, &nodes, nil)
+}
+
+func (b *astbuilder) getDefaultValue(ityp ssa.Type, depth int, nodes *int, path map[ssa.Type]struct{}) ssa.Value {
 	if utils.IsNil(ityp) {
 		return b.EmitUndefined("default")
+	}
+	if depth > defaultValueDepthLimit || *nodes > defaultValueNodeLimit {
+		return b.EmitMakeBuildWithType(ityp, nil, nil)
 	}
 	switch ityp.GetTypeKind() {
 	case ssa.NumberTypeKind:
@@ -956,13 +991,22 @@ func (b *astbuilder) GetDefaultValue(ityp ssa.Type) ssa.Value {
 		return b.EmitUndefined("func")
 	case ssa.AliasTypeKind:
 		alias, _ := ssa.ToAliasType(ityp)
-		return b.GetDefaultValue(alias.GetType())
+		return b.getDefaultValue(alias.GetType(), depth+1, nodes, path)
 	case ssa.StructTypeKind:
+		if _, cyclic := path[ityp]; cyclic {
+			return b.EmitMakeBuildWithType(ityp, nil, nil)
+		}
+		if path == nil {
+			path = make(map[ssa.Type]struct{})
+		}
+		path[ityp] = struct{}{}
+		defer delete(path, ityp)
+		*nodes++
 		typ := goSelectorObjectType(ityp)
 		obj := b.InterfaceAddFieldBuild(len(typ.Keys), func(i int) ssa.Value {
 			return typ.Keys[i]
 		}, func(i int) ssa.Value {
-			return b.GetDefaultValue(typ.FieldTypes[i])
+			return b.getDefaultValue(typ.FieldTypes[i], depth+1, nodes, path)
 		})
 		obj.SetType(ityp)
 		return obj
@@ -971,9 +1015,20 @@ func (b *astbuilder) GetDefaultValue(ityp ssa.Type) ssa.Value {
 	case ssa.ObjectTypeKind, ssa.InterfaceTypeKind, ssa.SliceTypeKind, ssa.MapTypeKind:
 		return b.EmitMakeBuildWithType(ityp, nil, nil)
 	case ssa.ClassBluePrintTypeKind:
-		// TODO
-		return b.EmitConstInst(0)
+		return b.unknownDefault(ityp)
 	default:
+		// Any, unresolved and external types are not the number 0. Keep the
+		// type identity and say the value is unknown.
+		return b.unknownDefault(ityp)
+	}
+}
+
+func (b *astbuilder) unknownDefault(typ ssa.Type) ssa.Value {
+	value := b.EmitUndefined("default")
+	if value == nil {
 		return b.EmitConstInst(0)
 	}
+	// Keep the blueprint or any identity. SetType would instantiate a class.
+	value.SetTypeExact(typ)
+	return value
 }

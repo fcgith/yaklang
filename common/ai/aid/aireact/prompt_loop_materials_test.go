@@ -18,13 +18,13 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/ai/ytoken"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils/filesys"
 )
 
-func mustLoopPromptSections(t *testing.T, raw any) []*reactloops.PromptSectionObservation {
+func freezePromptTestSkill(t *testing.T, react *ReAct, body string) {
 	t.Helper()
-	sections, ok := raw.([]*reactloops.PromptSectionObservation)
-	require.True(t, ok, "loop prompt sections should be []*reactloops.PromptSectionObservation")
-	return sections
+	require.True(t, react.config.GetTimeline().PushSkillFileContent(react.config.AcquireId(), "prompt-test-skill", "SKILL.md", body, aicommon.SkillContentSourceManual, 1, 1, 1))
+	react.config.GetTimeline().FreezeAll()
 }
 
 func TestPromptManager_ModelReasoningReplayOnlyEntersMainDecisionPrompt(t *testing.T) {
@@ -198,6 +198,8 @@ func TestPromptManager_AssembleLoopPrompt_LightweightUsesBoundedRecentTimeline(t
 		}),
 	)
 	require.NoError(t, err)
+	skillBody := strings.TrimSpace(strings.Repeat("skill ", 5000))
+	freezePromptTestSkill(t, react, skillBody)
 	react.AddToTimeline("note", "ANCIENT_LIGHTWEIGHT_CONTEXT "+strings.Repeat("old ", 20000))
 	react.AddToTimeline("note", "RECENT_LIGHTWEIGHT_FACT")
 	_, err = react.config.AppendUserInputHistory(strings.Repeat("query ", 5000), time.Now())
@@ -208,7 +210,6 @@ func TestPromptManager_AssembleLoopPrompt_LightweightUsesBoundedRecentTimeline(t
 		Lightweight:       true,
 		TaskInstruction:   "keep the task protocol",
 		Schema:            `{"type":"object","properties":{"@action":{"type":"string"}}}`,
-		SkillsContext:     strings.Repeat("skill ", 5000),
 		TodoSnapshot:      strings.Repeat("todo ", 5000),
 		ReactiveData:      strings.Repeat("reactive ", 5000),
 		InjectedMemory:    strings.Repeat("memory ", 5000),
@@ -217,6 +218,7 @@ func TestPromptManager_AssembleLoopPrompt_LightweightUsesBoundedRecentTimeline(t
 	})
 	require.NoError(t, err)
 	require.Contains(t, result.Prompt, "RECENT_LIGHTWEIGHT_FACT")
+	require.Contains(t, result.Prompt, skillBody, "frozen skills must not be omitted by a separate lightweight budget")
 	require.NotContains(t, result.Prompt, "ANCIENT_LIGHTWEIGHT_CONTEXT")
 	require.NotContains(t, result.Prompt, "evidence evidence evidence")
 	require.NotContains(t, result.Prompt, "Timeline Memory (Frozen)")
@@ -228,7 +230,9 @@ func TestPromptManager_AssembleLoopPrompt_LightweightUsesBoundedRecentTimeline(t
 	require.Less(t, strings.Index(result.Prompt, "[CURRENT TODO CHECKPOINT]"), strings.Index(result.Prompt, aiprojection.CreateTemplate("<|PROMPT_SECTION_dynamic_END_light-1|>")))
 	promptTokens := ytoken.CalcTokenCount(result.Prompt)
 	t.Logf("bounded lightweight loop prompt tokens: %d", promptTokens)
-	require.LessOrEqual(t, promptTokens, 30000)
+	// Retained skill originals are controlled by Timeline compression, not the
+	// lightweight execution-history budget.
+	require.LessOrEqual(t, promptTokens-ytoken.CalcTokenCount(skillBody), 30000)
 }
 
 // TestPromptManager_AssembleLoopPrompt_SectionOrder 验证"按稳定性分层"路径
@@ -250,6 +254,7 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
+	freezePromptTestSkill(t, react, "loaded skill")
 
 	tool := aitool.NewWithoutCallback("tool-a", aitool.WithDescription("tool a desc"))
 	react.promptManager.cpm.Register("provider-one", func(config aicommon.AICallerConfigIf, emitter *aicommon.Emitter, key string) (string, error) {
@@ -266,16 +271,16 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 	result, err := react.promptManager.AssembleLoopPrompt([]*aitool.Tool{tool}, &reactloops.LoopPromptAssemblyInput{
 		Nonce:           "n123",
 		TaskInstruction: "follow task rules",
+		AutoContext:     "loop-owned async execution snapshot",
 		OutputExample:   "example output",
 		Schema:          `{"type":"object","properties":{"@action":{"type":"string"}}}`,
-		SkillsContext:   "<|SKILLS_CONTEXT_skills_context|>\nloaded skill\n<|SKILLS_CONTEXT_END_skills_context|>",
 		ReactiveData:    "reactive state",
 		InjectedMemory:  "memory content",
 		TodoCheckpoint:  "[CURRENT TODO CHECKPOINT]\ncheckpoint tail",
 	})
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	sections := mustLoopPromptSections(t, result.Sections)
+	sections := result.Sections
 	require.Len(t, sections, 6)
 
 	require.Equal(t, "section.high_static", sections[0].Key)
@@ -284,15 +289,15 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 	require.Equal(t, "section.semi_dynamic_2", sections[3].Key)
 	require.Equal(t, "section.timeline_open", sections[4].Key)
 	require.Equal(t, "section.dynamic", sections[5].Key)
-	require.Equal(t, reactloops.PromptSectionRoleHighStatic, sections[0].Role)
-	require.Equal(t, reactloops.PromptSectionRoleZHHighStatic, sections[0].RoleZh)
-	require.Equal(t, reactloops.PromptSectionRoleFrozenBlock, sections[1].Role)
-	require.Equal(t, reactloops.PromptSectionRoleSemiDynamic1, sections[2].Role)
-	require.Equal(t, reactloops.PromptSectionRoleZHSemiDynamic1, sections[2].RoleZh)
-	require.Equal(t, reactloops.PromptSectionRoleSemiDynamic2, sections[3].Role)
-	require.Equal(t, reactloops.PromptSectionRoleZHSemiDynamic2, sections[3].RoleZh)
-	require.Equal(t, reactloops.PromptSectionRoleTimelineOpen, sections[4].Role)
-	require.Equal(t, reactloops.PromptSectionRoleDynamic, sections[5].Role)
+	require.Equal(t, aicommon.PromptSectionRoleHighStatic, sections[0].Role)
+	require.Equal(t, aicommon.PromptSectionRoleZHHighStatic, sections[0].RoleZh)
+	require.Equal(t, aicommon.PromptSectionRoleFrozenBlock, sections[1].Role)
+	require.Equal(t, aicommon.PromptSectionRoleSemiDynamic1, sections[2].Role)
+	require.Equal(t, aicommon.PromptSectionRoleZHSemiDynamic1, sections[2].RoleZh)
+	require.Equal(t, aicommon.PromptSectionRoleSemiDynamic2, sections[3].Role)
+	require.Equal(t, aicommon.PromptSectionRoleZHSemiDynamic2, sections[3].RoleZh)
+	require.Equal(t, aicommon.PromptSectionRoleTimelineOpen, sections[4].Role)
+	require.Equal(t, aicommon.PromptSectionRoleDynamic, sections[5].Role)
 
 	prompt := result.Prompt
 	traitsIdx := strings.Index(prompt, "<|TRAITS|>")
@@ -300,7 +305,7 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 	timelineIdx := strings.Index(prompt, "# Timeline Memory")
 	currentTimeIdx := strings.Index(prompt, "# Current Time")
 	toolInventoryIdx := strings.Index(prompt, "# Tool Inventory")
-	skillsIdx := strings.Index(prompt, "<|SKILLS_CONTEXT_skills_context|>")
+	skillsIdx := strings.Index(prompt, "<|SKILLS_CONTEXT_")
 	persistentIdx := strings.Index(prompt, "<|PERSISTENT|>")
 	executionPolicyIdx := strings.Index(prompt, "<|EXECUTION_POLICY|>")
 	schemaIdx := strings.Index(prompt, "<|SCHEMA|>")
@@ -389,14 +394,14 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 	require.NotEmpty(t, sections[1].Children)
 	require.Equal(t, "section.frozen_block.tool_inventory", sections[1].Children[0].Key)
 	require.Equal(t, "Tool Inventory", sections[1].Children[0].Label)
-	require.Equal(t, reactloops.PromptSectionRoleFrozenBlock, sections[1].Children[0].Role)
+	require.Equal(t, aicommon.PromptSectionRoleFrozenBlock, sections[1].Children[0].Role)
 
 	// semi_dynamic_1 段子结构: skills_context。
 	// 关键词: semi_dynamic_1 children, skills_context, Name 去前缀
 	require.Len(t, sections[2].Children, 2)
 	require.Equal(t, "section.semi_dynamic_1.workspace", sections[2].Children[0].Key)
 	require.Equal(t, "section.semi_dynamic_1.skills_context", sections[2].Children[1].Key)
-	require.Equal(t, reactloops.PromptSectionRoleSemiDynamic1, sections[2].Children[0].Role)
+	require.Equal(t, aicommon.PromptSectionRoleSemiDynamic1, sections[2].Children[0].Role)
 
 	// semi_dynamic_2 段子结构: execution_policy(inline) + task_instruction + schema + output_example
 	// (ExecutionPolicy / TaskInstruction / OutputExample 从 high_static 迁入 semi-dynamic-2,
@@ -409,8 +414,8 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 	require.Equal(t, "Schema", sections[3].Children[1].Label)
 	require.Equal(t, "section.semi_dynamic_2.output_example", sections[3].Children[2].Key)
 	require.Equal(t, "Output Example", sections[3].Children[2].Label)
-	require.Equal(t, reactloops.PromptSectionRoleSemiDynamic2, sections[3].Children[0].Role)
-	require.Equal(t, reactloops.PromptSectionRoleSemiDynamic2, sections[3].Children[2].Role)
+	require.Equal(t, aicommon.PromptSectionRoleSemiDynamic2, sections[3].Children[0].Role)
+	require.Equal(t, aicommon.PromptSectionRoleSemiDynamic2, sections[3].Children[2].Role)
 
 	// timeline_open 段子结构 (P1-C3 段内重排后):
 	// User history is part of the Open journal until promotion; there is no
@@ -425,8 +430,11 @@ func TestPromptManager_AssembleLoopPrompt_SectionOrder(t *testing.T) {
 	require.Equal(t, "section.dynamic.current_time", sections[5].Children[0].Key)
 	require.Equal(t, "section.dynamic.auto_context", sections[5].Children[1].Key)
 	require.Equal(t, "Auto Context", sections[5].Children[1].Label)
+	require.Contains(t, sections[5].Children[1].Content, "auto ctx body")
+	require.Contains(t, sections[5].Children[1].Content, "loop-owned async execution snapshot")
+	require.Contains(t, prompt[currentTimeIdx:dynamicEndIdx], "loop-owned async execution snapshot")
 	require.NotContains(t, sections[5].Content, "current user query")
-	require.Equal(t, reactloops.PromptSectionRoleDynamic, sections[5].Children[0].Role)
+	require.Equal(t, aicommon.PromptSectionRoleDynamic, sections[5].Children[0].Role)
 
 }
 
@@ -476,7 +484,7 @@ func TestPromptManager_RenderLoopSemiDynamic1Section_Order(t *testing.T) {
 	require.Greater(t, userInputIdx, promotedIdx)
 	require.Greater(t, evidenceIdx, userInputIdx)
 	observation := react.promptManager.buildSemiDynamic1Observation(materials, rendered)
-	children := map[string]*reactloops.PromptSectionObservation{}
+	children := map[string]*aicommon.PromptSectionObservation{}
 	for _, child := range observation.Children {
 		children[child.Key] = child
 	}
@@ -536,8 +544,8 @@ func TestPromptManager_RenderLoopSemiDynamic2Section_Order(t *testing.T) {
 }
 
 // TestPromptManager_RenderLoopFrozenBlockSection_Order 验证 FrozenBlock 段
-// (frozen_block_section.txt) 渲染顺序为 Tool Inventory -> Forge Inventory ->
-// Timeline (Frozen Prefix), 且不包含 Skills/Schema。
+// (frozen_block_section.txt) 渲染顺序为 Tool -> Skill -> Forge Inventory ->
+// Timeline (Frozen Prefix), 且不包含技能正文/Schema。
 //
 // 关键词: renderLoopFrozenBlockSection, Tool/Forge/Timeline-frozen 顺序
 func TestPromptManager_RenderLoopFrozenBlockSection_Order(t *testing.T) {
@@ -557,6 +565,7 @@ func TestPromptManager_RenderLoopFrozenBlockSection_Order(t *testing.T) {
 		TopToolsCount:  1,
 		TopTools:       []*aitool.Tool{aitool.NewWithoutCallback("tool-a", aitool.WithDescription("tool a desc"))},
 		HasMoreTools:   true,
+		SkillInventory: "# Skill Inventory\n  - skill-a: skill a desc",
 		ForgeInventory: true,
 		AIForgeList:    "* `forge-a`: forge a desc",
 		TimelineFrozen: "<|TIMELINE_r1t100|>\nfrozen reducer body\n<|TIMELINE_END_r1t100|>",
@@ -564,15 +573,97 @@ func TestPromptManager_RenderLoopFrozenBlockSection_Order(t *testing.T) {
 	require.NoError(t, err)
 
 	toolIdx := strings.Index(rendered, "# Tool Inventory")
+	skillIdx := strings.Index(rendered, "# Skill Inventory")
 	forgeIdx := strings.Index(rendered, "# AI Blueprint Inventory")
 	timelineFrozenIdx := strings.Index(rendered, "# Timeline Memory (Frozen Prefix)")
 	require.NotEqual(t, -1, toolIdx)
+	require.NotEqual(t, -1, skillIdx)
 	require.NotEqual(t, -1, forgeIdx)
 	require.NotEqual(t, -1, timelineFrozenIdx)
-	require.Less(t, toolIdx, forgeIdx)
+	require.Less(t, toolIdx, skillIdx)
+	require.Less(t, skillIdx, forgeIdx)
 	require.Less(t, forgeIdx, timelineFrozenIdx)
 	require.NotContains(t, rendered, "<|SKILLS_CONTEXT_")
 	require.NotContains(t, rendered, "<|SCHEMA|>")
+}
+
+func TestPromptManagerSkillInventorySnapshot(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		t.Run(strconv.FormatBool(native), func(t *testing.T) {
+			vfs := filesys.NewVirtualFs()
+			vfs.AddFile("inventory-skill/SKILL.md", "---\nname: inventory-skill\ndescription: Static guide\n---\nSKILL_BODY_ONLY_AFTER_LOAD\nsecond line\n")
+			react, err := NewTestReAct(aicommon.WithSkillsFS(vfs))
+			require.NoError(t, err)
+			loop, err := reactloops.NewReActLoop("skill-inventory-test", react, reactloops.WithFunctionCallMode(native))
+			require.NoError(t, err)
+			defer loop.Release()
+			mgr := loop.GetSkillsContextManager()
+			require.NotNil(t, mgr)
+			tools := []*aitool.Tool{aitool.NewWithoutCallback("inventory-tool", aitool.WithDescription("tool guide"))}
+			input := &reactloops.LoopPromptAssemblyInput{Nonce: "inventory", FunctionCallMode: native}
+			base, err := react.promptManager.GetLoopPromptBaseMaterialsForLoop(tools, input.Nonce, loop)
+			require.NoError(t, err)
+			require.Equal(t, mgr.SkillInventory(), base.SkillInventory)
+			before, err := react.promptManager.AssemblePromptPrefix(react.promptManager.NewPromptMaterials(base, input))
+			require.NoError(t, err)
+			require.Contains(t, before.FrozenBlock, mgr.SkillInventory())
+			require.Less(t, strings.Index(before.FrozenBlock, "# Tool Inventory"), strings.Index(before.FrozenBlock, "# Skill Inventory"))
+			require.NotContains(t, before.Prompt, "SKILL_BODY_ONLY_AFTER_LOAD")
+			require.NotContains(t, before.SemiDynamic1, "SKILLS_CONTEXT")
+
+			var observation *aicommon.PromptSectionObservation
+			for _, child := range before.Sections[1].Children {
+				if child.Key == "section.frozen_block.skill_inventory" {
+					observation = child
+				}
+			}
+			require.NotNil(t, observation)
+			require.Equal(t, mgr.SkillInventory(), observation.Content)
+			require.Equal(t, aicommon.PromptSectionRoleFrozenBlock, observation.Role)
+
+			added, err := mgr.LoadForcedSkill("inventory-skill")
+			require.NoError(t, err)
+			require.True(t, added)
+			require.NoError(t, mgr.ChangeViewOffset("inventory-skill", "SKILL.md", 2))
+			later := filesys.NewVirtualFs()
+			later.AddFile("later-skill/SKILL.md", "---\nname: later-skill\ndescription: Added later\n---\nLATER_BODY")
+			require.NoError(t, aicommon.WithSkillsFS(later)(react.config))
+
+			afterBase, err := react.promptManager.GetLoopPromptBaseMaterialsForLoop(tools, input.Nonce, loop)
+			require.NoError(t, err)
+			after, err := react.promptManager.AssemblePromptPrefix(react.promptManager.NewPromptMaterials(afterBase, input))
+			require.NoError(t, err)
+			require.Equal(t, before.FrozenBlock, after.FrozenBlock)
+			require.Contains(t, after.TimelineOpen, "SKILL_BODY_ONLY_AFTER_LOAD")
+			require.NotContains(t, after.FrozenBlock, "later-skill")
+			require.NotContains(t, after.SemiDynamic1, "SKILLS_CONTEXT", "loading must not bypass the freeze boundary")
+
+			lightInput := *input
+			lightInput.Lightweight = true
+			lightBase, _ := react.promptManager.projectLightweightLoopMaterials(afterBase, &lightInput)
+			require.Equal(t, afterBase.SkillInventory, lightBase.SkillInventory)
+		})
+	}
+}
+
+func TestPromptManagerSkillInventoryAbsentWithoutManager(t *testing.T) {
+	react, err := NewTestReAct()
+	require.NoError(t, err)
+	loop, err := reactloops.NewReActLoop("no-skill-inventory-test", react)
+	require.NoError(t, err)
+	defer loop.Release()
+	require.Nil(t, loop.GetSkillsContextManager())
+	for _, candidate := range []*reactloops.ReActLoop{nil, loop} {
+		base, err := react.promptManager.GetLoopPromptBaseMaterialsForLoop(nil, "no-inventory", candidate)
+		require.NoError(t, err)
+		require.Empty(t, base.SkillInventory)
+		prefix, err := react.promptManager.AssemblePromptPrefix(react.promptManager.NewPromptMaterials(base, nil))
+		require.NoError(t, err)
+		require.NotContains(t, prefix.Prompt, "# Skill Inventory")
+		for _, child := range prefix.Sections[1].Children {
+			require.NotEqual(t, "section.frozen_block.skill_inventory", child.Key)
+		}
+	}
 }
 
 // TestPromptManager_AssemblePromptPrefix 验证 5 段 prefix 输出 (high_static +
@@ -711,6 +802,7 @@ func TestPromptManager_AssembleLoopPrompt_HijackFiveSegment(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
+	freezePromptTestSkill(t, react, "loaded skill")
 
 	tool := aitool.NewWithoutCallback("tool-a", aitool.WithDescription("tool a desc"))
 	react.AddToTimeline("test", "timeline content")
@@ -722,7 +814,6 @@ func TestPromptManager_AssembleLoopPrompt_HijackFiveSegment(t *testing.T) {
 		TaskInstruction: "follow task rules",
 		OutputExample:   "example output",
 		Schema:          `{"type":"object","properties":{"@action":{"type":"string"}}}`,
-		SkillsContext:   "<|SKILLS_CONTEXT_skills_context|>\nloaded skill\n<|SKILLS_CONTEXT_END_skills_context|>",
 	})
 	require.NoError(t, err)
 
@@ -758,7 +849,7 @@ func TestPromptManager_AssembleLoopPrompt_HijackFiveSegment(t *testing.T) {
 		"user2 must contain AI_CACHE_SEMI END tag")
 	require.Contains(t, user2Content, "<|PROMPT_SECTION_semi-dynamic-1|>",
 		"user2 must contain inner PROMPT_SECTION_semi-dynamic-1 wrapper")
-	require.Contains(t, user2Content, "<|SKILLS_CONTEXT_skills_context|>",
+	require.Contains(t, user2Content, "<|SKILLS_CONTEXT_",
 		"user2 must contain SkillsContext")
 	require.True(t, strings.HasSuffix(strings.TrimSpace(user2Content), "<|AI_CACHE_SEMI_END_semi|>"),
 		"user2 should end at semi-1 boundary END tag, got: %q", user2Content)
@@ -965,6 +1056,7 @@ func TestPromptManager_AssembleLoopPrompt_SemiSegmentByteStableAcrossTurns(t *te
 		}),
 	)
 	require.NoError(t, err)
+	freezePromptTestSkill(t, react, "skill")
 
 	tool := aitool.NewWithoutCallback("tool-a", aitool.WithDescription("tool a desc"))
 
@@ -975,7 +1067,6 @@ func TestPromptManager_AssembleLoopPrompt_SemiSegmentByteStableAcrossTurns(t *te
 			Nonce:           turnNonce,
 			TaskInstruction: "task rules",
 			Schema:          `{"type":"object"}`,
-			SkillsContext:   "<|SKILLS_CONTEXT_demo|>\nskill\n<|SKILLS_CONTEXT_END_demo|>",
 		})
 		require.NoError(t, err)
 		return result.Prompt
@@ -1056,6 +1147,7 @@ func TestPromptManager_AssembleLoopPrompt_AicacheSplitClassification(t *testing.
 		}),
 	)
 	require.NoError(t, err)
+	freezePromptTestSkill(t, react, "loaded skill")
 
 	tool := aitool.NewWithoutCallback("tool-a", aitool.WithDescription("tool a desc"))
 	react.AddToTimeline("test", "timeline content")
@@ -1065,7 +1157,6 @@ func TestPromptManager_AssembleLoopPrompt_AicacheSplitClassification(t *testing.
 		TaskInstruction: "follow task rules",
 		OutputExample:   "example output",
 		Schema:          `{"type":"object","properties":{"@action":{"type":"string"}}}`,
-		SkillsContext:   "<|SKILLS_CONTEXT_skills_context|>\nloaded skill\n<|SKILLS_CONTEXT_END_skills_context|>",
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, result.Prompt)

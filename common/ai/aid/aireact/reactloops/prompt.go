@@ -29,11 +29,6 @@ var todoListTemplate = promptloader.MustLoad("ai/aid/aireact/reactloops/prompts/
 func (r *ReActLoop) generateSchemaString(disallowExit bool, actionOperators ...*LoopActionHandlerOperator) (string, error) {
 	filteredValues := r.getFilteredActions(disallowExit, actionOperators...)
 
-	// Mark init constraints as applied after first schema generation
-	if !r.functionCallMode && !r.initActionApplied && (len(r.initActionMustUse) > 0 || len(r.initActionDisabled) > 0) {
-		r.initActionApplied = true
-	}
-
 	schemaText := buildSchema(filteredValues...)
 	return applyToolBatchSchemaMaxItems(schemaText, r.toolBatchMaxCalls())
 }
@@ -67,13 +62,10 @@ func (r *ReActLoop) prepareLoopActionSchemas(operator *LoopActionHandlerOperator
 			return "", "", err
 		}
 	}
-	// Preserve this turn's exact tool set before consuming one-shot constraints.
-	// Recomputing filters during a retry could expose actions absent from its prompt.
+	// Rendering never consumes one-shot constraints. The first dispatched
+	// business action owns that transition; maintenance and retries keep them.
 	r.lastNativeActionNames = nativeActionNames
 	r.lastNativeTools = nativeTools
-	if !r.initActionApplied && (len(r.initActionMustUse) > 0 || len(r.initActionDisabled) > 0) {
-		r.initActionApplied = true
-	}
 	return schema, functionCallSchemas, nil
 }
 
@@ -169,8 +161,18 @@ func (r *ReActLoop) getFilteredActions(disallowExit bool, actionOperators ...*Lo
 	}
 
 	var filteredValues []*LoopAction
+	var asyncManagement *LoopAction
+	var contextCompression *LoopAction
 	for _, v := range values {
+		if v.ActionType == schema.AI_REACT_LOOP_ACTION_MANAGE_ASYNC_EXECUTION_RUNTIME {
+			asyncManagement = v
+			continue
+		}
 		if v.ActionType == nativeAdjustTodolistActionName && !r.functionCallMode {
+			continue
+		}
+		if v.ActionType == aicommon.ContextCompressionAction {
+			contextCompression = v
 			continue
 		}
 		if !slices.Contains(disableActionList, v.ActionType) && filterFunc(v) {
@@ -178,6 +180,11 @@ func (r *ReActLoop) getFilteredActions(disallowExit bool, actionOperators ...*Lo
 		} else {
 			log.Infof("action[%s] is removed from schema because loop exit is disallowed or init disabled", v.ActionType)
 		}
+	}
+
+	// 黑名单过滤结束后加回后台管理，下面的 MustUse 可以看见并点名它。
+	if asyncManagement != nil {
+		filteredValues = append(filteredValues, asyncManagement)
 	}
 
 	// Apply init handler must-use action constraints
@@ -218,6 +225,11 @@ func (r *ReActLoop) getFilteredActions(disallowExit bool, actionOperators ...*Lo
 		}
 	}
 
+	// Maintenance admission is controlled by the loop's prompt mode, not the
+	// business action filters. Keep its contract stable across both modes.
+	if contextCompression != nil {
+		filteredValues = append(filteredValues, contextCompression)
+	}
 	return filteredValues
 }
 
@@ -284,6 +296,62 @@ func applyToolBatchSchemaMaxItems(schemaText string, maxCalls int) (string, erro
 // 关键词: generateLoopPrompt, frozenUserContext, PLAN_CONTEXT 段,
 //
 //	prefix cache, PE-TASK 缓存优化
+//
+// loopPromptBuildInput pins the one-shot inputs of a single iteration so an
+// overflow retry can rebuild the prompt without consuming them twice.
+type loopPromptBuildInput struct {
+	nonce             string
+	userInput         string
+	frozenUserContext string
+	frozenPartitions  []aicommon.FrozenBlockPartition
+	memory            string
+	operator          *LoopActionHandlerOperator
+
+	// Captured exactly once per iteration: these reads mutate loop state.
+	subAgentInput            string
+	subAgentRevision         uint64
+	subAgentEvidenceRevision uint64
+	todoCheckpoint           string
+	actionSchemas            *loopPromptActionSchemas
+	// overflowCompression asks this rebuild to compress only through the last
+	// provider-accepted timeline boundary.
+	overflowCompression bool
+}
+
+type loopPromptActionSchemas struct {
+	text, native      string
+	nativeActionNames []string
+	nativeTools       []aispec.Tool
+}
+
+// captureLoopPromptBuildInput fixes the iteration inputs. The returned value is
+// reused by every prompt rebuild of this iteration.
+func (r *ReActLoop) captureLoopPromptBuildInput(
+	nonce string,
+	userInput string,
+	frozenUserContext string,
+	frozenPartitions []aicommon.FrozenBlockPartition,
+	memory string,
+	operator *LoopActionHandlerOperator,
+) *loopPromptBuildInput {
+	// Publication writes the parent evidence journal before advancing this
+	// cursor. Capture before projection so only model-visible saves are acked.
+	evidenceRevision := r.subAgentSharedEvidenceRevision()
+	subAgentInput, subAgentRevision := r.prepareSubAgentPrompt()
+	return &loopPromptBuildInput{
+		nonce:                    nonce,
+		userInput:                userInput,
+		frozenUserContext:        frozenUserContext,
+		frozenPartitions:         frozenPartitions,
+		memory:                   memory,
+		operator:                 operator,
+		subAgentInput:            subAgentInput,
+		subAgentRevision:         subAgentRevision,
+		subAgentEvidenceRevision: evidenceRevision,
+		todoCheckpoint:           r.consumeTodoCheckpoint(),
+	}
+}
+
 func (r *ReActLoop) generateLoopPrompt(
 	nonce string,
 	userInput string,
@@ -292,7 +360,25 @@ func (r *ReActLoop) generateLoopPrompt(
 	memory string,
 	operator *LoopActionHandlerOperator,
 ) (string, error) {
-	subAgentInput, subAgentRevision := r.prepareSubAgentPrompt()
+	result, err := r.generateLoopPromptFromInput(r.captureLoopPromptBuildInput(
+		nonce, userInput, frozenUserContext, frozenPartitions, memory, operator,
+	))
+	if err != nil {
+		return "", err
+	}
+	return result.Prompt, nil
+}
+
+// Assembly returns the prompt, mode and section snapshot. Once the normal
+// prompt exceeds the limit, it folds redundant history and rebuilds directly in
+// compression mode. Observations are published only for real decision requests.
+func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*LoopPromptAssemblyResult, error) {
+	if input == nil {
+		return nil, utils.Error("loop prompt build input is nil")
+	}
+	nonce, frozenUserContext := input.nonce, input.frozenUserContext
+	frozenPartitions, memory, operator := input.frozenPartitions, input.memory, input.operator
+	subAgentInput := input.subAgentInput
 	var tools []*aitool.Tool
 	if r.toolsGetter == nil {
 		tools = []*aitool.Tool{}
@@ -309,7 +395,7 @@ func (r *ReActLoop) generateLoopPrompt(
 	if persistentProvider != nil {
 		persistent, err = persistentProvider(r, "") // persistent context not use nonce
 		if err != nil {
-			return "", utils.Wrap(err, "build persistent context failed")
+			return nil, utils.Wrap(err, "build persistent context failed")
 		}
 	}
 
@@ -317,7 +403,8 @@ func (r *ReActLoop) generateLoopPrompt(
 	if !r.functionCallMode && r.outputExampleProvider != nil {
 		outputExample, err = r.outputExampleProvider(r, "") // persistent context not use nonce
 		if err != nil {
-			return "", utils.Wrap(err, "build output example failed")
+			log.Warnf("build output example failed; continuing without an output example: %v", err)
+			outputExample = ""
 		}
 	}
 
@@ -325,7 +412,9 @@ func (r *ReActLoop) generateLoopPrompt(
 	if r.reactiveDataBuilder != nil {
 		reactiveData, err = r.reactiveDataBuilder(r, operator.GetFeedback(), nonce)
 		if err != nil {
-			return "", utils.Wrap(err, "build reactive data failed")
+			log.Warnf("build reactive data failed; continuing without it: %v", err)
+			reactiveData = ""
+			err = nil
 		}
 		if reactiveData != "" {
 			utils.Debug(func() {
@@ -338,19 +427,10 @@ func (r *ReActLoop) generateLoopPrompt(
 	// Keep deliveries in the formal dynamic section so prompt analysis and the
 	// model request agree about which evidence belongs to this iteration.
 	reactiveData += subAgentInput
-	todoCheckpoint := r.consumeTodoCheckpoint()
-
-	// Render skills context if the manager is available.
-	// 三态分离: SkillsContext (SemiDynamic 1, 含 catalog) + ForcedSkills (frozen_block
-	// 顶部) + AutoLoadedSkills (SemiDynamic 2 尾部).
-	var skillsContext string
-	var forcedSkillsBlock string
-	var autoSkillsBlock string
-	if r.skillsContextManager != nil {
-		skillsContext = r.skillsContextManager.RenderStable()
-		forcedSkillsBlock = r.skillsContextManager.RenderForcedSkills()
-		autoSkillsBlock = r.skillsContextManager.RenderAutoLoadedSkills()
-	}
+	// Replaceable task-local definitions: never append schemas to feedback or
+	// Timeline, where old loads would survive eviction and accumulate forever.
+	reactiveData += r.renderUIComponents()
+	todoCheckpoint := input.todoCheckpoint
 
 	// Render extra capabilities discovered via intent recognition
 	var extraCapabilities string
@@ -384,28 +464,38 @@ func (r *ReActLoop) generateLoopPrompt(
 	}
 
 	if r.invoker == nil {
-		return "", utils.Error("invoker is nil in ReActLoop.generateLoopPrompt")
+		return nil, utils.Error("invoker is nil in ReActLoop.generateLoopPrompt")
 	}
 
 	// Providers may change the available actions (for example, the last planning
 	// iteration removes exploration tools). Build both protocols only after those
 	// transitions so the emitted schema matches the handlers for this iteration.
-	schema, functionCallSchemas, err := r.prepareLoopActionSchemas(operator)
-	if err != nil {
-		return "", err
+	if input.actionSchemas == nil {
+		text, native, err := r.prepareLoopActionSchemas(operator)
+		if err != nil {
+			return nil, err
+		}
+		input.actionSchemas = &loopPromptActionSchemas{
+			text: text, native: native,
+			nativeActionNames: slices.Clone(r.lastNativeActionNames),
+			nativeTools:       slices.Clone(r.lastNativeTools),
+		}
 	}
+	schema, functionCallSchemas := input.actionSchemas.text, input.actionSchemas.native
+	r.lastNativeActionNames = slices.Clone(input.actionSchemas.nativeActionNames)
+	r.lastNativeTools = slices.Clone(input.actionSchemas.nativeTools)
 	r.lastLoopSchema = schema
-	if err := r.compressTimelineBeforePrompt(userInput, frozenUserContext, todoSnapshot); err != nil {
-		return "", err
-	}
+	r.syncPromptOverflowTimelineLimit()
 	var planStatus string
 	if r.planStatusProvider != nil {
 		planStatus = r.planStatusProvider()
-	} else if provider, ok := r.GetCurrentTask().(aicommon.PlanStatusProvider); ok {
-		planStatus = provider.GetPlanStatusForPrompt()
+	} else if task := r.GetCurrentTask(); task != nil {
+		if provider, ok := task.(aicommon.PlanStatusProvider); ok {
+			planStatus = provider.GetPlanStatusForPrompt()
+		}
 	}
 
-	result, err := r.invoker.AssembleLoopPrompt(tools, &LoopPromptAssemblyInput{
+	assembly := &LoopPromptAssemblyInput{
 		Nonce:                    nonce,
 		FunctionCallMode:         r.functionCallMode,
 		IncludeLatestModelReplay: true,
@@ -416,68 +506,109 @@ func (r *ReActLoop) generateLoopPrompt(
 		OutputExample:            outputExample,
 		Schema:                   schema,
 		FunctionCallSchemas:      functionCallSchemas,
-		SkillsContext:            skillsContext,
-		ForcedSkills:             forcedSkillsBlock,
-		AutoLoadedSkills:         autoSkillsBlock,
 		ExtraCapabilities:        extraCapabilities,
+		AutoContext:              r.renderAsyncExecutionContext(nonce),
 		PlanStatus:               planStatus,
 		TodoSnapshot:             todoSnapshot,
 		ReactiveData:             reactiveData,
 		InjectedMemory:           memory,
 		TodoCheckpoint:           todoCheckpoint,
-	})
-	if err != nil {
-		return "", utils.Wrap(err, "assemble loop prompt failed")
 	}
-	if result == nil {
-		return "", utils.Error("assemble loop prompt returned nil result")
-	}
-	r.commitSubAgentPrompt(subAgentRevision)
-	r.subAgentModelSeen = subAgentRevision
-	// observation（UI 上下文成分面板）是旁路需求，不参与 AI call 主流程。
-	// 同步只写入 PromptTokens 供 verification gate 使用，完整 observation
-	// 构建 + BuildStatus + emit 全部异步执行，不阻塞主循环。
-	// verification gate 的 token 门阈值为 10K/20K 量级，粗估 len/4 即可。
-	_promptTokens := len(result.Prompt) / 4
-	r.SetLastPromptToken(_promptTokens)
-
-	// 异步旁路：构建完整 observation + BuildStatus + emit + debug report
-	_asyncSections := getLoopPromptObservationSections(result)
-	_promptCopy := result.Prompt
-	_loopName := r.loopName
-	_nonce := nonce
-	_debugMode := r.isDebugModeEnabled()
-	_emitter := r.emitter
-	r.observationInflight.Add(1)
-	go func() {
-		defer r.observationInflight.Done()
-		defer func() {
-			if rec := recover(); rec != nil {
-				log.Warnf("async observation build panic recovered: %v", rec)
+	assemble := func() (*LoopPromptAssemblyResult, error) {
+		// Custom assemblers may not report a watermark. Capture a conservative
+		// boundary before rendering so their in-flight writes are still protected.
+		var fallbackThroughID int64
+		var fallbackItemIDs []int64
+		if timeline := timelineFromConfig(r.config); timeline != nil {
+			if assembly.HistoryThroughID != nil {
+				fallbackThroughID, fallbackItemIDs = timeline.CompressionBoundary(*assembly.HistoryThroughID)
+			} else {
+				fallbackThroughID, fallbackItemIDs = timeline.CompressionBoundary()
 			}
-		}()
-		observation := BuildPromptObservation(_loopName, _nonce, _promptCopy, _asyncSections)
-		status := observation.BuildStatus(0)
-		r.SetLastPromptObservation(observation)
-		r.SetLastPromptObservationStatus(status)
-		if _emitter != nil {
-			_emitter.EmitPromptProfile(status)
 		}
-		if _debugMode {
-			log.Infof("prompt section build report:\n%s", observation.RenderCLIReport(120))
+		result, err := r.invoker.AssembleLoopPrompt(tools, assembly)
+		if err != nil {
+			return nil, utils.Wrap(err, "assemble loop prompt failed")
 		}
-	}()
-	return result.Prompt, nil
+		if result == nil {
+			return nil, utils.Error("assemble loop prompt returned nil result")
+		}
+		result.Mode = assembly.PromptMode
+		if result.TimelineThroughID == nil {
+			result.TimelineThroughID = &fallbackThroughID
+		}
+		if result.TimelineItemIDs == nil {
+			result.TimelineItemIDs = fallbackItemIDs
+		}
+		return result, nil
+	}
+	// 先缓存已经成功生成的普通 Prompt；后续压缩任一步失败时直接返回它。
+	var normalResult *LoopPromptAssemblyResult
+	limit := r.wholePromptTokenLimit()
+	normalResult, err = assemble()
+	if err != nil {
+		return nil, err
+	}
+	result := normalResult
+	promptTokens := int64(aicommon.MeasureTokens(result.Prompt))
+
+	// overflowCompression is a provider signal and may use the last fitting
+	// timeline boundary; an ordinary over-limit prompt keeps the full history.
+	if timeline := timelineFromConfig(r.config); timeline != nil &&
+		(input.overflowCompression || promptTokens > limit) {
+		ctx := r.config.GetContext()
+		if task := r.GetCurrentTask(); task != nil && task.GetContext() != nil {
+			ctx = task.GetContext()
+		}
+		target := max(int64(1), limit/6)
+		options := aicommon.TimelineCompressionOptions{
+			Context: ctx, PromptTokens: promptTokens, TargetTokens: target,
+		}
+		if input.overflowCompression && r.lastFittingTimelineThroughID != nil {
+			throughID := *r.lastFittingTimelineThroughID
+			options.ThroughID = &throughID
+			assembly.HistoryThroughID = &throughID
+		}
+		guide, guideErr := timeline.RenderCompressionGuide(options)
+		if guideErr != nil || strings.TrimSpace(guide) == "" {
+			r.recordContextCompressionFailure("rendering the compression guide", guideErr)
+			r.emitContextCompressionUnavailable(promptTokens, limit, guideErr)
+			return r.commitSubAgentPromptAssembly(input, normalResult), nil
+		}
+		instructions, err := aicommon.RenderPromptTemplate("timeline-compression", compressContextDynamicText,
+			map[string]any{"FunctionCallMode": r.functionCallMode})
+		if err != nil {
+			r.recordContextCompressionFailure("rendering the compression instructions", err)
+			r.emitContextCompressionRuntimeWarning("rendering the compression instructions", err)
+			return r.commitSubAgentPromptAssembly(input, normalResult), nil
+		}
+		assembly.PromptMode = aicommon.LoopPromptModeCompressContext
+		assembly.CompressionGuide = strings.TrimSpace(instructions) + "\n\n" + guide
+		result, err = assemble()
+		if err != nil {
+			r.recordContextCompressionFailure("assembling the compression prompt", err)
+			r.emitContextCompressionRuntimeWarning("assembling the compression prompt", err)
+			return r.commitSubAgentPromptAssembly(input, normalResult), nil
+		}
+		compressionPromptLimit := r.contextCompressionPromptTokenLimit()
+		compressionPromptTokens := int64(aicommon.MeasureTokens(result.Prompt))
+		if compressionPromptTokens > compressionPromptLimit {
+			log.Warnf(
+				"context-compression prompt exceeds advisory input budget: actual=%d limit=%d; continuing",
+				compressionPromptTokens, compressionPromptLimit,
+			)
+		}
+	}
+	return r.commitSubAgentPromptAssembly(input, result), nil
 }
 
-func getLoopPromptObservationSections(result *LoopPromptAssemblyResult) []*PromptSectionObservation {
-	if result == nil {
-		return nil
+func (r *ReActLoop) commitSubAgentPromptAssembly(input *loopPromptBuildInput, result *LoopPromptAssemblyResult) *LoopPromptAssemblyResult {
+	r.commitSubAgentPrompt(input.subAgentRevision)
+	r.subAgentModelSeen = input.subAgentRevision
+	if result.Mode != aicommon.LoopPromptModeCompressContext {
+		r.subAgentEvidenceSeen = input.subAgentEvidenceRevision
 	}
-	if sections, ok := result.Sections.([]*PromptSectionObservation); ok {
-		return sections
-	}
-	return nil
+	return result
 }
 
 // syncRecentToolParamAITagFields 给当前 react loop 的 aiTagFields 注册

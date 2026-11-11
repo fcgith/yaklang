@@ -951,8 +951,11 @@ func (y *singleFileBuilder) VisitStatement(raw javaparser.IStatementContext) {
 		}
 
 		loop.SetBody(func() {
-			if block := ret.Block(); block != nil {
-				y.VisitBlock(block)
+			// Java allows a single statement as the do-while body: `do x++;
+			// while (cond);`. Accepting only a block rejected valid sources that
+			// ship inside jars (coremail's weixin.war ZipInputStream.java).
+			if stmt := ret.Statement(); stmt != nil {
+				y.VisitStatement(stmt)
 			}
 		})
 
@@ -1564,6 +1567,10 @@ func (y *singleFileBuilder) VisitSwitchExpression(raw javaparser.ISwitchExpressi
 				switch ret := statement.(type) {
 				case *javaparser.ExpressionStatementContext:
 					return []ssa.Value{y.VisitExpression(ret.Expression())}
+				case *javaparser.SwitchArrowExpressionContext:
+					return []ssa.Value{y.VisitSwitchExpression(ret.SwitchExpression(), true)}
+				case *javaparser.PureSwitchStatementContext:
+					return []ssa.Value{y.switchStatementExpressionValue(ret.SwitchStatement())}
 				}
 			}
 			return nil
@@ -1587,9 +1594,10 @@ func (y *singleFileBuilder) VisitSwitchExpression(raw javaparser.ISwitchExpressi
 			if len(value) > 1 {
 				y.NewError(ssa.Warn, "javaast", "switch as expression can only return one value")
 				return nil
-			} else {
+			} else if len(value) == 1 {
 				return value[0]
 			}
+			return y.EmitConstInstNil()
 		}
 		// 遍历default的switchRuleOutcome的block和blockStatement
 		getDefalutOutCome := func() ssa.Value {
@@ -1635,6 +1643,62 @@ func (y *singleFileBuilder) VisitSwitchExpression(raw javaparser.ISwitchExpressi
 		return nil
 	}
 
+}
+
+// A nested switch used as an arrow outcome is represented by the Java parser
+// as a statement, even though its value becomes the outer switch expression's
+// value. The statement was already emitted by BuildCase; recover that value
+// from the selected rule without re-entering its CFG builder.
+func (y *singleFileBuilder) switchStatementExpressionValue(raw javaparser.ISwitchStatementContext) ssa.Value {
+	stmt, ok := raw.(*javaparser.SwitchStatementContext)
+	if !ok || stmt.ParExpression() == nil {
+		return y.EmitConstInstNil()
+	}
+	condition := y.VisitExpression(stmt.ParExpression().Expression())
+	if condition == nil {
+		return y.EmitConstInstNil()
+	}
+	for _, rawRule := range stmt.AllSwitchLabeledRule() {
+		rule, ok := rawRule.(*javaparser.SwitchLabeledRuleContext)
+		if !ok || rule.ExpressionList() == nil {
+			continue
+		}
+		for _, candidate := range y.VisitExpressionList(rule.ExpressionList()) {
+			if candidate != nil && condition.String() == candidate.String() {
+				return y.switchRuleOutcomeExpressionValue(rule.SwitchRuleOutcome())
+			}
+		}
+	}
+	if rawDefault := stmt.DefaultLabeledRule(); rawDefault != nil {
+		if defaultRule, ok := rawDefault.(*javaparser.DefaultLabeledRuleContext); ok {
+			return y.switchRuleOutcomeExpressionValue(defaultRule.SwitchRuleOutcome())
+		}
+	}
+	return y.EmitConstInstNil()
+}
+
+func (y *singleFileBuilder) switchRuleOutcomeExpressionValue(raw javaparser.ISwitchRuleOutcomeContext) ssa.Value {
+	outcome, ok := raw.(*javaparser.SwitchRuleOutcomeContext)
+	if !ok {
+		return y.EmitConstInstNil()
+	}
+	for _, rawBlock := range outcome.AllBlockStatement() {
+		block, ok := rawBlock.(*javaparser.BlockStatementContext)
+		if !ok || block.Statement() == nil {
+			continue
+		}
+		switch stmt := block.Statement().(type) {
+		case *javaparser.ExpressionStatementContext:
+			return y.VisitExpression(stmt.Expression())
+		case *javaparser.SwitchArrowExpressionContext:
+			return y.VisitSwitchExpression(stmt.SwitchExpression(), true)
+		case *javaparser.PureSwitchStatementContext:
+			return y.switchStatementExpressionValue(stmt.SwitchStatement())
+		case *javaparser.YieldStatementContext:
+			return y.VisitExpression(stmt.Expression())
+		}
+	}
+	return y.EmitConstInstNil()
 }
 
 func (y *singleFileBuilder) VisitGuardedPattern(raw javaparser.IGuardedPatternContext) []ssa.Value {

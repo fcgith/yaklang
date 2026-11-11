@@ -46,6 +46,7 @@ func ReplayPcap(input io.Reader, options ...CaptureOption) error {
 }
 
 func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
+	conf.offlineReplayClock = true
 	if conf.captureBuffer > 0 || conf.BPFFilter != "" || conf.onNetInterfaceCreated != nil || conf.EnableCache || len(conf.DeviceAdapter) != 0 || len(conf.Device) != 0 {
 		return fmt.Errorf("ReplayPcap: BPF, devices, native handle callbacks and capture cache require a native capture")
 	}
@@ -55,7 +56,7 @@ func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
 	if conf.reassemblyOptions.Stream && conf.requiresFullStream {
 		return fmt.Errorf("TCP streaming cannot be combined with built-in HTTP/TLS parsers")
 	}
-	r, err := NewCaptureReader(input)
+	r, err := NewCaptureReaderWithOptions(input, PcapReaderOptions{NormalizeLegacyOriginalLength: conf.normalizePcapLength, IgnoreEmbeddedSecrets: conf.ignoreEmbeddedSecrets})
 	if err != nil {
 		return err
 	}
@@ -77,7 +78,7 @@ func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	conf.Context = ctx
-	pool := newTrafficPool(ctx, conf.reassemblyOptions)
+	pool := newTrafficPool(ctx, conf.tcpPoolOptions())
 	pool.captureAccountingAvailable = true
 	conf.trafficPool, pool.captureConf = pool, conf
 	defer func() {
@@ -127,17 +128,17 @@ func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
 		// gopacket does not invoke a link decoder for an empty record. The
 		// recorded CAN link type still supplies enough context to report the
 		// missing header, including in the observable packet path.
-		if link == 227 && len(raw) == 0 && conf.binParser != nil && len(conf.onEveryPacket) == 0 && conf.Output == nil && !conf.Debug {
+		if link == 227 && len(raw) == 0 && conf.binParser != nil && len(conf.onEveryPacket) == 0 && len(conf.beforeTransportPacket) == 0 && conf.Output == nil && !conf.Debug {
 			conf.binParser.decodeCANRecord(raw, e, ci)
 			continue
 		}
-		if len(conf.onEveryPacket) != 0 || conf.Output != nil || conf.Debug {
-			packet := gopacket.NewPacket(raw, captureLinkDecoder(link), gopacket.DecodeOptions{Lazy: true, NoCopy: false, DecodeStreamsAsDatagrams: conf.binParser == nil})
+		if len(conf.onEveryPacket) != 0 || len(conf.beforeTransportPacket) != 0 || conf.Output != nil || conf.Debug {
+			packet := gopacket.NewPacket(raw, captureLinkDecoder(link), gopacket.DecodeOptions{Lazy: true, NoCopy: false, DecodeStreamsAsDatagrams: conf.binParser == nil && !conf.reassemblyOptions.Stream})
 			packet.Metadata().CaptureInfo = withEvidence(ci, e)
 			conf.packetHandlerWithLink(ctx, packet, link)
 		} else if pool.parallel != nil && !conf.DisableAssembly {
 			if key, ok, err := rawFlowKey(raw, link); err != nil {
-				if conf.binParser != nil {
+				if conf.binParser != nil || conf.transportNormalizer != nil {
 					d.feedWithEvidence(ctx, raw, ci, e)
 				} else {
 					pool.malformedPacket(err.Error())
@@ -145,7 +146,7 @@ func replayWithConfig(input io.Reader, conf *CaptureConfig) (resultErr error) {
 			} else if ok {
 				key.domain = e.Ref.Domain
 				pool.parallel.submit(workerPacket{data: raw, ts: ci.Timestamp, captureLength: ci.CaptureLength, originalLength: ci.Length, link: link, raw: true, key: key, evidence: e})
-			} else if conf.binParser != nil {
+			} else if conf.binParser != nil || conf.transportNormalizer != nil {
 				d.feedWithEvidence(ctx, raw, ci, e) // datagrams; TCP still uses the private worker path
 			}
 		} else {

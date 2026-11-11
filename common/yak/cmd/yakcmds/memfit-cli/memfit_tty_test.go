@@ -17,7 +17,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mattn/go-runewidth"
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/schema"
 	gopty "github.com/yaklang/yaklang/common/utils/pty"
@@ -157,6 +156,30 @@ func TestMemfitTTYCommandsAndErrorRecoverySnapshot(t *testing.T) {
 	h.AssertSnapshot("commands-error-recovery")
 }
 
+func TestMemfitTTYSnapshotWaitsForCompleteFrame(t *testing.T) {
+	t.Setenv("YAK_MEMFIT_UPDATE_TTY_GOLDEN", "")
+	golden, err := os.ReadFile(filepath.Join("testdata", "tty", "commands-error-recovery.golden"))
+	require.NoError(t, err)
+	frame := strings.TrimSuffix(strings.ReplaceAll(string(golden), "\r\n", "\n"), "\n")
+	footer := strings.LastIndex(frame, "\n") + 1
+	h := &memfitTTYHarness{t: t, screen: newMemfitTestScreen(68, 28)}
+	h.screen.Write([]byte(strings.ReplaceAll(frame[:footer], "\n", "\r\n")))
+	require.NotContains(t, h.screen.Snapshot(), "○ Ready")
+
+	// A PTY can deliver the transcript and composer before the final footer.
+	// The snapshot must wait for that remaining output without changing the golden.
+	done := make(chan struct{})
+	t.Cleanup(func() { <-done })
+	go func() {
+		defer close(done)
+		time.Sleep(50 * time.Millisecond)
+		h.mu.Lock()
+		h.screen.Write([]byte(frame[footer:]))
+		h.mu.Unlock()
+	}()
+	h.AssertSnapshot("commands-error-recovery")
+}
+
 func TestMemfitTTYMultilineStreamReturnsToColumnZero(t *testing.T) {
 	h := newMemfitTTYHarness(t, 60, 14)
 	defer h.Close()
@@ -255,7 +278,7 @@ func TestMemfitTTYActivityTimelineExpandsIndividualStreams(t *testing.T) {
 	h.Resize(30, 14)
 	narrow := h.WaitFor("Result:")
 	for _, line := range strings.Split(narrow, "\n") {
-		require.LessOrEqual(t, runewidth.StringWidth(line), 30)
+		require.LessOrEqual(t, memfitStringWidth(line), 30)
 	}
 	require.Contains(t, narrow, "❯")
 	h.AssertSnapshot("activity-narrow-open")
@@ -285,29 +308,28 @@ func TestMemfitTTYComposerCompletionPasteAndHistorySnapshot(t *testing.T) {
 
 	h.WaitFor("❯")
 	h.Write("/mo")
-	h.WaitForScreen("Commands · ↑↓ choose · Tab insert")
-	h.WaitForScreen("/mode yolo")
+	// Completion rows are written before the editor and footer. Wait for the
+	// entire requested frame, even when PTY reads split it across chunks.
+	h.WaitForScreen("Commands · ↑↓ choose · Tab insert", "/mode yolo", "│ ❯ /mo", "click/Ctrl+O details · /help")
 	h.AssertSnapshot("composer-slash-completion")
 	h.Write("\t")
 	h.WaitForScreen("│ ❯ /mode yolo")
 
 	h.Write("\x15@REA")
-	h.WaitForScreen("Files · ↑↓ choose · Tab insert")
-	h.WaitForScreen("@README.md")
+	h.WaitForScreen("Files · ↑↓ choose · Tab insert", "@README.md", "│ ❯ @REA", "click/Ctrl+O details · /help")
 	h.AssertSnapshot("composer-file-completion")
 	h.Write("\t")
 	h.WaitForScreen("│ ❯ @README.md")
 
 	h.Write("\x15\x1b[200~first line\n第二行 🌏\x1b[201~")
-	h.WaitForScreen("│ ❯ first line\n│   第二行 🌏")
+	h.WaitForScreen("│ ❯ first line\n│   第二行 🌏", "click/Ctrl+O details · /help")
 	h.AssertSnapshot("composer-multiline-paste")
 	h.Write("\r")
 	h.WaitFor("Completed")
 	h.WaitForScreen("○ Ready")
 
 	h.Write("\x1b[5~")
-	h.WaitForScreen("╭─ History")
-	h.WaitForScreen("PgDn latest")
+	h.WaitForScreen("╭─ History", "PgDn latest · YOLO")
 	h.AssertSnapshot("conversation-history")
 	h.Write("\x1b[6~")
 	time.Sleep(50 * time.Millisecond)
@@ -652,7 +674,7 @@ func (h *memfitTTYHarness) ClickText(text string) {
 		}
 		if byteIndex := strings.Index(line.String(), text); byteIndex >= 0 {
 			targetRow = row + 1
-			targetColumn = runewidth.StringWidth(line.String()[:byteIndex]) + 1
+			targetColumn = memfitStringWidth(line.String()[:byteIndex]) + 1
 			break
 		}
 	}
@@ -735,7 +757,7 @@ func (h *memfitTTYHarness) WaitFor(want string) string {
 	return ""
 }
 
-func (h *memfitTTYHarness) WaitForScreen(want string) string {
+func (h *memfitTTYHarness) WaitForScreen(wants ...string) string {
 	h.t.Helper()
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
@@ -743,12 +765,19 @@ func (h *memfitTTYHarness) WaitForScreen(want string) string {
 		snapshot := h.screen.Snapshot()
 		raw := h.raw.String()
 		h.mu.Unlock()
-		if strings.Contains(snapshot, want) {
+		matches := true
+		for _, want := range wants {
+			if !strings.Contains(snapshot, want) {
+				matches = false
+				break
+			}
+		}
+		if matches {
 			return snapshot
 		}
 		select {
 		case err := <-h.done:
-			h.t.Fatalf("TTY helper exited while waiting for %q on screen: %v\nraw output:\n%s", want, err, visibleMemfitControlBytes(raw))
+			h.t.Fatalf("TTY helper exited while waiting for %q on screen: %v\nraw output:\n%s", wants, err, visibleMemfitControlBytes(raw))
 		default:
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -757,16 +786,17 @@ func (h *memfitTTYHarness) WaitForScreen(want string) string {
 	snapshot := h.screen.Snapshot()
 	raw := h.raw.String()
 	h.mu.Unlock()
-	h.t.Fatalf("timed out waiting for %q on screen\nscreen:\n%s\nraw output:\n%s", want, snapshot, visibleMemfitControlBytes(raw))
+	h.t.Fatalf("timed out waiting for %q on screen\nscreen:\n%s\nraw output:\n%s", wants, snapshot, visibleMemfitControlBytes(raw))
 	return ""
 }
 
 func (h *memfitTTYHarness) AssertSnapshot(name string) {
 	h.t.Helper()
-	h.mu.Lock()
-	got := h.screen.Snapshot()
-	h.mu.Unlock()
-	assertMemfitTTYGolden(h.t, name, got)
+	assertMemfitTTYGolden(h.t, name, func() string {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.screen.Snapshot()
+	})
 }
 
 func (h *memfitTTYHarness) Raw() string {
@@ -793,9 +823,11 @@ func (h *memfitTTYHarness) Close() {
 	_ = h.pty.Close()
 }
 
-func assertMemfitTTYGolden(t *testing.T, name, got string) {
+func assertMemfitTTYGolden(t *testing.T, name string, snapshot func() string) {
 	t.Helper()
-	got = regexp.MustCompile(`\b\d+(?:\.\d+)?(?:ms|s)\b`).ReplaceAllString(got, "<elapsed>")
+	elapsed := regexp.MustCompile(`\b\d+(?:\.\d+)?(?:ms|s)\b`)
+	readSnapshot := func() string { return elapsed.ReplaceAllString(snapshot(), "<elapsed>") }
+	got := readSnapshot()
 	path := filepath.Join("testdata", "tty", name+".golden")
 	if os.Getenv("YAK_MEMFIT_UPDATE_TTY_GOLDEN") == "1" {
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
@@ -803,8 +835,16 @@ func assertMemfitTTYGolden(t *testing.T, name, got string) {
 	}
 	want, err := os.ReadFile(path)
 	require.NoError(t, err, "run with YAK_MEMFIT_UPDATE_TTY_GOLDEN=1 to create terminal snapshots")
-	wantText := strings.ReplaceAll(string(want), "\r\n", "\n")
-	require.Equal(t, strings.TrimSuffix(wantText, "\n"), got)
+	wantText := strings.TrimSuffix(strings.ReplaceAll(string(want), "\r\n", "\n"), "\n")
+	// Seeing a transcript marker does not mean the PTY has delivered the whole
+	// redraw. Wait for the exact expected screen; a persistent mismatch still
+	// fails below with the full diff, using the same timeout as WaitForScreen.
+	deadline := time.Now().Add(4 * time.Second)
+	for got != wantText && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		got = readSnapshot()
+	}
+	require.Equal(t, wantText, got)
 	if artifactDir := os.Getenv("YAK_MEMFIT_TTY_ARTIFACT_DIR"); artifactDir != "" {
 		require.NoError(t, os.MkdirAll(artifactDir, 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(artifactDir, name+".txt"), []byte(got+"\n"), 0o644))
@@ -816,7 +856,7 @@ func renderMemfitTTYSVG(title, snapshot string) []byte {
 	lines := strings.Split(snapshot, "\n")
 	maxCells := 1
 	for _, line := range lines {
-		maxCells = maxInt(maxCells, runewidth.StringWidth(line))
+		maxCells = maxInt(maxCells, memfitStringWidth(line))
 	}
 	width := maxCells*9 + 40
 	height := len(lines)*20 + 54
@@ -867,6 +907,10 @@ type memfitTestScreen struct {
 	row, col      int
 	cells         [][]string
 	pending       []byte
+	// wrapPending mirrors a real terminal's deferred wrap: after a rune fills
+	// the last column the cursor stays on that row until the next printable
+	// rune or an explicit newline; only then does the wrap actually happen.
+	wrapPending bool
 }
 
 func newMemfitTestScreen(width, height int) *memfitTestScreen {
@@ -894,6 +938,7 @@ func (s *memfitTestScreen) Resize(width, height int) {
 		}
 	}
 	s.width, s.height, s.cells = width, height, next
+	s.wrapPending = false
 	if s.row >= height {
 		s.row = height - 1
 	}
@@ -916,16 +961,19 @@ func (s *memfitTestScreen) Write(input []byte) {
 		switch s.pending[0] {
 		case '\r':
 			s.col = 0
+			s.wrapPending = false
 			s.pending = s.pending[1:]
 			continue
 		case '\n':
 			s.newline()
+			s.wrapPending = false
 			s.pending = s.pending[1:]
 			continue
 		case '\b':
 			if s.col > 0 {
 				s.col--
 			}
+			s.wrapPending = false
 			s.pending = s.pending[1:]
 			continue
 		}
@@ -946,6 +994,18 @@ func (s *memfitTestScreen) consumeEscape(input []byte) (int, bool) {
 	if len(input) < 2 {
 		return 0, false
 	}
+	if input[1] == ']' {
+		// OSC (e.g. the window title ConPTY replays) runs until BEL or ST.
+		for index := 2; index < len(input); index++ {
+			if input[index] == 0x07 {
+				return index + 1, true
+			}
+			if input[index] == 0x1b && index+1 < len(input) && input[index+1] == '\\' {
+				return index + 2, true
+			}
+		}
+		return 0, false
+	}
 	if input[1] != '[' {
 		return 2, true
 	}
@@ -963,31 +1023,47 @@ func (s *memfitTestScreen) consumeEscape(input []byte) (int, bool) {
 func (s *memfitTestScreen) applyCSI(params string, final byte) {
 	switch final {
 	case 'A':
+		s.wrapPending = false
 		amount := parseMemfitCSIAmount(params, 1)
 		s.row -= amount
 		if s.row < 0 {
 			s.row = 0
 		}
 	case 'B':
+		s.wrapPending = false
 		amount := parseMemfitCSIAmount(params, 1)
 		s.row += amount
 		if s.row >= s.height {
 			s.row = s.height - 1
 		}
 	case 'C':
+		s.wrapPending = false
 		amount := parseMemfitCSIAmount(params, 1)
 		s.col += amount
 		if s.col >= s.width {
 			s.col = s.width - 1
 		}
 	case 'D':
+		s.wrapPending = false
 		amount := parseMemfitCSIAmount(params, 1)
 		s.col -= amount
 		if s.col < 0 {
 			s.col = 0
 		}
 	case 'K':
-		if params == "2" || params == "" {
+		// EL: "" and "0" erase from the cursor to the end of the line (the
+		// common \r + ESC[K idiom ConPTY emits mid-line), "1" erases from the
+		// start through the cursor, "2" erases the whole line.
+		switch params {
+		case "", "0":
+			for col := s.col; col < s.width; col++ {
+				s.cells[s.row][col] = ""
+			}
+		case "1":
+			for col := 0; col <= s.col && col < s.width; col++ {
+				s.cells[s.row][col] = ""
+			}
+		case "2":
 			for col := range s.cells[s.row] {
 				s.cells[s.row][col] = ""
 			}
@@ -1001,8 +1077,25 @@ func (s *memfitTestScreen) applyCSI(params string, final byte) {
 			}
 		}
 	case 'H', 'f':
-		if params == "" {
-			s.row, s.col = 0, 0
+		s.wrapPending = false
+		// ConPTY positions the cursor with absolute coordinates
+		// (e.g. \x1b[5;1H) before replaying a frame; go-pty never emitted
+		// these, so honoring them keeps the model in sync with the screen.
+		row, col := 1, 1
+		if params != "" {
+			parts := strings.Split(params, ";")
+			row = parseMemfitCSIAmount(parts[0], 1)
+			if len(parts) > 1 {
+				col = parseMemfitCSIAmount(parts[1], 1)
+			}
+		}
+		s.row = minInt(s.height, row) - 1
+		if s.row < 0 {
+			s.row = 0
+		}
+		s.col = minInt(s.width, col) - 1
+		if s.col < 0 {
+			s.col = 0
 		}
 	}
 }
@@ -1019,12 +1112,17 @@ func parseMemfitCSIAmount(value string, fallback int) int {
 }
 
 func (s *memfitTestScreen) putRune(r rune) {
-	width := runewidth.RuneWidth(r)
+	width := memfitRuneWidth(r)
 	if width <= 0 {
 		if s.col > 0 {
 			s.cells[s.row][s.col-1] += string(r)
 		}
 		return
+	}
+	if s.wrapPending {
+		s.col = 0
+		s.newline()
+		s.wrapPending = false
 	}
 	if s.col+width > s.width {
 		s.col = 0
@@ -1036,8 +1134,12 @@ func (s *memfitTestScreen) putRune(r rune) {
 	}
 	s.col += width
 	if s.col >= s.width {
-		s.col = 0
-		s.newline()
+		// Filling the last column leaves the wrap deferred: Memfit pads
+		// borders and footers to the full width, so wrapping eagerly here
+		// would make a following \r\n advance two rows instead of one and
+		// desynchronize every later row.
+		s.col = s.width - 1
+		s.wrapPending = true
 	}
 }
 

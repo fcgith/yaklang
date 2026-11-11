@@ -24,6 +24,9 @@ const (
 	// transaction + cgo overhead across more rows.
 	largeProjectInstructionSave = 16384
 	largeProjectPersistLimit    = 65536
+	// Estimated persisted string bytes, not RSS. A 16384-row IrCode batch can
+	// materialize a few hundred MiB, so a full row count is not a byte bound.
+	largeProjectInstructionByteBudget = 32 << 20
 	// Auxiliary (index/offset) and type stores share the same rationale: the
 	// per-batch flush owns one SQLite transaction, so larger batches directly
 	// cut transaction count. Bumped from 512/256 to 4096 after the run2 pprof
@@ -37,14 +40,6 @@ const (
 	saveIrCodeInsertBatchSize = 500
 )
 
-var hotInstructionOpcodeBlacklist = map[Opcode]struct{}{
-	SSAOpcodeBasicBlock: {},
-	SSAOpcodeFunction:   {},
-	SSAOpcodeConstInst:  {},
-	SSAOpcodeUndefined:  {},
-	SSAOpcodeMake:       {},
-}
-
 func instructionCacheDebugEnabled() bool {
 	return log.Level >= stdlog.DebugLevel
 }
@@ -55,14 +50,6 @@ func instructionCacheEventDebugEnabled() bool {
 
 func instructionReloadStackDebugEnabled() bool {
 	return os.Getenv("YAK_SSA_IR_CACHE_RELOAD_STACK_DEBUG") != ""
-}
-
-func shouldKeepInstructionResident(inst Instruction) bool {
-	if utils.IsNil(inst) {
-		return false
-	}
-	_, ok := hotInstructionOpcodeBlacklist[inst.GetOpcode()]
-	return ok
 }
 
 func shouldKeepCompileUnitBoundaryResident(inst Instruction) bool {
@@ -78,16 +65,112 @@ func shouldKeepCompileUnitBoundaryResident(inst Instruction) bool {
 		SSAOpcodeExternLib:
 		return true
 	case SSAOpcodeBasicBlock:
-		// BasicBlocks carry the ScopeTable that FunctionBuilder relies on for
-		// CreateVariable/NewParam during lazy/deferred builds. The scope is not
-		// restored when a spilled block is reloaded from DB, so a reloaded block
-		// has a nil ScopeTable and the next NewParam panics (nil Variable). Keep
-		// blocks resident under compile-unit split; they are small (metadata +
-		// scope) compared to the instruction stream that the split path spills.
+		// The cache eviction callback may run on a saver goroutine while a
+		// function is being built. Only the compile-thread flush may decide to
+		// spill a completed private block (see below).
 		return true
 	default:
 		return false
 	}
+}
+
+// The compile-thread flush runs after a function is finished, where its
+// original CFG scopes are no longer needed for later lazy builds. Never use
+// this from the async cache eviction callback: Function.finished is owned by
+// the builder and must not be read concurrently with Finish().
+func canSpillFinishedPrivateBlock(inst Instruction) bool {
+	if utils.IsNil(inst) || inst.GetOpcode() != SSAOpcodeBasicBlock {
+		return false
+	}
+	fn := cachedFinishedFunction(inst)
+	if fn == nil || fn.IsExtern() || isLiveContainerFunction(fn) {
+		return false
+	}
+	// A block whose scope was detached is pure weight: the function keeps the
+	// block id and reloads the object by id.
+	if fn.bodyScopesDetached {
+		return true
+	}
+	// An empty scope pins nothing either, so a private block that still points
+	// at one can leave the resident cache before the scope pass runs. A kept
+	// cross-unit symbol is exempt: a later unit still enters its body, so its
+	// block must stay resident until that unit detaches the scope.
+	if shouldKeepFunctionForCrossUnitReference(fn) {
+		return false
+	}
+	block, ok := ToBasicBlock(inst)
+	if !ok || block == nil || block.ScopeTable == nil {
+		return true
+	}
+	return blockScopeIsEmpty(block.ScopeTable)
+}
+
+// blockScopeIsEmpty reports whether every scope in the chain holds no
+// variable. Reading it is a pure map inspection: the caller decides who owns
+// the block, it does not build or mutate one.
+func blockScopeIsEmpty(scope ScopeIF) bool {
+	for scope != nil {
+		current, ok := scope.(*ScopeInstance)
+		if !ok || current == nil {
+			return false
+		}
+		if len(current.GetAllVariables()) != 0 {
+			return false
+		}
+		scope = current.GetParent()
+	}
+	return true
+}
+
+// A finished function's parameters and parameter members are ID-addressed.
+// Call binding reloads them. Keeping one object per parameter of every
+// exported Go function retains the whole program. Externs and a blueprint
+// container that later batches still emit into stay resident.
+func canSpillFinishedFunctionMember(inst Instruction) bool {
+	if utils.IsNil(inst) {
+		return false
+	}
+	switch inst.GetOpcode() {
+	case SSAOpcodeParameter, SSAOpcodeParameterMember, SSAOpcodeSideEffect:
+	default:
+		return false
+	}
+	fn := cachedFinishedFunction(inst)
+	if fn == nil || fn.IsExtern() || fn.hasPending() || isLiveContainerFunction(fn) {
+		return false
+	}
+	return true
+}
+
+func cachedFinishedFunction(inst Instruction) *Function {
+	cached, ok := inst.(interface{ GetCachedFunc() *Function })
+	if !ok {
+		return nil
+	}
+	fn := cached.GetCachedFunc()
+	if fn == nil || !fn.IsFinished() {
+		return nil
+	}
+	return fn
+}
+
+// skipInstructionEviction reports values the capacity cache must not drop.
+// Functions and basic blocks stay through TTL so a deferred build still has
+// its scope; the unit flush spills finished private blocks itself.
+// Const, undefined and make used to be pinned the same way, and that pin is
+// what kept every unit's values resident until the final close.
+func skipInstructionEviction(inst Instruction, compileUnitSplit bool) bool {
+	if utils.IsNil(inst) || shouldDelayInstructionEviction(inst) {
+		return true
+	}
+	switch inst.GetOpcode() {
+	case SSAOpcodeBasicBlock, SSAOpcodeFunction:
+		return true
+	}
+	if compileUnitSplit && shouldKeepCompileUnitBoundaryResident(inst) && !canSpillFinishedFunctionMember(inst) {
+		return true
+	}
+	return false
 }
 
 func shouldDelayInstructionEviction(inst Instruction) bool {

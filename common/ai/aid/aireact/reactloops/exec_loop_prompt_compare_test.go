@@ -208,7 +208,36 @@ func TestExecLoopPromptCompare_HighStaticProtocol(t *testing.T) {
 	require.Contains(t, functionPrompt, "本轮使用原生 function call")
 	require.Contains(t, functionPrompt, "仅 `adjust_todolist` 工具接收 `arguments.todo_delta`")
 	require.NotContains(t, textPrompt, "`adjust_todolist` 工具")
-	require.Contains(t, functionPrompt, "模型输出的 AITAG 不参与 function call 的 action 解析")
+	require.Contains(t, functionPrompt, "执行所需内容必须完整放在对应调用的 `arguments` 中")
+	require.NotContains(t, functionPrompt, "AITAG")
 	require.NotContains(t, functionPrompt, "caller 每轮给 JSON SCHEMA")
 	require.NotContains(t, functionPrompt, "## NONCE 与 AITAG")
+}
+
+func TestClarificationDisabledDisappearsFromModelPayload(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		cfg := aicommon.NewConfig(context.Background())
+		loop := makeSchemaStabilityTestLoop(cfg)
+		loop.functionCallMode = native
+		loop.invoker = &promptCompareInvoker{MockInvoker: mock.NewMockInvoker(context.Background())}
+		for _, name := range []string{"ask_for_clarification", "ask_for_clarification_async"} {
+			loop.actions.Set(name, &LoopAction{ActionType: name, Description: "ask_SENTINEL", Options: []aitool.ToolOption{aitool.WithStringParam("question_SENTINEL")}})
+		}
+		prompt, err := loop.generateLoopPrompt("enabled", "task", "", nil, "", nil)
+		require.NoError(t, err)
+		require.Contains(t, prompt, "ask_for_clarification")
+		require.NoError(t, aicommon.WithAllowRequireForUserInteract(false)(cfg))
+		prompt, err = loop.generateLoopPrompt("disabled", "task", "", nil, "", nil)
+		require.NoError(t, err)
+		loop.WaitForInflightObservation()
+		for _, hidden := range []string{"ask_for_clarification", "ask_SENTINEL", "question_SENTINEL"} {
+			require.NotContains(t, prompt, hidden)
+		}
+		if native {
+			projected := aiprojection.ProjectAndObserve("disabled", prompt)
+			for _, tool := range projected.Tools {
+				require.NotContains(t, tool.Function.Name, "ask_for_clarification")
+			}
+		}
+	}
 }

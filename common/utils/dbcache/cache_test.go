@@ -14,6 +14,26 @@ import (
 
 type closeFlushItem struct{ id int64 }
 
+func TestResidencyCacheDeleteIfSettled(t *testing.T) {
+	cache := dbcache.NewResidencyCacheWithKey[int, string](0, 0, nil, nil)
+	cache.Set(1, "persisted")
+	require.True(t, cache.DeleteIfSettled(1))
+	_, ok := cache.GetResident(1)
+	require.False(t, ok)
+
+	cache.Set(2, "in-flight")
+	requests := cache.MarkPending([]int{2}, utils.EvictionReasonCapacityReached)
+	require.Len(t, requests, 1)
+	_, ok = cache.SnapshotForPersist(2, requests[0].Generation)
+	require.True(t, ok)
+	require.False(t, cache.DeleteIfSettled(2), "an in-flight update must not be discarded")
+	_, ok = cache.GetResident(2)
+	require.True(t, ok)
+	cache.FinishPersist(2, requests[0].Generation, true)
+	_, ok = cache.GetResident(2)
+	require.False(t, ok)
+}
+
 func (i *closeFlushItem) GetId() int64   { return i.id }
 func (i *closeFlushItem) SetId(id int64) { i.id = id }
 
@@ -60,6 +80,21 @@ func TestResidencyCache(t *testing.T) {
 	loaded, ok := cache.Get(1)
 	require.True(t, ok)
 	require.Equal(t, "1", loaded)
+}
+
+func TestResidencyCache_GetDoesNotCancelFlush(t *testing.T) {
+	cache := dbcache.NewResidencyCacheWithKey[int, string](0, 0, nil, nil)
+	cache.Set(1, "flush-me")
+	requests := cache.MarkPending([]int{1}, utils.EvictionReasonCapacityReached)
+	require.Len(t, requests, 1)
+	_, ok := cache.GetResident(1)
+	require.True(t, ok)
+	value, ok := cache.SnapshotForPersist(1, requests[0].Generation)
+	require.True(t, ok, "a read must not cancel a capacity flush")
+	require.Equal(t, "flush-me", value)
+	cache.FinishPersist(1, requests[0].Generation, true)
+	_, ok = cache.GetResident(1)
+	require.False(t, ok, "a flush queued before the read must still delete the resident entry")
 }
 
 func TestResidencyCache_GetReactivatesPendingEntry(t *testing.T) {

@@ -20,15 +20,15 @@ var ErrSourceRangeAbsent = errors.New("source range is absent")
 type IrOffset struct {
 	gorm.Model
 
-	ProgramName string `json:"program_name" gorm:"index"`
+	ProgramName string `json:"program_name"`
 	// offset
 	FileHash    string `json:"file_hash" gorm:"index"`
-	StartOffset int64  `json:"start_offset" gorm:"index"`
+	StartOffset int64  `json:"start_offset"`
 	EndOffset   int64  `json:"end_offset" gorm:"index"`
 	//variable
 	VariableName string `json:"variable_name" gorm:"index"` // this id set when have variable
 	// value
-	ValueID int64 `json:"value_id" gorm:"index"` // this id will set
+	ValueID int64 `json:"value_id"` // this id will set
 }
 
 func (*IrOffset) TableName() string {
@@ -61,20 +61,42 @@ func SaveIrOffsetBatch(db *gorm.DB, items []*IrOffset) error {
 	if db == nil || len(items) == 0 {
 		return nil
 	}
-	clean := make([]*IrOffset, 0, len(items))
-	for _, it := range items {
-		if it != nil {
-			clean = append(clean, it)
-		}
+	if err := db.CreateInBatches(items, irOffsetBatchChunk).Error; err != nil {
+		return err
 	}
-	if r := db.CreateInBatches(clean, irOffsetBatchChunk); r.Error != nil {
-		return r.Error
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		program := strings.TrimSpace(item.ProgramName)
+		if program == "" {
+			continue
+		}
+		if _, ok := seen[program]; ok {
+			continue
+		}
+		seen[program] = struct{}{}
+		invalidateOffsetCache(program)
 	}
 	return nil
 }
 
 func GetOffsetByVariable(name string, valueID int64, programName string) []*IrOffset {
+	if rows, ok := cachedOffsetsByVariable(programName, name, valueID); ok {
+		return rows
+	}
 	db := GetDB()
+	offsets, err := nativeGetOffsetsByVariable(db, name, valueID, programName)
+	if err == nil {
+		return offsets
+	}
+	if nativeContextErr(err) {
+		// A timed-out read must not restart as an unbounded GORM query.
+		return nil
+	}
+	// Native queries use a fixed column list. Retain the former reader for
+	// legacy schemas/drivers that cannot satisfy it, as with native IR reads.
 	var ir []*IrOffset
 	query := db.Model(&IrOffset{}).Where("variable_name = ? and value_id = ?", name, valueID)
 	if p := strings.TrimSpace(programName); p != "" {
@@ -107,11 +129,11 @@ func (r *IrOffset) GetStartAndEndPositions() (*memedit.MemEditor, *memedit.Posit
 	if err != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions failed: %v", err)
 	}
-	start, startErr := editor.GetPositionByOffsetWithError(int(r.StartOffset))
+	start, startErr := editor.GetSourceBoundaryPosition(int(r.StartOffset))
 	if startErr != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions start: %v", startErr)
 	}
-	end, endErr := editor.GetPositionByOffsetWithError(int(r.EndOffset))
+	end, endErr := editor.GetSourceBoundaryPosition(int(r.EndOffset))
 	if endErr != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions end: %v", endErr)
 	}

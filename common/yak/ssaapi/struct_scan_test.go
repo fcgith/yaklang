@@ -23,6 +23,7 @@ func TestStructOpcodeIndexPreservesUnitBoundary(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, progs, 1)
 	prog := progs[0]
+	index := &structResidentOpcodeIndex{prog: prog.Program}
 	checked := 0
 	seen := map[int64]string{}
 	for _, unit := range prog.Program.CompileUnits {
@@ -43,6 +44,22 @@ func TestStructOpcodeIndexPreservesUnitBoundary(t *testing.T) {
 			}
 			seen[id] = unit.Key
 		}
+		var want []int64
+		for _, inst := range target.matchOpcodes(ssa.SSAOpcodeCall) {
+			if target.bound.Allow(inst) {
+				want = append(want, inst.GetId())
+			}
+		}
+		require.NotEmpty(t, want)
+		target.opcodeIndex = make(map[ssa.Opcode][]ssa.Instruction)
+		target.residentIndex = index
+		for i := 0; i < 3; i++ {
+			var got []int64
+			for _, inst := range target.matchOpcodes(ssa.SSAOpcodeCall, ssa.SSAOpcodeCall) {
+				got = append(got, inst.GetId())
+			}
+			require.ElementsMatch(t, want, got, "reused index must preserve unit filtering and duplicate-opcode semantics")
+		}
 		checked++
 	}
 	require.Equal(t, 2, checked)
@@ -53,7 +70,10 @@ func TestValidRuleModeStructIsNotSSA(t *testing.T) {
 	require.Equal(t, schema.SFR_MODE_SSA, schema.ValidRuleMode("unknown"))
 }
 
-func TestStructRuleRejectedOnBareProgram(t *testing.T) {
+// TestStructRuleRunsOnProgramUnits covers Program.SyntaxFlowRule dispatching a
+// struct rule to the program's own application/library units. A program with
+// no unit is still an error, but it is no longer a mode rejection.
+func TestStructRuleRunsOnProgramUnits(t *testing.T) {
 	prog, err := Parse("a = 1")
 	require.NoError(t, err)
 	rule := &schema.SyntaxFlowRule{
@@ -65,21 +85,27 @@ a as $hit
 alert $hit
 `,
 	}
-	_, err = prog.SyntaxFlowRule(rule)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "QueryWithStruct")
+	res, err := prog.SyntaxFlowRule(rule)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.GreaterOrEqual(t, len(res.GetValues("hit")), 1)
 }
 
-func TestStructRuleContentRejectedWithoutQueryWithStruct(t *testing.T) {
+// TestStructRuleContentDispatchesToProgramUnits covers the content entry: the
+// rule text is compiled first and then dispatched by the compiled frame's mode,
+// so a struct rule runs over the program's units just like the rule-object
+// entry does.
+func TestStructRuleContentDispatchesToProgramUnits(t *testing.T) {
 	prog, err := Parse("a = 1")
 	require.NoError(t, err)
-	_, err = prog.SyntaxFlowWithError(`
+	res, err := prog.SyntaxFlowWithError(`
 desc(mode: "struct")
 a as $hit
 alert $hit
 `)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "struct rule requires QueryWithStruct")
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.GreaterOrEqual(t, len(res.GetValues("hit")), 1)
 }
 
 func TestUnknownRuleModeExecutedAsSSA(t *testing.T) {

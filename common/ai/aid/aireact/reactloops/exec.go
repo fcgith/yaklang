@@ -254,9 +254,6 @@ func inferActionTypeFromPayload(action *aicommon.Action, finalAnswer string) str
 	if hasField("capability_identifier") {
 		return "load_capability"
 	}
-	if hasField("rewrite_user_query_for_knowledge_enhance") {
-		return "knowledge_enhance_answer"
-	}
 	if hasField("blueprint_payload") {
 		return "require_ai_blueprint"
 	}
@@ -277,12 +274,12 @@ func actionTypeResolutionError(requested string, availableActions []string, reas
 	if requested == "" {
 		requested = "<missing>"
 	}
-	return utils.Errorf(
+	return aicommon.NewRecoverableError(utils.Errorf(
 		"action resolution failed: requested=%q; matcher=exact registered action or alias; available_actions=%v; reason=%s",
 		requested,
 		availableActions,
 		reason,
-	)
+	))
 }
 
 func (r *ReActLoop) Execute(taskId string, ctx context.Context, userInput string) error {
@@ -465,7 +462,7 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 				aicommon.WithStatusState(aicommon.StatusStateError),
 			)
 			inv := r.GetInvoker()
-			inv.AddToTimeline("error", fmt.Sprintf("ReActLoop[%v] task init handler execute failed: %v", r.loopName, failErr))
+			r.recordRecoverableTurnError(0, "init", "<init-handler>", failErr)
 			query := "Task initialization failed: " + failErr.Error() + "\n\n Origin INPUT: " + task.GetUserInput() + "\n\n Please give some practical advice for fix this issue or help user"
 			ctx := inv.GetConfig().GetContext()
 			if !utils.IsNil(task.GetContext()) {
@@ -473,10 +470,14 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 			}
 			result, err := inv.DirectlyAnswer(ctx, query, nil)
 			if err != nil {
-				return utils.Errorf("re-act loop [%v] task init handler execute failed: %v; additionally, failed to get direct answer: %v", r.loopName, failErr, err)
+				r.emitRecoveryWarning(fmt.Sprintf(
+					"ReActLoop[%v] init failure advice could not be generated; continuing with initialized state: %v",
+					r.loopName,
+					err,
+				))
+			} else {
+				inv.EmitFileArtifactWithExt("init_error_advice.txt", ".md", result)
 			}
-			inv.EmitFileArtifactWithExt("init_error_advice.txt", ".md", result)
-			return utils.Errorf("re-act loop [%v] task init handler execute failed: %v", r.loopName, failErr)
 		}
 
 		// Continue with normal execution
@@ -632,8 +633,12 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 	defer stopStallHeartbeat()
 
 	needSummary := utils.NewBool(false)
+	lastCompressionTokens := 0
 LOOP:
 	for {
+		if r.handleAsyncDirectAnswerSignal() {
+			continue LOOP
+		}
 		iterationCount++
 		r.currentIterationIndex = iterationCount
 		// 主循环每轮推进一次都给 stall heartbeat 打个 tick, 让心跳协程
@@ -695,7 +700,7 @@ LOOP:
 		// when the current iteration is below GoalMinIterations, causing finish to
 		// be removed from the schema. Idempotent via DisallowNextLoopExit's Once.
 		r.ApplyGoalModeGate(operator, iterationCount)
-		prompt, finalError = r.generateLoopPrompt(
+		buildInput := r.captureLoopPromptBuildInput(
 			nonce,
 			taskInput,
 			frozenUserContext,
@@ -703,59 +708,137 @@ LOOP:
 			r.GetCurrentMemoriesContent(),
 			operator,
 		)
-		if finalError != nil {
-			r.finishIterationLoopWithError(iterationCount, task, finalError)
-			log.Errorf("Failed to generate prompt: %v", finalError)
-			needSummary.SetTo(true)
-			return finalError
-		}
-		// Save prompt to file in debug mode
-		if r.isDebugModeEnabled() {
-			r.savePromptToFile(task, iterationCount, prompt)
-		}
-		// observation 已通过 emitter.EmitPromptProfile 走 prompt_profile 结构化事件
-		// 推送给前端 "上下文成分" 面板, 不再落盘 ASCII 副本以避免污染 task 目录.
-		// 关键词: prompt observation 不再落盘, EmitPromptProfile 现役路径
-
-		streamWg := new(sync.WaitGroup)
-		/* Generate AI Action */
-		loopCalls, stopReason, resultDescriptor, transactionErr := r.callAILoopTransaction(
-			streamWg, prompt, nonce, operator,
-			r.emitLoopGeneralOutput, r.emitLoopFunctionCallOutput,
+		var (
+			assembled        *LoopPromptAssemblyResult
+			loopCalls        []LoopCall
+			stopReason       LoopStopReason
+			resultDescriptor *LoopResultDescriptor
+			transactionErr   error
+			lastPromptTokens int
 		)
-		if resultDescriptor != nil {
-			log.Debugf("AI loop transaction stop=%s provider_finish=%q", stopReason, resultDescriptor.Snapshot().ProviderFinishReason)
+		retryMax := r.promptOverflowRetryMax()
+		for attempt := 0; ; attempt++ {
+			var promptErr error
+			assembled, promptErr = r.generateLoopPromptFromInput(buildInput)
+			if promptErr != nil {
+				r.finishIterationLoopWithError(iterationCount, task, promptErr)
+				log.Errorf("Failed to generate prompt: %v", promptErr)
+				needSummary.SetTo(true)
+				return promptErr
+			}
+			prompt = assembled.Prompt
+			aicommon.RecordTaskTrajectoryPrompt(task, prompt)
+			r.promptMode = assembled.Mode
+			r.requestTimelineThroughID = assembled.TimelineThroughID
+			r.requestTimelineItemIDs = assembled.TimelineItemIDs
+			tokens := aicommon.MeasureTokens(prompt)
+			if r.promptMode == aicommon.LoopPromptModeCompressContext {
+				r.noteCompressionStatus()
+			}
+			if r.promptMode == aicommon.LoopPromptModeCompressContext && lastCompressionTokens > 0 && tokens >= lastCompressionTokens*99/100 {
+				r.emitContextCompressionNoProgress(lastCompressionTokens, tokens)
+			}
+			if r.promptMode == aicommon.LoopPromptModeNormal && transactionErr != nil && aicommon.IsPromptTooLong(transactionErr) && tokens >= lastPromptTokens*99/100 {
+				// 这里只结束本轮的 Prompt 重建重试，不退出主 LOOP。
+				// transactionErr 会走下面的统一恢复分支写入 Timeline，然后 continue LOOP。
+				log.Warnf(
+					"prompt overflow retry made no measurable progress (%d >= %d); recording a recoverable error and continuing the outer loop",
+					tokens, lastPromptTokens*99/100,
+				)
+				break
+			}
+			lastPromptTokens = tokens
+			if r.isDebugModeEnabled() {
+				r.savePromptToFile(task, iterationCount, prompt)
+			}
+			if r.promptMode == aicommon.LoopPromptModeNormal {
+				r.publishPromptObservation(nonce, assembled, tokens)
+			}
+			streamWg := new(sync.WaitGroup)
+			loopCalls, stopReason, resultDescriptor, transactionErr = r.callAILoopTransaction(
+				streamWg, prompt, nonce, operator, r.emitLoopGeneralOutput, r.emitLoopFunctionCallOutput,
+			)
+			if resultDescriptor != nil {
+				log.Debugf("AI loop transaction stop=%s provider_finish=%q", stopReason, resultDescriptor.Snapshot().ProviderFinishReason)
+			}
+			streamWg.Wait()
+			if transactionErr == nil {
+				r.noteFittingTimelineThroughID(assembled.TimelineThroughID)
+				break
+			}
+			if !aicommon.IsPromptTooLong(transactionErr) || buildInput.overflowCompression {
+				break
+			}
+			if r.lastFittingTimelineThroughID != nil {
+				buildInput.overflowCompression = true
+				log.Warnf("prompt overflow detected; compressing through the last fitting timeline boundary")
+				continue
+			}
+			if attempt >= retryMax || !r.reduceTimelineLimitForPromptOverflow(transactionErr, prompt) {
+				break
+			}
+			log.Warnf("prompt overflow detected; rebuilding the context (retry %d/%d)", attempt+1, retryMax)
 		}
-		streamWg.Wait()
 		iterationModelThinking := strings.TrimSpace(r.takeModelThinkingForTimeline())
-		if transactionErr != nil {
-			r.recordModelThinkingTimeline(iterationModelThinking, "", nonce, false)
-			r.finishIterationLoopWithError(iterationCount, task, transactionErr)
-			log.Errorf("Failed to execute loop: %v", transactionErr)
-			needSummary.SetTo(true)
-			return transactionErr
+
+		// 无条件整理响应形态。这里只做派生，不产生错误，后续校验会复用结果。
+		compressionOnly := len(loopCalls) == 1 && isContextCompressionCall(loopCalls[0])
+		turnErr := transactionErr
+		var eventSink loopActionEventSink
+
+		// 需要判断错误的模型响应校验。任一校验失败都写入 turnErr，最后统一处理。
+		if turnErr == nil && r.promptMode == aicommon.LoopPromptModeCompressContext && !compressionOnly {
+			turnErr = aicommon.NewRecoverableError(utils.Error(
+				"context-compression mode requires exactly one compress_context action",
+			))
 		}
-		if len(loopCalls) == 0 {
-			r.recordModelThinkingTimeline(iterationModelThinking, "", nonce, false)
-			finalError = utils.Error("AI loop returned no actions")
-			r.finishIterationLoopWithError(iterationCount, task, finalError)
-			needSummary.SetTo(true)
-			return finalError
+		if turnErr == nil && len(loopCalls) == 0 {
+			turnErr = aicommon.NewRecoverableError(utils.Error("AI loop returned no actions"))
 		}
 
-		// A native tool-call response needs one assistant plus every matching tool
-		// acknowledgement before any action writes to the timeline. Execution below
-		// is the same for both response formats.
-		var eventSink loopActionEventSink
-		if stopReason == LoopStopToolCalls {
+		// 执行前需要判断错误的协议准备，例如 function-call 回放记录。
+		if turnErr == nil && r.promptMode == aicommon.LoopPromptModeNormal &&
+			!compressionOnly && stopReason == LoopStopToolCalls {
 			if err := r.appendFunctionCallActionResponse(loopCalls, resultDescriptor); err != nil {
 				r.clearCallsExecutionValues(loopCalls)
-				r.finishIterationLoopWithError(iterationCount, task, err)
-				needSummary.SetTo(true)
-				return err
+				turnErr = aicommon.NewRecoverableError(err)
+			} else {
+				eventSink = r.appendFunctionCallActionEvent
 			}
-			eventSink = r.appendFunctionCallActionEvent
-		} else {
+		}
+		if turnErr == nil {
+			for i := range loopCalls {
+				if !isContextCompressionCall(loopCalls[i]) {
+					continue
+				}
+				if resultDescriptor == nil {
+					turnErr = aicommon.NewRecoverableError(
+						utils.Error("context compression requires a result descriptor"),
+					)
+					break
+				}
+				loopCalls[i].trajectoryResponse = resultDescriptor.onTrajectoryResponse
+			}
+		}
+
+		// Prompt 已成功构建后，除取消控制信号外，所有错误都写入 Timeline 后继续。
+		if turnErr != nil {
+			r.recordModelThinkingTimeline(iterationModelThinking, "", nonce, false)
+			if isLoopControlTermination(turnErr) || task.GetContext().Err() != nil {
+				r.finishIterationLoopWithError(iterationCount, task, turnErr)
+				return turnErr
+			}
+			phase, action := "execute_ai_output", "<model-response>"
+			if transactionErr != nil {
+				phase, action = "request_ai", "<ai-request>"
+			}
+			r.recordRecoverableTurnError(iterationCount, phase, action, turnErr)
+			continue LOOP
+		}
+
+		// 文本协议校验通过后，再记录本轮 reasoning 和 decision。
+		// 无效输出不能被记录成已经接受的工作。
+		if r.promptMode == aicommon.LoopPromptModeNormal && !compressionOnly && stopReason != LoopStopToolCalls {
 			decision := r.Get("last_ai_decision_response")
 			if loopCalls[0].Action == nil {
 				decision = ""
@@ -764,25 +847,44 @@ LOOP:
 		}
 
 		batch := r.execCalls(loopCalls, iterationCount, task, prompt, done, eventSink)
+		// A maintenance action does not consume the preceding business action's
+		// next-action constraints, including while a rejected selection is retried.
+		if len(loopCalls) == 1 && isContextCompressionCall(loopCalls[0]) {
+			batch.operator.nextActionMustUse = append(batch.operator.nextActionMustUse, operator.GetNextActionMustUse()...)
+			batch.operator.nextActionDisabled = append(batch.operator.nextActionDisabled, operator.GetNextActionDisabled()...)
+			if operator.GetDisallowLoopExit() {
+				batch.operator.DisallowNextLoopExit()
+			}
+		}
 		operator = batch.operator
+		if operator == nil {
+			operator = newLoopActionHandlerOperator(task)
+		}
+		if batch.result == loopActionsRecover {
+			continue LOOP
+		}
 		if batch.err != nil || batch.result == loopActionsError {
 			finalError = batch.err
 			if finalError == nil {
 				finalError = utils.Error("action batch failed")
 			}
-			if !batch.skipErrorFinalization {
+			if isLoopControlTermination(finalError) || task.GetContext().Err() != nil {
 				r.finishIterationLoopWithError(iterationCount, task, finalError)
+				return finalError
 			}
-			if !batch.skipErrorSummary {
-				needSummary.SetTo(true)
-			}
-			return finalError
+			r.recordRecoverableTurnError(iterationCount, "execute_ai_output", "<action-batch>", finalError)
+			continue LOOP
+		}
+		if r.promptMode == aicommon.LoopPromptModeCompressContext {
+			lastCompressionTokens = aicommon.MeasureTokens(prompt)
+		} else {
+			lastCompressionTokens = 0
 		}
 		if batch.result == loopActionsExit || batch.result == loopActionsAsync {
 			r.finishIterationLoopWithError(iterationCount, task, nil)
 			return nil
 		}
-		if batch.skipPostIteration {
+		if batch.skipPostIteration || r.promptMode == aicommon.LoopPromptModeCompressContext {
 			continue LOOP
 		}
 		postOp := r.doneCurrentIteration(iterationCount, task)
@@ -830,7 +932,17 @@ func (r *ReActLoop) callOnPostIteration(current int, task aicommon.AIStatefulTas
 	// Phase 1: Run all registered callbacks in order.
 	// Callbacks may set flags (e.g. IgnoreError()) and register deferred functions.
 	for _, fn := range r.onPostIteration {
-		fn(r, current, task, isDone, reason, operator)
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					r.emitRecoveryWarning(fmt.Sprintf(
+						"post-iteration callback panicked and was skipped: %v",
+						recovered,
+					))
+				}
+			}()
+			fn(r, current, task, isDone, reason, operator)
+		}()
 	}
 	// Phase 2: Run deferred functions after ALL callbacks have completed.
 	// This ensures deferred logic can safely check the final operator state

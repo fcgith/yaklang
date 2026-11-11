@@ -39,6 +39,83 @@ type typePersistenceSnapshot struct {
 	container       int64
 }
 
+// typePersistIdentity is the map-cache key for one type. Fields are the
+// persisted inputs that can change without a full snapshot: name-pool
+// identity, full-name generation, and blueprint links. Types whose String()
+// walks a structural graph stay uncached and take the snapshot path.
+type typePersistIdentity struct {
+	namesGen, relationGen uint64
+	container             int64
+	// relationIDs covers the ids of the parent/interface blueprints. They are
+	// part of the persisted body, so a blueprint that only receives its id
+	// after the child row was written must invalidate this key too.
+	relationIDs     uint64
+	kind, extraKind int
+	name, extra     string
+}
+
+// blueprintRelationIDs mixes the ids of the blueprints a class points at. The
+// order participates so a reordering is not mistaken for no change.
+func blueprintRelationIDs(t *Blueprint) uint64 {
+	const (
+		offset64 uint64 = 14695981039346656037
+		prime64  uint64 = 1099511628211
+	)
+	h := offset64
+	for _, p := range t.ParentBlueprints {
+		if p == nil {
+			continue
+		}
+		h = (h ^ uint64(p.GetId())) * prime64
+	}
+	h = (h ^ 0x9e3779b97f4a7c15) * prime64
+	for _, p := range t.InterfaceBlueprints {
+		if p == nil {
+			continue
+		}
+		h = (h ^ uint64(p.GetId())) * prime64
+	}
+	return h
+}
+
+func typePersistIdentityOf(typ Type) (typePersistIdentity, bool) {
+	if utils.IsNil(typ) {
+		return typePersistIdentity{}, false
+	}
+	switch t := typ.(type) {
+	case *BasicType:
+		name := ""
+		if t.description != nil {
+			name = t.description.name
+		}
+		return typePersistIdentity{
+			namesGen: t.fullTypeName.generation(), kind: int(t.GetTypeKind()), extraKind: int(t.Kind), name: name,
+		}, true
+	case *ObjectType:
+		if t.Name == "" || t.Combination {
+			return typePersistIdentity{}, false
+		}
+		return typePersistIdentity{namesGen: t.fullTypeName.generation(), kind: int(t.GetTypeKind()), name: t.Name}, true
+	case *FunctionType:
+		if t.Name == "" {
+			return typePersistIdentity{}, false
+		}
+		return typePersistIdentity{namesGen: t.fullTypeName.generation(), kind: int(t.GetTypeKind()), name: t.Name}, true
+	case *Blueprint:
+		container := int64(-1)
+		if c := t.Container(); !utils.IsNil(c) {
+			container = c.GetId()
+		}
+		return typePersistIdentity{
+			namesGen: t.fullTypeName.generation(), relationGen: t.relationGen.Load(), container: container,
+			relationIDs: blueprintRelationIDs(t),
+			kind:        int(t.GetTypeKind()), name: t.Name, extra: string(t.Kind),
+		}, true
+	default:
+		return typePersistIdentity{}, false
+	}
+}
+
 func snapshotTypePersistence(typ Type) typePersistenceSnapshot {
 	s := typePersistenceSnapshot{id: typ.GetId(), kind: int(typ.GetTypeKind()), text: typ.String(), fullNames: typ.GetFullTypeNames()}
 	switch t := typ.(type) {
@@ -47,7 +124,7 @@ func snapshotTypePersistence(typ Type) typePersistenceSnapshot {
 	case *ObjectType:
 		s.shape, s.name = typePersistenceNamed, t.Name
 	case *BasicType:
-		s.shape, s.name, s.extraKind = typePersistenceBasic, t.name, int(t.Kind)
+		s.shape, s.name, s.extraKind = typePersistenceBasic, t.GetName(), int(t.Kind)
 	case *Blueprint:
 		s.shape, s.name, s.blueprintKind = typePersistenceBlueprint, t.Name, string(t.Kind)
 		for _, p := range t.ParentBlueprints {
@@ -121,40 +198,67 @@ func (s typePersistenceSnapshot) writeTo(ir *ssadb.IrType) {
 	irTypeJSONBufPool.Put(buf)
 }
 
-func marshalTypeSnapshots(program string, snapshots []typePersistenceSnapshot, concurrency int) []*ssadb.IrType {
+func marshalTypeSnapshots(program string, snapshots []typePersistenceSnapshot, fingerprints [][sha256.Size]byte, concurrency int) []*ssadb.IrType {
 	rows := make([]*ssadb.IrType, len(snapshots))
+	if len(snapshots) == 0 {
+		return rows
+	}
+	if len(fingerprints) != len(snapshots) {
+		fingerprints = make([][sha256.Size]byte, len(snapshots))
+		for i := range snapshots {
+			fingerprints[i] = snapshots[i].fingerprint()
+		}
+	}
+	// Same persisted payload can belong to different Type IDs. Encode it once
+	// and copy the immutable strings. Do not alias the row structs or change IDs.
+	first := make(map[[sha256.Size]byte]int, len(snapshots))
+	unique := make([]int, 0, len(snapshots))
+	for i, fp := range fingerprints {
+		if _, ok := first[fp]; ok {
+			continue
+		}
+		first[fp] = i
+		unique = append(unique, i)
+	}
 	if concurrency <= 0 {
 		concurrency = ssaconfig.DefaultCPUConcurrency()
 	}
-	// Small updates do not benefit from launching workers. Large updates use
-	// the configured CPU budget, with no fixed eight-core cap. Only this save
-	// batch is materialized; SQLite writes remain on the caller goroutine.
-	workers := min(concurrency, (len(snapshots)+63)/64)
+	workers := min(concurrency, (len(unique)+63)/64)
 	encode := func(i int) {
 		rows[i] = ssadb.EmptyIrType(program, uint64(snapshots[i].id))
 		snapshots[i].writeTo(rows[i])
 	}
 	if workers <= 1 {
-		for i := range snapshots {
+		for _, i := range unique {
 			encode(i)
 		}
-		return rows
-	}
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for {
-				i := int(next.Add(1) - 1)
-				if i >= len(snapshots) {
-					return
+	} else {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for range workers {
+			go func() {
+				defer wg.Done()
+				for {
+					n := int(next.Add(1) - 1)
+					if n >= len(unique) {
+						return
+					}
+					encode(unique[n])
 				}
-				encode(i)
-			}
-		}()
+			}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
+	for i, fp := range fingerprints {
+		src := first[fp]
+		if src == i {
+			continue
+		}
+		encoded := rows[src]
+		row := ssadb.EmptyIrType(program, uint64(snapshots[i].id))
+		row.Kind, row.String, row.ExtraInformation = encoded.Kind, encoded.String, encoded.ExtraInformation
+		rows[i] = row
+	}
 	return rows
 }

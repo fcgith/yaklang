@@ -13,10 +13,13 @@ type LoopActionHandlerFunc func(loop *ReActLoop, action *aicommon.Action, operat
 
 type LoopAction struct {
 	// plan 与 forge executor 会允许支持异步执行，异步情况下仍然允许对话和其他功能
-	AsyncMode   bool
-	ActionType  string `json:"type"`
-	Description string `json:"description"`
-	Options     []aitool.ToolOption
+	AsyncMode  bool
+	ActionType string `json:"type"`
+	// SourceToolName identifies an intentional projection of a business tool.
+	// Custom actions must not borrow a tool's name for unrelated behavior.
+	SourceToolName string `json:"-"`
+	Description    string `json:"description"`
+	Options        []aitool.ToolOption
 	// Display names are UI metadata; they never enter model prompts or schemas.
 	VerboseNameI18n *schema.I18n `json:"-"`
 	// NativeDescription and NativeOptions replace text-output instructions when
@@ -27,13 +30,14 @@ type LoopAction struct {
 	// NativeOnlyOptions omits common action metadata fields from a dedicated
 	// provider tool whose name already identifies its purpose.
 	NativeOnlyOptions bool `json:"-"`
-	// FunctionCallAction is a static protocol variant, selected only by loops
-	// that explicitly opt into native action behavior (not merely native tools).
+	// FunctionCallAction is the static protocol variant used by native loops.
 	FunctionCallAction *LoopAction `json:"-"`
-	ActionVerifier     LoopActionVerifierFunc
-	ActionHandler      LoopActionHandlerFunc
-	StreamFields       []*LoopStreamField
-	AITagStreamFields  []*LoopAITagField
+	// Rich question contract selected only for clients advertising question support.
+	ClientQuestionsAction *LoopAction `json:"-"`
+	ActionVerifier        LoopActionVerifierFunc
+	ActionHandler         LoopActionHandlerFunc
+	StreamFields          []*LoopStreamField
+	AITagStreamFields     []*LoopAITagField
 
 	// OutputExamples provides usage examples for this action, describing when and how to use it.
 	// This field helps AI understand the appropriate scenarios for selecting this action.

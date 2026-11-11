@@ -3,6 +3,7 @@ package pcaputil
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
+	"github.com/yaklang/yaklang/common/bin-parser/parser/stream_parser"
 )
 
 type fragmentKey struct {
@@ -22,9 +24,11 @@ type fragmentKey struct {
 	v6       bool
 }
 type ipFragment struct {
-	start int
-	data  []byte
-	ref   PacketReference
+	parents []uint64
+	start   int
+	data    []byte
+	refs    []PacketReference
+	more    bool
 }
 type fragmentSet struct {
 	parts    []ipFragment
@@ -35,15 +39,387 @@ type fragmentSet struct {
 	rejected bool
 }
 type fragmentStore struct {
-	mu           sync.Mutex
-	sets         map[fragmentKey]*fragmentSet
-	clock        time.Time
-	blockedUntil time.Time
+	mu            sync.Mutex
+	sets          map[fragmentKey]*fragmentSet
+	blocked       bool
+	blockedDomain CaptureDomain
+	blockedUntil  time.Time
+}
+
+func networkCarrierProfile(p gopacket.Packet) (inner gopacket.NetworkLayer, networks, tunnels int, unsupported bool) {
+	return networkCarrierProfileUntil(p, nil)
+}
+
+func unselectedEtherIPLayer(layer gopacket.Layer) bool {
+	switch v := layer.(type) {
+	case *layers.IPv4:
+		return v.Version == 4 && v.Protocol == layers.IPProtocol(97) && v.FragOffset == 0 && v.Flags&layers.IPv4MoreFragments == 0
+	case *layers.IPv6:
+		return v.Version == 6 && v.NextHeader == layers.IPProtocol(97)
+	case *layers.EtherIP:
+		return true // Also covers EtherIP after an IPv6 extension header.
+	}
+	return false
+}
+
+func hasUnselectedEtherIP(p gopacket.Packet) bool {
+	for _, layer := range p.Layers() {
+		if unselectedEtherIPLayer(layer) {
+			return true
+		}
+	}
+	return false
+}
+
+// selectedGeneve is shared by native admission and capture-domain projection.
+// Only the existing option-free version-zero Ethernet data profile owns children.
+func selectedGeneve(v *layers.Geneve) bool {
+	if v == nil {
+		return false
+	}
+	h := v.LayerContents()
+	return len(h) == 8 && h[0] == 0 && h[1] == 0 && h[7] == 0 && v.Protocol == layers.EthernetTypeTransparentEthernetBridging
+}
+
+func networkCarrierProfileUntil(p gopacket.Packet, stop gopacket.Layer) (inner gopacket.NetworkLayer, networks, tunnels int, unsupported bool) {
+	for _, l := range p.Layers() {
+		if stop != nil && l == stop {
+			break
+		}
+		if n, ok := l.(gopacket.NetworkLayer); ok {
+			inner = n
+			networks++
+		}
+		// ARP has no NetworkLayer; counting inner IP layers cannot gate it.
+		unsupported = unsupported || unselectedEtherIPLayer(l)
+		switch v := l.(type) {
+		case *capturePIM:
+			if v.Type == 1 && !v.NullRegister {
+				tunnels++
+			}
+		case *layers.GRE:
+			// ACK-only PPTP has no child network to normalize. Counting it
+			// as another network tunnel would reject a valid terminal header.
+			if !selectedPPTPGRE(v) || len(v.LayerPayload()) != 0 {
+				tunnels++
+			}
+			// Version zero and the legacy PPTP version-one decoder have
+			// distinct existing layouts. Other version bits cannot select an
+			// inner grammar merely because Protocol Type resembles an EtherType.
+			if v.Version > 1 || v.Version == 1 && !selectedPPTPGRE(v) {
+				unsupported = true
+			}
+		case *layers.VXLAN:
+			tunnels++
+			if !selectedVXLAN(v) {
+				unsupported = true
+			}
+		case *captureVXLANGPE:
+			tunnels++
+			unsupported = true // only its complete header is observed
+		case *layers.Geneve:
+			tunnels++
+			// Only option-free v0 Ethernet data is selected for normalization.
+			if !selectedGeneve(v) {
+				unsupported = true
+			}
+		case *layers.IPv4:
+			if v.Version == 4 && v.Protocol == layers.IPProtocolIPv6HopByHop && v.FragOffset == 0 && v.Flags&layers.IPv4MoreFragments == 0 {
+				// IPv4 HOPOPT is an unselected carrier profile. Its typed
+				// standalone-HBH refusal must not elevate any child identity or
+				// advance fragment/session clocks before this existing gate.
+				// Failed IPv4 decodes leave Protocol at its zero default; only a
+				// successfully validated IPv4 may select this parent policy.
+				unsupported = true
+			}
+			if v.FragOffset == 0 && v.Flags&layers.IPv4MoreFragments == 0 && (v.Protocol == layers.IPProtocolIPv4 || v.Protocol == layers.IPProtocolIPv6) {
+				tunnels++
+			}
+		case *layers.IPv6:
+			if v.NextHeader == layers.IPProtocolIPv4 || v.NextHeader == layers.IPProtocolIPv6 {
+				tunnels++
+			}
+		}
+	}
+	return
+}
+
+func selectedVXLANEnclosingParent(p gopacket.Packet, layer gopacket.Layer, normalized int) bool {
+	found := false
+	for _, candidate := range p.Layers() {
+		if candidate == layer {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	_, networks, tunnels, unsupported := networkCarrierProfileUntil(p, layer)
+	return !unsupported && tunnels+normalized+1 <= 4 && (networks <= 1 || tunnels > 0 && networks == tunnels+1)
+}
+
+func (a *binParser) refuseVXLANHeader(p gopacket.Packet, e captureEvidence, ci gopacket.CaptureInfo, failure *vxlanHeaderError) {
+	fields := map[string]any{"Observed Header Layers": outerNetworkHeaderNames(p), "Header Observation Scope": "outer network prefix only", "Child Header Identity": "unconfirmed", "Encapsulation Admission": "unselected profile", "Unselected Carrier": "VXLAN", "Parent Admission Reason": failure.reason, "Available VXLAN Bytes": failure.available, "Required VXLAN Header Bytes": 8, "Reserved Receive Rule": "ignored per RFC 7348"}
+	h := failure.layer.LayerContents()
+	if len(h) > 0 {
+		fields["Observed VXLAN Flags"], fields["VXLAN I Bit"] = h[0], failure.layer.ValidIDFlag
+	}
+	if len(h) >= 7 {
+		fields["Observed VXLAN VNI"] = failure.layer.VNI
+	}
+	if failure.truncated {
+		if failure.innerTruncated {
+			fields["Header Observation Scope"] = "validated VXLAN fixed header; incomplete Ethernet child prefix"
+			fields["Available Ethernet Header Bytes"] = len(failure.layer.LayerPayload())
+			fields["Required Ethernet Header Bytes"] = 14
+		} else {
+			fields["VXLAN Header Truncated"] = true
+		}
+	}
+	a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Profile: "network-encapsulation-refusal", Domain: e.Ref.Domain, Status: "limited", Completeness: "limited", ExpertCode: "VXLANHeaderAdmission", Error: failure.Error(), Summary: failure.Error() + "; inner identity unconfirmed", Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
+}
+
+func (a *binParser) observeVXLANGPEHeader(p gopacket.Packet, e captureEvidence, ci gopacket.CaptureInfo, layer *captureVXLANGPE) {
+	h := layer.LayerContents()
+	vni := uint32(h[4])<<16 | uint32(h[5])<<8 | uint32(h[6])
+	fields := map[string]any{"Observed Header Layers": outerNetworkHeaderNames(p), "Header Observation Scope": "validated VXLAN-GPE v0 header only", "Child Header Identity": "unconfirmed", "Encapsulation Admission": "unselected payload profile", "Unselected Carrier": "VXLAN-GPE", "VXLAN-GPE Version": uint8(0), "VXLAN-GPE Flags": h[0], "VXLAN-GPE VNI": vni, "VXLAN-GPE Next Protocol Present": h[0]&4 != 0, "VXLAN-GPE Next Protocol": h[3], "VXLAN-GPE OAM": h[0]&1 != 0, "VXLAN-GPE Replicated BUM": h[0]&2 != 0, "Reserved Receive Rule": "ignored", "Payload Profile Implemented": false}
+	summary := fmt.Sprintf("VXLAN-GPE v0 header VNI=%d next=%d; payload profile not selected; inner identity unconfirmed", vni, h[3])
+	a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Profile: "network-encapsulation-refusal", Domain: e.Ref.Domain, Status: "limited", Completeness: "headers", ExpertCode: "VXLANProfileUnselected", Summary: summary, Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
+}
+
+func outerNetworkHeaderNames(p gopacket.Packet) []string {
+	e := evidenceFrom(p.Metadata().CaptureInfo)
+	names := make([]string, 0, len(e.networkPrefix)+8)
+	for _, typ := range e.networkPrefix {
+		names = append(names, typ.String())
+	}
+	for _, layer := range p.Layers() {
+		if layer.LayerType() == gopacket.LayerTypeDecodeFailure || layer.LayerType() == gopacket.LayerTypePayload {
+			break
+		}
+		if len(names) >= maxCaptureTransportLayers {
+			return nil
+		}
+		names = append(names, layer.LayerType().String())
+		if _, network := layer.(gopacket.NetworkLayer); network {
+			break
+		}
+	}
+	return names
+}
+
+func (a *binParser) refuseUnselectedNetworkParent(p gopacket.Packet, e captureEvidence, ci gopacket.CaptureInfo) {
+	names := outerNetworkHeaderNames(p)
+	fields := map[string]any{"Observed Header Layers": names, "Header Observation Scope": "outer network prefix only", "Child Header Identity": "unconfirmed", "Encapsulation Admission": "unselected profile"}
+	summary := "Encapsulation profile unavailable; inner identity unconfirmed"
+	// Report a literal GRE version only directly after the observed outer IP.
+	// A child behind some other unselected parent has no admitted GRE identity.
+	network := p.NetworkLayer()
+	directGRE := false
+	switch ip := network.(type) {
+	case *layers.IPv4:
+		directGRE = ip.Protocol == layers.IPProtocolGRE
+	case *layers.IPv6:
+		directGRE = ip.NextHeader == layers.IPProtocolGRE
+	}
+	if directGRE && e.normalizedTunnels < 4 {
+		afterNetwork := false
+		for _, layer := range p.Layers() {
+			if layer == network {
+				afterNetwork = true
+				continue
+			}
+			if !afterNetwork {
+				continue
+			}
+			if gre, ok := layer.(*layers.GRE); ok {
+				if gre.Version > 1 {
+					fields["Unselected Carrier"] = "GRE"
+					fields["Observed GRE Version"] = gre.Version
+					summary = fmt.Sprintf("GRE version %d not selected; inner identity unconfirmed", gre.Version)
+				} else if gre.Version == 1 && !selectedPPTPGRE(gre) {
+					fields["Unselected Carrier"] = "PPTP"
+					fields["Observed GRE Version"] = uint8(1)
+					fields["Parent Admission Reason"] = "unselected enhanced GRE header"
+					summary = "PPTP header profile unavailable; inner identity unconfirmed"
+				}
+				break
+			}
+			if _, inner := layer.(gopacket.NetworkLayer); inner {
+				break
+			}
+		}
+	}
+	// Narrow the displayed interpretation, never the observed source identity.
+	// The zero flow IDs and explicit refusal admit no child connection state.
+	a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Profile: "network-encapsulation-refusal", Domain: e.Ref.Domain, Status: "limited", Completeness: "limited", ExpertCode: "EncapsulationDepthOrProfile", Error: "EncapsulationDepthOrProfile", Summary: summary, Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
 }
 
 func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 	e := packetEvidence(p)
 	ci := p.Metadata().CaptureInfo
+	inner, networks, tunnels, unsupportedTunnel := networkCarrierProfile(p)
+	if networks > 1 {
+		// Preserve the existing full observation domain before narrowing a
+		// rejected interpretation, including sources reconstructed from fragments.
+		e.refs = append([]PacketReference(nil), e.refs...)
+		if !e.carrierOwned {
+			for i := range e.refs {
+				e.refs[i].Domain = e.Ref.Domain
+			}
+		}
+	}
+	if failure := p.ErrorLayer(); failure != nil {
+		var vxlan *vxlanHeaderError
+		if errors.As(failure.Error(), &vxlan) && selectedVXLANEnclosingParent(p, vxlan.layer, e.normalizedTunnels) {
+			a.refuseVXLANHeader(p, e, ci, vxlan)
+			// Retain the typed decoder error for strict API/accounting. The UDP
+			// ingress guard prevents redispatch as an outer application.
+			return p, false
+		}
+	}
+	for _, layer := range p.Layers() {
+		if gpe, ok := layer.(*captureVXLANGPE); ok && selectedVXLANEnclosingParent(p, gpe, e.normalizedTunnels) {
+			a.observeVXLANGPEHeader(p, e, ci, gpe)
+			return nil, true
+		}
+	}
+	if unsupportedTunnel || networks > 1 && (tunnels == 0 || tunnels+e.normalizedTunnels > 4 || networks != tunnels+1) {
+		// Parent admission precedes every child observation, including ARP,
+		// topology/discovery codecs and errors in incomplete inner IP headers.
+		a.refuseUnselectedNetworkParent(p, e, ci)
+		if p.ErrorLayer() != nil && hasUnselectedEtherIP(p) {
+			// Refusal must not erase the captured decoder error. Existing
+			// transport ingress rejects this original error-bearing packet.
+			return p, false
+		}
+		return nil, true
+	}
+	if a.refuseUnconfirmedPPPoEOwner(p, e, ci) {
+		return nil, true
+	}
+	if a.refuseIPv4IPIPExtent(p, e, ci) {
+		if p.ErrorLayer() != nil {
+			return &ipv4IPIPExtentRefusedPacket{p}, false
+		}
+		return nil, true
+	}
+	if a.refuseIPv4FragmentExtent(p, e, ci) {
+		return nil, true
+	}
+	if failure := p.ErrorLayer(); failure != nil {
+		var pptp *pptpHeaderError
+		if errors.As(failure.Error(), &pptp) {
+			// The enclosing topology/profile gate above takes precedence: an
+			// error in a child behind unselected Geneve/GRE is not a PPTP claim.
+			fields := map[string]any{"Observed Header Layers": outerNetworkHeaderNames(p), "Header Observation Scope": "outer network prefix only", "Child Header Identity": "unconfirmed", "Encapsulation Admission": "unselected profile", "Unselected Carrier": "PPTP", "Observed GRE Version": uint8(1), "Parent Admission Reason": pptp.reason, "GRE Header Flags": pptp.flags, "Available GRE Bytes": pptp.available, "Required GRE Bytes": pptp.required}
+			if pptp.hasProtocol {
+				fields["GRE Protocol Type"] = pptp.protocol
+			}
+			if pptp.truncated {
+				fields["Declared GRE Bytes Unavailable"] = true
+			}
+			a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Profile: "network-encapsulation-refusal", Domain: e.Ref.Domain, Status: "limited", Completeness: "limited", ExpertCode: "PPTPHeaderAdmission", Error: pptp.Error(), Summary: pptp.Error() + "; inner identity unconfirmed", Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
+			// The error-bearing packet preserves capture decoder-error accounting
+			// and the strict API result; its child decoder has never run.
+			return p, false
+		}
+		var truncated *ipHeaderTruncatedError
+		var options *ipv6OptionsHeaderError
+		var ah *ahHeaderError
+		if errors.As(failure.Error(), &options) || errors.As(failure.Error(), &ah) {
+			code := "IPv6OptionsHeaderBounds"
+			if options != nil && options.placement {
+				code = "IPv6OptionsHeaderOrder"
+			}
+			if ah != nil {
+				code = "AHHeaderBounds"
+			}
+			a.malformed.Add(1)
+			a.networkHeaderRefusal(p, e, ci, code, failure.Error().Error())
+			return p, false // Keep strict capture API and decoder-error accounting.
+		}
+		if errors.As(failure.Error(), &truncated) {
+			fields := map[string]any{"Expected IP Version": truncated.expected, "Available Header Bytes": truncated.available, "Required Header Bytes": truncated.required, "Header Observation Scope": "incomplete fixed header; declared carrier only"}
+			if truncated.hasVersion {
+				fields["Observed IP Version"] = truncated.observed
+			}
+			names := make([]string, 0, len(e.networkPrefix)+8)
+			for _, typ := range e.networkPrefix {
+				names = append(names, typ.String())
+			}
+			for _, layer := range p.Layers() {
+				if layer.LayerType() == gopacket.LayerTypeDecodeFailure || layer.LayerType() == gopacket.LayerTypePayload {
+					break
+				}
+				if len(names) >= maxCaptureTransportLayers {
+					names = nil
+					fields["Header Layer Projection Limited"] = true
+					break
+				}
+				names = append(names, layer.LayerType().String())
+			}
+			if e.networkPrefixLimited {
+				fields["Header Layer Projection Limited"] = true
+			}
+			if len(names) > 0 {
+				fields["Observed Header Layers"] = names
+			}
+			summary := fmt.Sprintf("IPv%d header incomplete: %d of %d fixed bytes available; transport not admitted", truncated.expected, truncated.available, truncated.required)
+			a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Domain: e.Ref.Domain, Status: "incomplete", Completeness: "incomplete", ExpertCode: "IPHeaderTruncated", Error: failure.Error().Error(), Summary: summary, Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
+			// Keep the original error-bearing packet for capture-level accounting.
+			// No normalization, fragment clock or application parser sees it here;
+			// the existing transport ingress rejects its decoder error as before.
+			return p, false
+		}
+		var version *ipVersionError
+		if errors.As(failure.Error(), &version) {
+			// A decoder's partial layer cannot admit a fragment/tunnel/native
+			// message, advance clocks, or create an application connection.
+			// Keep only the validated outer domain and literal physical source.
+			fields := map[string]any{"Observed IP Version": version.observed, "Expected IP Version": version.expected}
+			if e.networkPrefixLimited {
+				fields["Header Layer Projection Limited"] = true
+			}
+			names := make([]string, 0, len(e.networkPrefix)+8)
+			for _, typ := range e.networkPrefix {
+				names = append(names, typ.String())
+			}
+			for _, layer := range p.Layers() {
+				if layer.LayerType() == gopacket.LayerTypeDecodeFailure || layer.LayerType() == gopacket.LayerTypePayload {
+					break
+				}
+				if len(names) >= maxCaptureTransportLayers {
+					names = nil
+					fields["Header Layer Projection Limited"] = true
+					break
+				}
+				names = append(names, layer.LayerType().String())
+			}
+			if len(names) > 0 {
+				fields["Observed Header Layers"] = names
+			}
+			a.malformed.Add(1)
+			a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Domain: e.Ref.Domain, Status: "malformed", Completeness: "malformed", ExpertCode: "IPVersionMismatch", Error: version.Error(), Summary: version.Error(), Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
+			return nil, true
+		}
+	}
+	for _, layer := range p.Layers() {
+		gre, ok := layer.(*layers.GRE)
+		if !ok || !selectedPPTPGRE(gre) || len(gre.LayerPayload()) != 0 {
+			continue
+		}
+		fields := map[string]any{"Observed GRE Version": uint8(1), "PPTP Call ID": uint16(gre.Key), "PPTP Payload Length": uint16(0), "PPTP Acknowledgment Number": gre.Ack, "Header Observation Scope": "PPTP acknowledgment header only", "Child Header Identity": "not present", "PPTP Data Path Scope": "one direction; call-control association unavailable"}
+		a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Profile: "pptp-acknowledgment", Domain: e.Ref.Domain, Status: "limited", Completeness: "headers", ExpertCode: "PPTPAcknowledgment", Summary: fmt.Sprintf("PPTP acknowledgment call=%d ack=%d; no PPP payload", uint16(gre.Key), gre.Ack), Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(e)})
+		return nil, true
+	}
+	if a.observeSTP(p, e) {
+		return nil, true
+	}
+	if a.observeISIS(p, e) {
+		return nil, true
+	}
 	if decoded := p.Layers(); len(decoded) != 0 {
 		if can, ok := decoded[0].(*socketCANLayer); ok {
 			a.decodeCANRecord(can.wire, e, ci)
@@ -60,7 +436,16 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 			payload = payload[4:]
 		}
 		if etherType == layers.EthernetType(0x8892) {
-			a.decodeDCPEthernet(p.Data(), e, ci)
+			frame := p.Data()
+			// The DCP wire codec takes the observed Ethernet frame, not its PPI
+			// metadata prefix. Select only a validated, declared PPI layer; never
+			// guess/strip a prefix from ordinary Ethernet or change packet identity.
+			if decoded := p.Layers(); len(decoded) > 0 {
+				if ppi, ok := decoded[0].(*capturePPILayer); ok {
+					frame = ppi.payload
+				}
+			}
+			a.decodeDCPEthernet(frame, e, ci)
 			return nil, true
 		}
 		if etherType == layers.EthernetType(0x88cc) {
@@ -78,44 +463,27 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 			return nil, true
 		}
 	}
+	if a.observePIM(p, e) {
+		return nil, true
+	}
 	// gopacket exposes the outer NetworkLayer and TransportLayer. Normalize a
 	// supported tunnel to its innermost IP before transport dispatch.
-	var inner gopacket.NetworkLayer
-	networks, tunnels := 0, 0
-	unsupportedTunnel := false
-	for _, l := range p.Layers() {
-		if n, ok := l.(gopacket.NetworkLayer); ok {
-			inner = n
-			networks++
-		}
-		switch v := l.(type) {
-		case *layers.GRE, *layers.VXLAN:
-			tunnels++
-		case *layers.Geneve:
-			tunnels++
-			// Admit only the option-free v0 Ethernet data profile. Read the version
-			// bits from the captured header: gopacket's Version field does
-			// not retain both bits. OAM and critical options need semantics
-			// that this transport normalization does not implement.
-			header := v.LayerContents()
-			if len(header) != 8 || header[0] != 0 || header[1] != 0 || header[7] != 0 || v.Protocol != layers.EthernetTypeTransparentEthernetBridging {
-				unsupportedTunnel = true
-			}
-		case *layers.IPv4:
-			if v.Protocol == layers.IPProtocolIPv4 || v.Protocol == layers.IPProtocolIPv6 {
-				tunnels++
-			}
-		}
-	}
 	if networks > 1 {
-		if unsupportedTunnel || tunnels == 0 || tunnels > 4 || networks != tunnels+1 {
-			a.networkDiagnostic(e, ci, "limited", "EncapsulationDepthOrProfile")
-			return nil, true
+		e.normalizedTunnels += tunnels
+		e.preserveNetworkPrefix(p, inner)
+		raw := bytes.Clone(inner.LayerContents())
+		if ip, ok := inner.(*layers.IPv6); ok && ip.HopByHop != nil {
+			// IPv6's Payload begins after its embedded first HBH. Keep that
+			// validated header when reconstructing the complete inner datagram.
+			raw = append(raw, ip.HopByHop.LayerContents()...)
 		}
-		raw := append(bytes.Clone(inner.LayerContents()), inner.LayerPayload()...)
+		raw = append(raw, inner.LayerPayload()...)
+		// Fragmentation of an outer carrier does not mean that the inner
+		// IPv6 ND message itself contained a Fragment header.
+		e.ipv6Fragment = false
 		ci.CaptureLength, ci.Length = len(raw), len(raw)
 		ci = withEvidence(ci, e)
-		p = gopacket.NewPacket(raw, protocolPacketDecoder{decoder: layers.LinkTypeRaw}, gopacket.Default)
+		p = gopacket.NewPacket(raw, protocolPacketDecoder{decoder: layers.LinkTypeRaw, datagramDecodeAs: a.datagramDecodeAs}, gopacket.Default)
 		p.Metadata().CaptureInfo = ci
 	}
 	var key fragmentKey
@@ -145,8 +513,73 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 		}
 	}
 	if off >= 0 {
-		return a.fragment(p, e, key, off, more, payload)
+		e.preserveNetworkPrefix(p, p.NetworkLayer())
+		q, consumed := a.fragment(p, e, key, off, more, payload)
+		// fragment() releases its store mutex before this dispatch. A complete
+		// datagram must pass through tunnel normalization and native observation
+		// before transport dispatch; the decoded outer IP is not the inner peer.
+		if !consumed && q != nil {
+			return a.networkPacket(q)
+		}
+		return q, consumed
 	}
+	if q, handled := a.observeL2TPv3(p, e); handled {
+		if q != nil {
+			return a.networkPacket(q)
+		}
+		return nil, true
+	}
+	if a.observeESP(p, e) {
+		if failure := p.ErrorLayer(); failure != nil {
+			var short *espHeaderTruncatedError
+			if errors.As(failure.Error(), &short) {
+				return p, false
+			}
+		}
+		return nil, true
+	}
+
+	if observed, preserveError := a.observeIGMP(p, e); observed {
+		if preserveError {
+			return &igmpObservedErrorPacket{p}, false
+		}
+		return nil, true
+	}
+	if a.observeOSPFv2(p, e) || a.observeOSPFv3(p, e) || a.observeRSVP(p, e) {
+		return nil, true
+	}
+
+	// Check native observation admission before constructing or cloning field trees,
+	// quoted packets, ND options or the captured Raw projection. Capture buffers
+	// retained by the driver/caller are outside this parser's resource contract.
+	nativeProtocol := ""
+	if p.Layer(layers.LayerTypeARP) != nil {
+		nativeProtocol = "arp"
+	} else if p.Layer(layers.LayerTypeICMPv4) != nil {
+		nativeProtocol = "icmp"
+	} else if p.Layer(layers.LayerTypeICMPv6) != nil {
+		nativeProtocol = "icmpv6"
+	}
+	if nativeProtocol != "" && len(p.Data()) > min(a.budget.MaxFrameBytes, a.config.MaxMessageBytes) {
+		err := protocolError(ErrResourceExceeded, "native network frame exceeds parser message limit")
+		status, typed := classifySessionError(err)
+		event := &ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: nativeProtocol, Domain: e.Ref.Domain, Length: len(p.Data()), Status: status, Completeness: status, ExpertCode: string(typed.Kind), Error: err.Error(), sessionError: typed, SourceBytes: networkObservationSource(e)}
+		event.CarrierLayers = append([]string(nil), e.carrierLayers...)
+		if n := p.NetworkLayer(); n != nil {
+			event.Source, event.Destination = n.NetworkFlow().Src().String(), n.NetworkFlow().Dst().String()
+		}
+		if arp, ok := p.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
+			if arp.Protocol == layers.EthernetTypeIPv4 && arp.ProtAddressSize == 4 {
+				event.Source, event.Destination = net.IP(arp.SourceProtAddress).String(), net.IP(arp.DstProtAddress).String()
+			} else {
+				event.Source, event.Destination = fmt.Sprintf("%x", arp.SourceProtAddress), fmt.Sprintf("%x", arp.DstProtAddress)
+			}
+		}
+		a.limited.Add(uint64(len(p.Data())))
+		a.emit(event)
+		return nil, true
+	}
+
 	var protocol string
 	var fields map[string]any
 	if arp, ok := p.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
@@ -154,8 +587,34 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 		fields = map[string]any{"Operation": arp.Operation, "Sender MAC": net.HardwareAddr(arp.SourceHwAddress).String(), "Sender IP": net.IP(arp.SourceProtAddress).String(), "Target IP": net.IP(arp.DstProtAddress).String(), "Observation": "unverified-neighbor"}
 	} else if icmp, ok := p.Layer(layers.LayerTypeICMPv6).(*layers.ICMPv6); ok {
 		protocol = "icmpv6"
+		// RFC 6980 section 5 forbids a Fragment header on ND types133..137,
+		// including atomic fragments. Keep a diagnostic, never a valid ND
+		// projection. SEND CPA/message types outside this range are distinct.
+		if e.ipv6Fragment && icmp.TypeCode.Type() >= 133 && icmp.TypeCode.Type() <= 137 {
+			a.malformed.Add(1)
+			a.networkDiagnostic(e, ci, "malformed", "NDFragmentForbidden")
+			return nil, true
+		}
 		fields = map[string]any{"Type": icmp.TypeCode.Type(), "Code": icmp.TypeCode.Code()}
 		typ := icmp.TypeCode.Type()
+		if typ == 130 || typ == 131 || typ == 132 || typ == 143 {
+			result, _, selected, decodeErr := DecodeMLDPacketFields(p, min(a.budget.MaxFrameBytes, a.config.MaxMessageBytes), a.budget.MaxCollectionElements)
+			if selected {
+				if result.Fields == nil {
+					result.Fields = fields // An exhausted input policy still owns its generic header.
+				}
+				status, code := "decoded", ""
+				if decodeErr != nil {
+					status, code = "limited", "MLDCollectionBudget"
+					var failure *stream_parser.MLDWireError
+					if errors.As(decodeErr, &failure) {
+						status, code = failure.Kind, failure.Code
+					}
+				}
+				a.emitNativeNetworkObservation(p, e, ci, protocol, result.Fields, status, code, &result)
+				return nil, true
+			}
+		}
 		b := icmp.Payload
 		fixed := 0
 		switch typ {
@@ -168,8 +627,18 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 			if len(b) >= 20 {
 				fields["Target"] = net.IP(b[4:20]).String()
 			}
+		case 137:
+			// RFC 4861 section 4.5: reserved, target and destination follow
+			// the generic four-byte ICMPv6 header, before any ND options.
+			fixed = 36
+			if len(b) >= 20 {
+				fields["Target"] = net.IP(b[4:20]).String()
+			}
+			if len(b) >= 36 {
+				fields["Destination"] = net.IP(b[20:36]).String()
+			}
 		case 1, 2, 3, 4:
-			fixed = len(b)
+			fixed = 4 // RFC 4443: type-specific word precedes the quoted packet.
 			if len(b) >= 4 {
 				fields["Quoted Packet"] = bytes.Clone(b[4:])
 				if typ == 2 {
@@ -177,25 +646,29 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 				}
 			}
 		case 128, 129:
-			fixed = len(b)
+			fixed = 4 // Identifier and sequence are mandatory, even with no data.
 			if len(b) >= 4 {
 				fields["Identifier"], fields["Sequence"] = binary.BigEndian.Uint16(b), binary.BigEndian.Uint16(b[2:])
 			}
 		}
 		if fixed > len(b) {
-			a.networkDiagnostic(e, ci, "incomplete", "ICMPv6HeaderTruncated")
+			fields["Available ICMPv6 Bytes"] = 4 + len(b)
+			fields["Required ICMPv6 Header Bytes"] = 4 + fixed
+			a.emitNativeNetworkObservation(p, e, ci, protocol, fields, "incomplete", "ICMPv6HeaderTruncated")
 			return nil, true
 		}
-		if typ >= 133 && typ <= 136 {
+		if typ >= 133 && typ <= 137 {
 			var opts []map[string]any
 			for at := fixed; at < len(b); {
 				if len(b)-at < 2 || b[at+1] == 0 || int(b[at+1])*8 > len(b)-at {
-					a.networkDiagnostic(e, ci, "malformed", "NDOptionLength")
+					fields["Options"] = opts
+					a.emitNativeNetworkObservation(p, e, ci, protocol, fields, "malformed", "NDOptionLength")
 					return nil, true
 				}
 				n := int(b[at+1]) * 8
 				if len(opts) >= a.budget.MaxCollectionElements {
-					a.networkDiagnostic(e, ci, "limited", "NDOptionBudget")
+					fields["Options"] = opts
+					a.emitNativeNetworkObservation(p, e, ci, protocol, fields, "limited", "NDOptionBudget")
 					return nil, true
 				}
 				opts = append(opts, map[string]any{"Type": b[at], "Value": bytes.Clone(b[at+2 : at+n])})
@@ -206,31 +679,100 @@ func (a *binParser) networkPacket(p gopacket.Packet) (gopacket.Packet, bool) {
 		}
 	} else if icmp, ok := p.Layer(layers.LayerTypeICMPv4).(*layers.ICMPv4); ok {
 		protocol = "icmp"
-		fields = map[string]any{"Type": icmp.TypeCode.Type(), "Code": icmp.TypeCode.Code(), "Identifier": icmp.Id, "Sequence": icmp.Seq}
-		if icmp.TypeCode.Type() == 3 || icmp.TypeCode.Type() == 11 {
-			fields["Quoted Packet"] = bytes.Clone(icmp.Payload)
+		// Native frame admission and its byte budget were checked above. Use
+		// the same union codec as the explicit canonical stateless entry.
+		wire := append(bytes.Clone(icmp.LayerContents()), icmp.LayerPayload()...)
+		var decodeErr error
+		fields, decodeErr = stream_parser.DecodeICMPv4HeaderWire(wire, len(wire))
+		if decodeErr != nil {
+			a.emitNativeNetworkObservation(p, e, ci, protocol, fields, "incomplete", "ICMPHeaderTruncated")
+			return nil, true
 		}
 	}
 	if protocol != "" {
-		event := &ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: protocol, Domain: e.Ref.Domain, Length: len(p.Data()), Raw: bytes.Clone(p.Data()), Status: "decoded", Completeness: "message", Session: fields, SourceBytes: ByteSource{Kind: "captured", PacketRefs: []PacketReference{e.Ref}}, semanticFields: fields}
-		if n := p.NetworkLayer(); n != nil {
-			event.Source, event.Destination = n.NetworkFlow().Src().String(), n.NetworkFlow().Dst().String()
-		}
-		if protocol == "arp" {
-			arp := p.Layer(layers.LayerTypeARP).(*layers.ARP)
-			if arp.Protocol == layers.EthernetTypeIPv4 && arp.ProtAddressSize == 4 {
-				event.Source, event.Destination = net.IP(arp.SourceProtAddress).String(), net.IP(arp.DstProtAddress).String()
-			} else {
-				event.Source, event.Destination = fmt.Sprintf("%x", arp.SourceProtAddress), fmt.Sprintf("%x", arp.DstProtAddress)
-			}
-		}
-		event.Structured = map[string]any{"fields": fields}
-		a.messages.Add(1)
-		a.decoded.Add(1)
-		a.emit(event)
+		a.emitNativeNetworkObservation(p, e, ci, protocol, fields, "decoded", "")
 		return nil, true
 	}
 	return p, false
+}
+
+// A complete generic header proves the observed family, not a complete body.
+// Preserve only available fields and their source on a refusal; quoted inner
+// decoder errors do not invalidate a complete outer ICMP message.
+func (a *binParser) emitNativeNetworkObservation(p gopacket.Packet, e captureEvidence, ci gopacket.CaptureInfo, protocol string, fields map[string]any, status, code string, mld ...*stream_parser.MLDWireResult) {
+	if e.carrierOwned {
+		// The logical native network PDU can consume the packet before the
+		// transport callback. Preserve its actual full header path for the
+		// UI instead of pairing an inner ICMP/ARP label with outer peers.
+		names := make([]string, 0, len(e.networkPrefix)+8)
+		for _, typ := range e.networkPrefix {
+			names = append(names, typ.String())
+		}
+		for _, layer := range p.Layers() {
+			if layer.LayerType() == gopacket.LayerTypePayload || layer.LayerType() == gopacket.LayerTypeDecodeFailure {
+				break
+			}
+			if len(names) >= maxCaptureTransportLayers {
+				break
+			}
+			names = append(names, layer.LayerType().String())
+		}
+		fields["Observed Header Layers"] = names
+	}
+	completeness := status
+	if status == "decoded" {
+		completeness = "message"
+	}
+	event := &ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: protocol, Domain: e.Ref.Domain, Length: len(p.Data()), Raw: bytes.Clone(p.Data()), Status: status, Completeness: completeness, ExpertCode: code, Error: code, Session: cloneSession(fields), SourceBytes: networkObservationSource(e), semanticFields: cloneSession(fields), semanticSession: cloneSession(fields)}
+	if code != "" {
+		event.Profile = protocol + "-header-observation"
+		family, availableKey, requiredKey := "ICMPv6", "Available ICMPv6 Bytes", "Required ICMPv6 Header Bytes"
+		name := layers.CreateICMPv6TypeCode(fields["Type"].(uint8), fields["Code"].(uint8)).String()
+		if protocol == "icmp" {
+			family, availableKey, requiredKey = "ICMP", "Available ICMP Bytes", "Required ICMP Header Bytes"
+			name = layers.CreateICMPv4TypeCode(fields["Type"].(uint8), fields["Code"].(uint8)).String()
+		}
+		event.Summary = family + " " + name + "; " + code
+		if code == "ICMPv6HeaderTruncated" || code == "ICMPHeaderTruncated" {
+			event.Summary = fmt.Sprintf("%s %s; incomplete fixed header (%v/%v bytes)", family, name, fields[availableKey], fields[requiredKey])
+		} else if code == "NDOptionLength" {
+			event.Summary = "ICMPv6 " + name + "; invalid ND option length"
+		}
+	}
+	event.CarrierLayers = append([]string(nil), e.carrierLayers...)
+	if n := p.NetworkLayer(); n != nil {
+		event.Source, event.Destination = n.NetworkFlow().Src().String(), n.NetworkFlow().Dst().String()
+	}
+	if protocol == "arp" {
+		arp := p.Layer(layers.LayerTypeARP).(*layers.ARP)
+		if arp.Protocol == layers.EthernetTypeIPv4 && arp.ProtAddressSize == 4 {
+			event.Source, event.Destination = net.IP(arp.SourceProtAddress).String(), net.IP(arp.DstProtAddress).String()
+		} else {
+			event.Source, event.Destination = fmt.Sprintf("%x", arp.SourceProtAddress), fmt.Sprintf("%x", arp.DstProtAddress)
+		}
+	}
+	event.Structured = map[string]any{"fields": cloneSession(fields)}
+	event.retainNativeNetworkFields(p)
+	if len(mld) == 1 && mld[0] != nil {
+		event.Profile = "icmpv6-mld"
+		event.Summary = mld[0].Summary
+		if event.Summary == "" {
+			event.Summary = "MLD wire fields unavailable"
+		}
+		event.retainNativeMLDFields(p, mld[0])
+	}
+	switch status {
+	case "decoded":
+		a.messages.Add(1)
+		a.decoded.Add(1)
+	case "incomplete":
+		a.incomplete.Add(1)
+	case "malformed":
+		a.malformed.Add(1)
+	case "limited":
+		a.limited.Add(uint64(len(p.Data())))
+	}
+	a.emit(event)
 }
 
 // decodeGOOSEEthernet admits IEC 61850 GOOSE only when the caller has matched
@@ -294,6 +836,7 @@ func (a *binParser) decodeGOOSEEthernet(eth *layers.Ethernet, payload []byte, ev
 	} else {
 		e.Status, e.Completeness = "decoded", "message"
 		e.Structured = result
+		e.retainRuleEnvelope(result)
 		e.Summary = fmt.Sprintf("GOOSE state %v sequence %v", e.Session["State Number"], e.Session["Sequence Number"])
 		a.messages.Add(1)
 		a.messageBytes.Add(uint64(length))
@@ -302,14 +845,78 @@ func (a *binParser) decodeGOOSEEthernet(eth *layers.Ethernet, payload []byte, ev
 	a.emit(e)
 }
 
+func networkObservationSource(e captureEvidence) ByteSource {
+	if e.byteSourceKind != "" {
+		b := ByteSource{Kind: e.byteSourceKind, PacketRefs: append([]PacketReference(nil), e.refs...), ParentPDUs: append([]uint64(nil), e.parents...)}
+		if len(e.parents) > 0 {
+			b.ParentPDU = e.parents[len(e.parents)-1]
+		}
+		return b
+	}
+	if len(e.refs) != 0 {
+		return ByteSource{Kind: "reassembled", PacketRefs: append([]PacketReference(nil), e.refs...)}
+	}
+	return ByteSource{Kind: "captured", PacketRefs: []PacketReference{e.Ref}}
+}
+
+func (a *binParser) networkHeaderRefusal(p gopacket.Packet, evidence captureEvidence, ci gopacket.CaptureInfo, code, reason string) {
+	names := make([]string, 0, len(evidence.networkPrefix)+8)
+	for _, kind := range evidence.networkPrefix {
+		names = append(names, kind.String())
+	}
+	for _, layer := range p.Layers() {
+		kind := layer.LayerType()
+		if kind == gopacket.LayerTypeDecodeFailure || kind == gopacket.LayerTypePayload || kind == layers.LayerTypeICMPv4 || kind == layers.LayerTypeICMPv6 || kind == layers.LayerTypeIPSecESP {
+			break
+		}
+		if len(names) >= maxCaptureTransportLayers {
+			names = nil
+			break
+		}
+		names = append(names, kind.String())
+	}
+	fields := map[string]any{"Observed Header Layers": names, "Header Observation Scope": "validated network prefix before refused child header", "Child Header Identity": "unconfirmed", "Parent Header Refusal": code}
+	e := &ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Profile: "network-header-refusal", Domain: evidence.Ref.Domain, Status: "malformed", Completeness: "malformed", ExpertCode: code, Error: reason, Summary: reason + "; child identity not admitted", Session: cloneSession(fields), semanticSession: cloneSession(fields), SourceBytes: networkObservationSource(evidence), CarrierLayers: append([]string(nil), evidence.carrierLayers...)}
+	for _, layer := range p.Layers() {
+		if layer.LayerType() == gopacket.LayerTypeDecodeFailure || layer.LayerType() == layers.LayerTypeICMPv4 || layer.LayerType() == layers.LayerTypeICMPv6 {
+			break
+		}
+		h := layer.LayerContents()
+		switch layer.(type) {
+		case *layers.IPv4:
+			if len(h) >= 20 && h[0]>>4 == 4 && int(h[0]&15)*4 == len(h) && int(binary.BigEndian.Uint16(h[2:4])) >= len(h) {
+				e.Source, e.Destination = net.IP(h[12:16]).String(), net.IP(h[16:20]).String()
+			}
+		case *layers.IPv6:
+			if len(h) == 40 && h[0]>>4 == 6 {
+				e.Source, e.Destination = net.IP(h[8:24]).String(), net.IP(h[24:40]).String()
+			}
+		}
+	}
+	a.emit(e)
+}
+
 func (a *binParser) networkDiagnostic(e captureEvidence, ci gopacket.CaptureInfo, status, code string) {
-	a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Domain: e.Ref.Domain, Status: status, Completeness: status, ExpertCode: code, Error: code, SourceBytes: ByteSource{Kind: "captured", PacketRefs: []PacketReference{e.Ref}}})
+	a.emit(&ProtocolEvent{Timestamp: ci.Timestamp, Transport: "network", Protocol: "ip", Domain: e.Ref.Domain, Status: status, Completeness: status, ExpertCode: code, Error: code, SourceBytes: networkObservationSource(e)})
 }
 func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentKey, off int, more bool, payload []byte) (gopacket.Packet, bool) {
 	ci := p.Metadata().CaptureInfo
+	if ci.CaptureLength < ci.Length {
+		// A proved local capture cut is not evidence of malformed bytes on
+		// the network. Keep existing complete ranges and allow a later full
+		// retransmission to repair it; never retain the ambiguous prefix.
+		a.networkDiagnostic(e, ci, "incomplete", "FragmentCaptureTruncated")
+		return nil, true
+	}
 	// RFC 6946: atomic fragments neither join nor remove a matching pending
 	// datagram, including one quarantined after an overlap.
 	if key.v6 && off == 0 && !more {
+		// Removing Fragment must not legalize an on-wire HBH after it.
+		// RFC 8200 section 4 requires HBH immediately after the IPv6 header.
+		if f, ok := p.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment); ok && f.NextHeader == layers.IPProtocolIPv6HopByHop {
+			a.networkDiagnostic(e, ci, "malformed", "IPv6OptionsHeaderOrder")
+			return nil, true
+		}
 		header, err := fragmentHeader(p, true)
 		if err != nil || p.Metadata().Truncated || ci.CaptureLength < ci.Length || len(header)-40+len(payload) > 65535 {
 			a.networkDiagnostic(e, ci, "malformed", "FragmentLength")
@@ -323,19 +930,28 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 	if s.sets == nil {
 		s.sets = map[fragmentKey]*fragmentSet{}
 	}
-	if ci.Timestamp.After(s.clock) {
-		s.clock = ci.Timestamp
-	}
+	var expired []fragmentKey
 	for k, v := range s.sets {
-		if s.clock.Sub(v.last) > 30*time.Second {
-			a.buffered.Add(-v.cost)
-			delete(s.sets, k)
-			a.fragmentDiagnostic(v, "FragmentTimeout")
+		// Interfaces, sections and tunnels can have independent capture clocks.
+		// Only this domain's actual timestamp can prove a known lease expired.
+		// Unknown time remains unknown within the existing count/byte bounds.
+		if k.domain == key.domain && !ci.Timestamp.IsZero() && !v.last.IsZero() && ci.Timestamp.Sub(v.last) > 30*time.Second {
+			expired = append(expired, k)
 		}
 	}
-	if s.clock.Before(s.blockedUntil) {
-		a.networkDiagnostic(e, ci, "limited", "FragmentQuarantineBudget")
-		return nil, true
+	sortFragmentKeys(expired)
+	for _, k := range expired {
+		v := s.sets[k]
+		a.buffered.Add(-v.cost)
+		delete(s.sets, k)
+		a.fragmentDiagnostic(v, "FragmentTimeout")
+	}
+	if s.blocked {
+		if key.domain != s.blockedDomain || s.blockedUntil.IsZero() || ci.Timestamp.IsZero() || ci.Timestamp.Before(s.blockedUntil) {
+			a.networkDiagnostic(e, ci, "limited", "FragmentQuarantineBudget")
+			return nil, true
+		}
+		s.blocked, s.blockedDomain, s.blockedUntil = false, CaptureDomain{}, time.Time{}
 	}
 	if v := s.sets[key]; v != nil && v.rejected {
 		return nil, true
@@ -349,12 +965,16 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 		} else {
 			delete(s.sets, key) // An unreserved, empty provisional set owns no bytes.
 			if len(s.sets) < a.budget.MaxCollectionElements && a.reserveEvidence(128) {
-				s.sets[key] = &fragmentSet{last: s.clock, cost: 128, rejected: true}
+				s.sets[key] = &fragmentSet{last: ci.Timestamp, cost: 128, rejected: true}
 			} else {
 				// Without space to remember a rejected ID, fail closed for fragment
 				// admission for one bounded lifetime. Unfragmented traffic and IPv6
 				// atomic fragments remain independent.
-				s.blockedUntil = s.clock.Add(30 * time.Second)
+				s.blocked, s.blockedDomain = true, key.domain
+				s.blockedUntil = time.Time{}
+				if !ci.Timestamp.IsZero() {
+					s.blockedUntil = ci.Timestamp.Add(30 * time.Second)
+				}
 			}
 		}
 		a.networkDiagnostic(e, ci, "malformed", code)
@@ -365,6 +985,11 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 	}
 	if key.v6 && off == 0 {
 		f, ok := p.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
+		// Only offset zero supplies the reassembled Next Header. A later
+		// fragment's value must not change this datagram's interpretation.
+		if ok && f.NextHeader == layers.IPProtocolIPv6HopByHop {
+			return invalid("IPv6OptionsHeaderOrder")
+		}
 		if !ok || !completeFragmentFirstHeader(byte(f.NextHeader), payload) {
 			return invalid("FragmentFirstHeader")
 		}
@@ -375,11 +1000,23 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 			a.networkDiagnostic(e, ci, "limited", "FragmentSessionBudget")
 			return nil, true
 		}
-		v = &fragmentSet{end: -1, last: s.clock}
+		v = &fragmentSet{end: -1, last: ci.Timestamp}
 		s.sets[key] = v
 	}
 	for _, part := range v.parts {
-		if !key.v6 && off == part.start && bytes.Equal(part.data, payload) {
+		if off == part.start && bytes.Equal(part.data, payload) {
+			if part.more != more {
+				return invalid("FragmentConflictingEnd")
+			}
+			if key.v6 && off == 0 {
+				header, err := fragmentHeader(p, true)
+				if err != nil || !bytes.Equal(v.header, header) {
+					return invalid("FragmentOverlapRejected")
+				}
+			}
+			// RFC8200 4.5 explicitly allows dropping exact duplicates while
+			// preserving other fragments. Neither evidence cost nor contributor
+			// references grow, and conflicting/partial overlaps still fail closed.
 			return nil, true
 		}
 		if off < part.start+len(part.data) && part.start < off+len(payload) {
@@ -403,7 +1040,20 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 		}
 		v.end = off + len(payload)
 	}
-	cost := int64(len(payload) + 128)
+	refs := e.refs
+	if len(refs) == 0 {
+		refs = []PacketReference{e.Ref}
+	}
+	contributors := len(refs)
+	for _, part := range v.parts {
+		contributors += len(part.refs)
+	}
+	if contributors > min(128, a.budget.MaxCollectionElements) {
+		return invalid("FragmentRangeBudget")
+	}
+	// Reconstructed fragments can themselves contain reconstructed carriers.
+	// Retain and charge every physical contributor, not only the final arrival.
+	cost := int64(len(payload) + 128*len(refs) + 8*len(e.parents))
 	var header []byte
 	if off == 0 {
 		var err error
@@ -424,7 +1074,7 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 	if header != nil {
 		v.header = header
 	}
-	v.parts = append(v.parts, ipFragment{off, bytes.Clone(payload), e.Ref})
+	v.parts = append(v.parts, ipFragment{start: off, data: bytes.Clone(payload), refs: append([]PacketReference(nil), refs...), more: more, parents: append([]uint64(nil), e.parents...)})
 	sort.Slice(v.parts, func(i, j int) bool { return v.parts[i].start < v.parts[j].start })
 	cursor := 0
 	for _, part := range v.parts {
@@ -437,10 +1087,16 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 		return nil, true
 	}
 	raw := make([]byte, 0, cursor)
-	refs := make([]PacketReference, 0, len(v.parts))
+	refs = make([]PacketReference, 0, contributors)
+	var parents []uint64
 	for _, part := range v.parts {
 		raw = append(raw, part.data...)
-		refs = append(refs, part.ref)
+		refs = append(refs, part.refs...)
+		for _, id := range part.parents {
+			if len(parents) == 0 || parents[len(parents)-1] != id {
+				parents = append(parents, id)
+			}
+		}
 	}
 	length := len(v.header) + len(raw)
 	if key.v6 {
@@ -453,7 +1109,15 @@ func (a *binParser) fragment(p gopacket.Packet, e captureEvidence, key fragmentK
 	a.buffered.Add(-v.cost)
 	delete(s.sets, key)
 	e.refs = refs
-	return a.reassembledPacket(header, raw, e, ci, key.v6)
+	e.parents = parents
+	if e.carrierOwned {
+		e.byteSourceKind = "reassembled"
+	}
+	q, handled := a.reassembledPacket(header, raw, e, ci, key.v6)
+	if key.v6 && q != nil && len(header) == 40 && header[6] == 115 && len(v.parts) > 0 && v.parts[0].start == 0 {
+		q = &l2tp3IPv6FragmentPacket{Packet: q, firstPayloadBytes: len(v.parts[0].data)}
+	}
+	return q, handled
 }
 
 // RFC 8200 section 4.5 requires the offset-zero fragment to contain the
@@ -491,12 +1155,87 @@ func completeFragmentFirstHeader(next byte, b []byte) bool {
 			return n >= 20 && n <= len(b)
 		case 41:
 			return len(b) >= 40
+		case 46: // Selected RSVP common header.
+			return len(b) >= 8
+		case 47:
+			return completeFragmentGREHeader(b)
+		case 89: // IPv6's selected OSPFv3 fixed header, not its message body.
+			return len(b) >= 16
+		case 103: // Only the PIM common header, not its type-specific body.
+			return len(b) >= 4
+		case 115:
+			if len(b) < 4 {
+				return false
+			}
+			// Zero SID selects control16; nonzero data remains context-dependent.
+			return binary.BigEndian.Uint32(b[:4]) != 0 || len(b) >= 16
 		default:
 			// Unknown upper layers remain unknown to normal ingress; no
 			// transport admission is inferred from their identifier.
 			return true
 		}
 	}
+}
+
+// Check only the currently selected GRE header's complete byte extent. The
+// normal carrier gate still decides version, flags, child profile and semantics.
+// Unsupported versions/profiles must retain their existing refusal, not acquire
+// a fabricated minimum upper-header grammar here.
+func completeFragmentGREHeader(b []byte) bool {
+	if len(b) < 4 {
+		return false
+	}
+	version := b[1] & 7
+	if version == 1 {
+		flags := binary.BigEndian.Uint16(b[:2])
+		if flags&^uint16(0x3081) != 0 || flags&0x2000 == 0 || binary.BigEndian.Uint16(b[2:4]) != uint16(layers.EthernetTypePPP) {
+			return true // The existing PPTP profile gate owns this refusal.
+		}
+		n := 8
+		if flags&0x1000 != 0 {
+			n += 4
+		}
+		if flags&0x80 != 0 {
+			n += 4
+		}
+		return n <= len(b)
+	}
+	if version != 0 {
+		return true // An unselected GRE version is not an admitted child.
+	}
+	at := 4
+	if b[0]&0xc0 != 0 {
+		at += 4
+	}
+	if b[0]&0x20 != 0 {
+		at += 4
+	}
+	if b[0]&0x10 != 0 {
+		at += 4
+	}
+	if at > len(b) {
+		return false
+	}
+	if b[0]&0x40 != 0 {
+		for {
+			if at+4 > len(b) {
+				return false
+			}
+			size := int(b[at+3])
+			end := b[at] == 0 && b[at+1] == 0 && size == 0
+			at += 4 + size
+			if at > len(b) {
+				return false
+			}
+			if end {
+				break
+			}
+		}
+	}
+	if b[1]&0x80 != 0 {
+		at += 4
+	}
+	return at <= len(b)
 }
 
 // Retain the offset-zero IP header and pre-fragment extension headers. Rebuilding
@@ -554,7 +1293,11 @@ func (a *binParser) reassembledPacket(header, payload []byte, e captureEvidence,
 		}
 		binary.BigEndian.PutUint16(raw[10:12], ^uint16(sum))
 	}
-	q := gopacket.NewPacket(raw, protocolPacketDecoder{decoder: layers.LinkTypeRaw}, gopacket.Default)
+	q := gopacket.NewPacket(raw, protocolPacketDecoder{decoder: layers.LinkTypeRaw, datagramDecodeAs: a.datagramDecodeAs}, gopacket.Default)
+	e.ipv6Fragment = v6
+	if len(e.refs) == 0 {
+		e.refs = []PacketReference{e.Ref}
+	}
 	ci.CaptureLength, ci.Length = len(raw), len(raw)
 	ci = withEvidence(ci, e)
 	q.Metadata().CaptureInfo = ci
@@ -564,12 +1307,49 @@ func (a *binParser) closeFragments() {
 	s := &a.fragments
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, v := range s.sets {
+	keys := make([]fragmentKey, 0, len(s.sets))
+	for k := range s.sets {
+		keys = append(keys, k)
+	}
+	sortFragmentKeys(keys)
+	for _, k := range keys {
+		v := s.sets[k]
 		a.buffered.Add(-v.cost)
 		a.fragmentDiagnostic(v, "FragmentCaptureEnded")
 	}
 	s.sets = nil
-	s.blockedUntil = time.Time{}
+	s.blocked, s.blockedDomain, s.blockedUntil = false, CaptureDomain{}, time.Time{}
+}
+
+// Diagnostics allocate PDU IDs and compete for bounded history just like
+// decoded messages. A randomized map traversal must not decide which physical
+// frames still have details after EOF or a batch of simultaneous expirations.
+func sortFragmentKeys(keys []fragmentKey) {
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.domain.Section != b.domain.Section {
+			return a.domain.Section < b.domain.Section
+		}
+		if a.domain.Interface != b.domain.Interface {
+			return a.domain.Interface < b.domain.Interface
+		}
+		if a.domain.Encapsulation != b.domain.Encapsulation {
+			return a.domain.Encapsulation < b.domain.Encapsulation
+		}
+		if a.src != b.src {
+			return a.src < b.src
+		}
+		if a.dst != b.dst {
+			return a.dst < b.dst
+		}
+		if a.id != b.id {
+			return a.id < b.id
+		}
+		if a.protocol != b.protocol {
+			return a.protocol < b.protocol
+		}
+		return !a.v6 && b.v6
+	})
 }
 func (a *binParser) fragmentDiagnostic(v *fragmentSet, code string) {
 	if len(v.parts) == 0 {
@@ -577,7 +1357,7 @@ func (a *binParser) fragmentDiagnostic(v *fragmentSet, code string) {
 	}
 	refs := make([]PacketReference, 0, len(v.parts))
 	for _, p := range v.parts {
-		refs = append(refs, p.ref)
+		refs = append(refs, p.refs...)
 	}
 	a.emit(&ProtocolEvent{Timestamp: v.last, Transport: "network", Protocol: "ip", Domain: refs[0].Domain, Status: "incomplete", Completeness: "incomplete", ExpertCode: code, Error: code, SourceBytes: ByteSource{Kind: "reassembled", PacketRefs: refs}})
 }
@@ -607,6 +1387,7 @@ func dhcp6Options(w []byte, depth, limit int) ([]map[string]any, error) {
 		return nil, protocolError(ErrResourceExceeded, "DHCPv6 option depth")
 	}
 	var out []map[string]any
+	var clientSeen, serverSeen bool
 	for len(w) > 0 {
 		if len(w) < 4 {
 			return nil, fmt.Errorf("DHCPv6 option header")
@@ -622,6 +1403,24 @@ func dhcp6Options(w []byte, depth, limit int) ([]map[string]any, error) {
 			return nil, protocolError(ErrResourceExceeded, "DHCPv6 option count")
 		}
 		o := map[string]any{"Code": code, "Raw": bytes.Clone(b)}
+		if code == 1 {
+			if clientSeen {
+				return nil, fmt.Errorf("DHCPv6 duplicate client identifier")
+			}
+			clientSeen = true
+		}
+		if code == 2 {
+			if serverSeen {
+				return nil, fmt.Errorf("DHCPv6 duplicate server identifier")
+			}
+			serverSeen = true
+		}
+		if code == 8 && n != 2 {
+			return nil, fmt.Errorf("DHCPv6 elapsed time width")
+		}
+		if code == 14 && n != 0 {
+			return nil, fmt.Errorf("DHCPv6 Rapid Commit width")
+		}
 		prefix := -1
 		switch code {
 		case 1, 2:
